@@ -1,0 +1,36 @@
+{
+	"operator": {
+		"name": "TcnStreamSynchronizerOp",
+		"description": "This operator synchronizes several video streams.",
+		"authors": [
+			{
+                "name": "Holoscan Team",
+				"affiliation": "NVIDIA"
+			}
+		],
+		"language": ["C++", "Python"],
+		"version": "1.0.0",
+		"changelog": {
+			"1.0": "Initial Release"
+		},
+		"holoscan_sdk": {
+			"minimum_required_version": "3.3.0",
+			"tested_versions": [
+				"3.3.0"
+			]
+		},
+		"platforms": [
+			"x86_64",
+			"aarch64"
+		],
+		"tags": [
+			"Streaming",
+			"Synchronization"
+		],
+		"ranking": 2,
+		"requirements": {
+			"packages": [
+			]
+		}
+	}
+}
