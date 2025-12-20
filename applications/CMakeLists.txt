@@ -156,3 +156,5 @@ add_subdirectory(orsi)
 add_subdirectory(nvidia_nim)
 add_subdirectory(ehr_query_llm)
 add_subdirectory(slang)
+
+add_subdirectory(tcn_artekmed)

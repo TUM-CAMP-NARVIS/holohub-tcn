@@ -57,6 +57,9 @@ add_holohub_operator(yuan_qcap DEPENDS EXTENSIONS yuan_qcap)
 add_holohub_operator(ehr_query_llm)
 add_holohub_operator(xr)
 
+
+add_subdirectory(tcn_artekmed)
+
 # install
 install(
     DIRECTORY "${CMAKE_BINARY_DIR}/python/lib/holohub"
