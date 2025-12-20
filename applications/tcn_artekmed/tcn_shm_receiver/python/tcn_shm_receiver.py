@@ -6,11 +6,7 @@ import logging
 from argparse import ArgumentParser
 from typing import Any, Dict, List, Optional, Callable, Tuple, Union
 import queue
-import threading
-import ctypes
-from enum import IntEnum
-from pathlib import Path
-from typing import Union
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import holoscan as hs
 import numpy as np
@@ -23,127 +19,17 @@ from holoscan.core import Application, ConditionType, IOSpec, Operator, Operator
 from holoscan.schedulers import EventBasedScheduler, GreedyScheduler, MultiThreadScheduler
 from holoscan.operators import HolovizOp
 
-
+import iceoryx2 as iox2
 from tcnart.core.semantic_type import SemanticType
-
-from .shm_serde import decode_buffer_descriptor, decode_shm_buffer_connection_status, decode_shm_device_context
+from shm_receiver import ShmSynchronizedBufferReceiver
+from shm_serde import shm_transport_enum
 
 log = logging.getLogger(__name__)
 
 
-class StatsOp(Operator):
-    """Print common streaming statistics"""
-
-    def __init__(self, app, *args, **kwargs):
-        self.encode_latency = []
-        self.decode_latency = []
-        self.jitter_time = []
-        self.fps = []
-        self.first_frame_ignored = False
-        self._logger = logging.getLogger(__name__)
-        super().__init__(app, *args, **kwargs)
-
-    def setup(self, spec):
-        spec.input("input")
-
-    def compute(self, op_input, op_output, context):
-        _ = op_input.receive("input")
-        if not self.first_frame_ignored:
-            self.first_frame_ignored = True
-            return
-
-        # Check if metadata exists before accessing it
-        if hasattr(self, "metadata"):
-            self.encode_latency.append(self.metadata.get("video_encoder_encode_latency_ms", 0))
-            self.decode_latency.append(self.metadata.get("video_decoder_decode_latency_ms", 0))
-            self.jitter_time.append(self.metadata.get("jitter_time", 0))
-            self.fps.append(self.metadata.get("fps", 0))
-
-    def stop(self):
-        if self.encode_latency:
-            self._logger.info(
-                f"Encode Latency (ms) (min, max, avg): {min(self.encode_latency):.3f}, {max(self.encode_latency):.3f}, {sum(self.encode_latency) / len(self.encode_latency):.3f}"
-            )
-        if self.decode_latency:
-            self._logger.info(
-                f"Decode Latency (ms) (min, max, avg): {min(self.decode_latency):.3f}, {max(self.decode_latency):.3f}, {sum(self.decode_latency) / len(self.decode_latency):.3f}"
-            )
-        if self.jitter_time:
-            self._logger.info(
-                f"Jitter Time (ms) (min, max, avg): {min(self.jitter_time):.3f}, {max(self.jitter_time):.3f}, {sum(self.jitter_time) / len(self.jitter_time):.3f}"
-            )
-        if self.fps:
-            self._logger.info(
-                f"FPS (min, max, avg): {min(self.fps):.3f}, {max(self.fps):.3f}, {sum(self.fps) / len(self.fps):.3f}"
-            )
 
 
-class CdrDecoderOp(Operator):
-    """Decode CDR Payload Baseclass.
-
-    This operator has 1 input and 1 output port:
-        input:  "in"
-        output: "out"
-
-    The data from each input is multiplied by a user-defined value.
-
-    """
-
-    def __init__(self,
-                 fragment: Any,
-                 type_class: Any,
-                 result_factory: Callable,
-                 source: str,
-                 stream_index: int,
-                 semantic_type: SemanticType,
-                 annotations: Dict[str, FrameAnnotation],
-                 *args,
-                 **kwargs):
-
-        self.type_class = type_class
-        self.source = source
-        self.stream_index = stream_index
-        self.semantic_type = semantic_type
-        self.annotations = annotations
-        self.result_factory = result_factory if result_factory else lambda m, tn, d: d
-
-        # Need to call the base class constructor last
-        super().__init__(fragment, *args, **kwargs)
-
-    def setup(self, spec: OperatorSpec):
-        spec.input("input")
-        spec.output("output")
-
-    def compute(self, op_input, op_output, context):
-        value = op_input.receive("input")
-
-        type_name = self.metadata.get("CdrTypeName", None)
-
-        if type_name is None:
-            return
-
-        self.metadata.set("StreamSource", self.source)
-        self.metadata.set("StreamIndex", self.stream_index)
-        self.metadata.set("SemanticType", self.semantic_type)
-
-        for k,v in self.annotations.items():
-            self.metadata.set(k, v)
-
-        # decode using the provided type_class
-        try:
-            # allocates buffers in library ...
-            msg = self.type_class.deserialize(value)
-        except MessageError as e:
-            log.exception(e)
-            msg = InvalidMessage()
-
-        result = {"": self.result_factory(self.metadata, type_name, msg)}
-        op_output.emit(result, "output")
-
-
-
-
-class ZenohSubscriberOp(Operator):
+class ShmSubscriberOp(Operator):
     """Simple zenoh subscriber.
 
     On each tick, it transmits a received message to the "out" port.
@@ -157,171 +43,179 @@ class ZenohSubscriberOp(Operator):
     def __init__(
         self,
         fragment: Any,
-        session: Any,
-        topic: str,
+        subscriber: Any,
+        stream_name: str,
+        channel_config: Any,
+        cycle_time_ms: int,
         *args,
         **kwargs,
     ):
-        self.session = session
-        self.topic = topic
-
-        self.subscriber = None
+        self.subscriber = subscriber
+        self.channel_config = channel_config
+        self.stream_name = stream_name
+        self.cycle_time_ms = cycle_time_ms
         self.pool = None
 
+        self.executor_ = ThreadPoolExecutor(max_workers=1)
+        self.future_ = None  # will be set during start()
         self.async_cond_ = AsynchronousCondition(fragment, name="async_cond")
         self.buffer = queue.Queue()
 
         # Need to call the base class constructor last
         super().__init__(fragment, self.async_cond_, *args, **kwargs)
 
-    def on_receive(self, sample: Any):
+    def on_receive(self, user_header: Any, message: Any):
         """Function to be supplied as callback
 
         When the condition's event_state is EVENT_WAITING, set to EVENT_DONE. This function will
         only exit once the condition is set to EVENT_NEVER.
         """
         if self.async_cond_.event_state == AsynchronousEventState.EVENT_NEVER:
-            return
+            return False
 
-        if sample is None or sample.payload is None or sample.attachment is None:
-            log.warning("received incomplete sample.")
-            return
+        # log.debug(f"on_receive frame with timestamp {user_header.timestamp}")
+        data = {}
+        frame_timestamp = user_header.timestamp
+        for port in message.ports:
+            if port.data.portType == shm_transport_enum.CameraPortType.colorimage:
+                # log.debug(f"added port data: {port.name}")
+                md = port.data.metadata
+                mv = memoryview(port.data.data)
+                # for now we copy the payload from shm to a newly allocated numpy array
+                # this could be improved by preallocating these arrays (double buffering)
+                # and use np.copy_to(src, dst) to avoid repeated allocations
+                data[port.name] = np.frombuffer(mv, dtype=np.uint8).reshape(
+                    md.header.dimY, md.header.dimX, int(md.header.bitsPerElement/8)
+                ).copy()
+            elif port.data.portType == shm_transport_enum.CameraPortType.depthimage:
+                # log.debug(f"added port data: {port.name}")
+                md = port.data.metadata
+                mv = memoryview(port.data.data)
+                # for now we copy the payload from shm to a newly allocated numpy array
+                # this could be improved by preallocating these arrays (double buffering)
+                # and use np.copy_to(src, dst) to avoid repeated allocations
+                data[port.name] = np.frombuffer(mv, dtype=np.uint16).reshape(
+                    md.header.dimY, md.header.dimX, 1
+                ).copy()
 
-        try:
-            payload = sample.payload.to_bytes()
-            type_name = sample.attachment.to_string()
-        except Exception as e:
-            log.exception(e)
-            type_name = None
-            payload = None
-
-        if payload is not None and type_name is not None:
+        if data:
             # how does ts relate to fragment.scheduler().clock.timestamp()?
-            self.buffer.put((type_name, payload))
+            # log.debug(f"put data for {frame_timestamp} into queue")
+            self.buffer.put((frame_timestamp, data))
 
             if self.async_cond_.event_state == AsynchronousEventState.EVENT_WAITING:
                 self.async_cond_.event_state = AsynchronousEventState.EVENT_DONE
+            return True
+
+        return False
+
+    def receiver_mainloop(self):
+        while self.subscriber is not None:
+            if not self.subscriber.receive_frame(self.on_receive, self.cycle_time_ms):
+                log.warning("could not receive frame.")
 
     def setup(self, spec: OperatorSpec):
-        spec.output("output")
+        spec.output("outputs")
+        spec.output("output_specs")
 
     def start(self):
-        self.subscriber = self.session.declare_subscriber(self.topic, self.on_receive)
+        self.subscriber.subscribe(self.stream_name)
+
+        self.future_ = self.executor_.submit(self.receiver_mainloop)
+        assert isinstance(self.future_, Future)
 
     def compute(self, op_input, op_output, context):
         scheduler = self.fragment.scheduler()
         clock = scheduler.clock
         ts = clock.timestamp()
 
-        type_name, block = self.buffer.get()
+        frame_ts, data = self.buffer.get()
+        log.debug(f"got data for {frame_ts} from queue")
+        message = {k:hs.as_tensor(v) for k,v in data.items()}
 
         self.async_cond_.event_state = AsynchronousEventState.EVENT_WAITING
+        op_output.emit(message, "outputs", acq_timestamp=ts)
 
-        self.metadata.set("CdrTypeName", type_name)
+        num_videos = len(message.keys())
 
-        op_output.emit(block, "output", acq_timestamp=ts)
+        # Determine grid size (e.g., 2 for 2x2, 3 for 3x3)
+        grid_size = int(np.ceil(np.sqrt(num_videos))) if num_videos > 0 else 1
+        tile_size = 1.0 / grid_size
+
+        output_specs = []
+        for i, port_name in enumerate(message.keys()):
+            # Compute row and column index
+            row = i // grid_size
+            col = i % grid_size
+
+            # Compute normalized offsets (0.0 to 1.0)
+            # Note: Holoviz usually uses (x, y) for offsets
+            offset_x = col * tile_size
+            offset_y = row * tile_size
+
+            spec = HolovizOp.InputSpec(port_name, HolovizOp.InputType.COLOR)
+            views = []
+            view = HolovizOp.InputSpec.View()
+            view.offset_x = offset_x
+            view.offset_y = offset_y
+            view.width = tile_size
+            view.height = tile_size
+            views.append(view)
+            spec.views = views
+            output_specs.append(spec)
+
+        op_output.emit(output_specs, "output_specs", acq_timestamp=ts)
+
 
     def stop(self):
         self.async_cond_.event_state = AsynchronousEventState.EVENT_NEVER
         if self.subscriber is not None:
-            self.subscriber.undeclare()
             self.subscriber = None
-
-
-
-class PingRxOp(Operator):
-    """Simple receiver operator.
-
-    This is an example of a native operator with one input port.
-    On each tick, it receives an integer from the "in" port.
-
-    **==Named Inputs==**
-
-        in : any
-            A received value.
-    """
-
-    def __init__(self, fragment, *args, **kwargs):
-        # Need to call the base class constructor last
-        super().__init__(fragment, *args, **kwargs)
-
-    def setup(self, spec: OperatorSpec):
-        spec.input("input")
-
-    def compute(self, op_input, op_output, context):
-        value = op_input.receive("input")
-        #print(f"Received: {value}", self.metadata.keys())
+        self.future_.result()
 
 
 class App(hs.core.Application):
     def compose(self):
         # Add your operators here
-        print("Starting TCN Test Receiver")
+        print("Starting TCN Shm Receiver")
 
-        zenoh_config = self.kwargs("zenoh")
+        shm_config = self.kwargs("shared_memory")
 
-        topic_prefix = zenoh_config.get("topic_prefix")
-        capture_node = zenoh_config.get("capture_node")
-        zenoh_config_file = zenoh_config.get("zenoh_config_file")
+        stream_name = shm_config.get("stream_name")
+        cycle_time_ms = shm_config.get("cycle_time_ms")
 
+        node = iox2.NodeBuilder.new().create(iox2.ServiceType.Ipc)
+        shm_receiver = ShmSynchronizedBufferReceiver(node)
 
-        zenoh.init_log_from_env_or("info")
-        self.session = zenoh.open(zenoh.Config.from_json5(open(zenoh_config_file).read()))
+        log.info("Find cameras in shared memory")
+        camera_names = shm_receiver.discover_devices()
+        device_contexts = {}
+        for camera_name in camera_names:
+            log.info(f"Retrieving camera_info: {camera_name}")
+            ctx = shm_receiver.retrieve_device_context(camera_name)
+            if ctx is not None:
+                device_contexts[camera_name] = ctx
 
-        find_cameras_topic = f"{topic_prefix}/{capture_node}/rpc/sensor/*/describe"
-        print(f"Find cameras: {find_cameras_topic}")
+        log.info(f"Retrieve channel config for stream: {stream_name}")
+        channels_config = shm_receiver.retrieve_channel_config(stream_name)
+        subscriber_op = ShmSubscriberOp(self, shm_receiver, stream_name, channels_config, cycle_time_ms)
 
-        cameras = find_camera_sensors(self.session, find_cameras_topic)
-        channels_config, channel_calibration, channel_poses = build_channel_configs(cameras)
-        stream_config = resolve_stream_descriptors(
-            topic_prefix, None, channel_calibration, channel_poses, channels_config, self.session
-        )
-        stream_keys = list(sorted(stream_config.keys()))
-        num_streams = len(stream_keys)
-        print(stream_keys)
-
-        def cb_decoder(meta, type_name, msg):
-            # is a video message, so return the raw image-bytes (typically bit/bytestream)
-            return np.asarray(msg.image, dtype=np.uint8, copy=True)
-
-        for stream_index, stream_name in enumerate(stream_keys):
-            config = stream_config[stream_name]
-            topic = config.descriptor.stream_topic
-            subscriber = ZenohSubscriberOp(self, self.session, topic,
-                                           name=f"subscriber_{stream_name}")
-
-            deserializer = CdrDecoderOp(self, VideoStreamMessage, cb_decoder, stream_name, stream_index,
-                                   SemanticType.from_identifier(config.descriptor.buffer_info.semantic_type),
-                                   config.annotations,
-                                   name=f"cdr_decoder_{stream_name}")
-
-            decoder = NvVideoDecoderOp(
+        visualizer = HolovizOp(
+            self,
+            name="visualizer",
+            allocator=CudaStreamPool(
                 self,
-                name=f"nv_decoder_{stream_name}",
-                allocator=UnboundedAllocator(self, name=f"video_decoder_pool_{stream_name}"),
-                **self.kwargs("decoder"),
-            )
-
-            stats = StatsOp(self, name=f"stats_{stream_name}")
-
-            self.add_flow(subscriber, deserializer, {('output', 'input')})
-            self.add_flow(deserializer, decoder, {('output', 'input')})
-            self.add_flow(decoder, stats, {("output", "input")})
-
-        # visualizer = HolovizOp(
-        #     self,
-        #     name="visualizer",
-        #     allocator=CudaStreamPool(
-        #         self,
-        #         name="cuda_stream",
-        #         dev_id=0,
-        #         stream_flags=0,
-        #         stream_priority=0,
-        #         reserved_size=1,
-        #         max_size=num_streams,
-        #     ),
-        #     **self.kwargs("holoviz"),
-        # )
+                name="cuda_stream",
+                dev_id=0,
+                stream_flags=0,
+                stream_priority=0,
+                reserved_size=1,
+                max_size=channels_config.get("numPorts", 1),
+            ),
+            **self.kwargs("holoviz"),
+        )
+        self.add_flow(subscriber_op, visualizer, {("outputs", "receivers")})
+        self.add_flow(subscriber_op, visualizer, {("output_specs", "input_specs")})
 
 
 def main(config_file=None):
@@ -346,7 +240,7 @@ def main(config_file=None):
 if __name__ == "__main__":
 
 
-    parser = ArgumentParser(description="ARTEKMED Holoscan Client.")
+    parser = ArgumentParser(description="ARTEKMED Holoscan SHM Client.")
 
     parser.add_argument(
         "-c",
