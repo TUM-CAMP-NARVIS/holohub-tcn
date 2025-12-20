@@ -3,14 +3,17 @@ import os
 from pathlib import Path
 from typing import Union
 
-SCHEMA_PATH = (Path(__file__) / Path("schema/shm_synchronized_transport.capnp")).resolve()
+SCHEMA_PATH = (Path(__file__).parent / Path("schema/shm_synchronized_transport.capnp")).resolve()
+ENUM_SCHEMA_PATH = (Path(__file__).parent / Path("schema/enumerations.capnp")).resolve()
 PACKAGES_PATH = Path(capnp.__file__).resolve().parent.parent
 CANDIDATE_INCLUDE_ROOTS = [
     str(SCHEMA_PATH.parent),
     str(PACKAGES_PATH),
 ]
 IMPORTS = [p for p in CANDIDATE_INCLUDE_ROOTS if os.path.isdir(p)]
+
 shm_transport_schema = capnp.load(str(SCHEMA_PATH), imports=IMPORTS)
+shm_transport_enum = capnp.load(str(ENUM_SCHEMA_PATH), imports=IMPORTS)
 
 def decode_buffer_descriptor(buf: Union[bytes, bytearray, memoryview]):
     """
