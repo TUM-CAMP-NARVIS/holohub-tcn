@@ -59,6 +59,26 @@ RUN python3 -m pip install --no-cache-dir -r /tmp/requirements.txt
 RUN apt-get update \
     && apt-get install -y \
       libavformat-dev gdb rustc cargo \
+      libeigen3-dev \
     && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /tmp/dependencies
+WORKDIR /tmp/dependencies
+RUN git clone https://github.com/pybind/pybind11 && \
+    cd pybind11 && \
+    git checkout v2.13.6 && \
+    mkdir build && \
+    cd build && \
+    cmake -G "Ninja" .. -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build . --config Release&& \
+    cmake --install .
+
+RUN git clone https://github.com/TUM-CAMP-NARVIS/xylt.git && \
+    cd xylt && \
+    mkdir build && \
+    cd build && \
+    cmake -G "Ninja" .. -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build . --config Release && \
+    cmake --install . --prefix=/usr
 
 WORKDIR /

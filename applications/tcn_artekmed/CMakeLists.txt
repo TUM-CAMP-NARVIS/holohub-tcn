@@ -15,11 +15,8 @@
 
 add_holohub_application(tcn_zenoh_receiver DEPENDS OPERATORS
                           nv_video_decoder
-                          #tcn_artekmed
                           )
 
-add_holohub_application(tcn_shm_receiver
-                          #DEPENDS OPERATORS
-                          #nv_video_decoder
-                          #tcn_artekmed
+add_holohub_application(tcn_shm_receiver DEPENDS OPERATORS
+                          tcn_depthimage_backprojection
                           )
