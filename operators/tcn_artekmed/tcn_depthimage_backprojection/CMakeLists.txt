@@ -13,19 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-cmake_minimum_required(VERSION 3.20)
-project(tcn_shm_receiver LANGUAGES NONE)
+cmake_minimum_required(VERSION 3.24)
+project(tcn_depthimage_backprojection LANGUAGES CXX CUDA)
 
-find_package(holoscan 3.7.0 REQUIRED CONFIG
+find_package(holoscan 3.0 REQUIRED CONFIG
              PATHS "/opt/nvidia/holoscan" "/workspace/holoscan-sdk/install")
 
-# Enable the operators
-add_library(tcn_shm_receiver INTERFACE)
-target_link_libraries(tcn_shm_receiver INTERFACE
-    holoscan::core
-    holoscan::ops::format_converter
-    holoscan::ops::holoviz
-    #holoscan::ops::nv_video_decoder
-    #holoscan::ops::tcn_stream_synchronizer
-    holoscan::ops::tcn_depthimage_backprojection
+# Decoder Operator
+add_library(tcn_depthimage_backprojection SHARED
+        tcn_depthimage_backprojection.cpp
+        tcn_depthimage_backprojection_kernel.cu
 )
+add_library(holoscan::ops::tcn_depthimage_backprojection ALIAS tcn_depthimage_backprojection)
+
+target_link_libraries(tcn_depthimage_backprojection PUBLIC
+  holoscan::core
+  cuda
+)
+target_include_directories(tcn_depthimage_backprojection PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+)
+
+#add_subdirectory(python)

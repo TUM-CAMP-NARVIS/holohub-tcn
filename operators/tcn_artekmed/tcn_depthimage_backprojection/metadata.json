@@ -1,7 +1,7 @@
 {
 	"operator": {
-		"name": "TcnStreamSynchronizerOp",
-		"description": "This operator synchronizes several video streams.",
+		"name": "TcnDepthImageTcnDepthImageBackprojectionOp",
+		"description": "This operator projects a depthimage into a pointcloud.",
 		"authors": [
 			{
                 "name": "Ulrich Eck",
@@ -25,7 +25,7 @@
 		],
 		"tags": [
 			"Streaming",
-			"Synchronization"
+			"Pointcloud Processing"
 		],
 		"ranking": 2,
 		"requirements": {

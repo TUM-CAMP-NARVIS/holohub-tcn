@@ -220,7 +220,7 @@ class App(hs.core.Application):
 
 def main(config_file=None):
     # make configurable or use holoscan debug level here too
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=logging.INFO)
     set_log_level(LogLevel.INFO)
 
     app = App()
