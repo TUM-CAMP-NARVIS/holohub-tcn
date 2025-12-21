@@ -94,7 +94,7 @@ PYBIND11_MODULE(_tcn_depthimage_backprojection, m) {
   m.attr("__version__") = "dev";
 #endif
 
-  py::enum_<nvidia::gxf::DistortionType>(m, "DistortionType")
+  py::enum_<nvidia::gxf::DistortionType>(m, "DistortionType", doc::TcnDepthImageBackprojectionOp::doc_DistortionType)
     .value("Perspective", nvidia::gxf::DistortionType::Perspective)
     .value("Brown", nvidia::gxf::DistortionType::Brown)
     .value("Polynomial", nvidia::gxf::DistortionType::Polynomial)
@@ -103,18 +103,18 @@ PYBIND11_MODULE(_tcn_depthimage_backprojection, m) {
     .value("FisheyeOrthoGraphic", nvidia::gxf::DistortionType::FisheyeOrthoGraphic)
     .value("FisheyeStereographic", nvidia::gxf::DistortionType::FisheyeStereographic);
 
-  py::class_<nvidia::gxf::Vector2u>(m, "Vector2u")
+  py::class_<nvidia::gxf::Vector2u>(m, "Vector2u", doc::TcnDepthImageBackprojectionOp::doc_Vector2u)
     .def(py::init<>())
     .def_readwrite("x", &nvidia::gxf::Vector2u::x)
     .def_readwrite("y", &nvidia::gxf::Vector2u::y)
   ;
-  py::class_<nvidia::gxf::Vector2f>(m, "Vector2f")
+  py::class_<nvidia::gxf::Vector2f>(m, "Vector2f", doc::TcnDepthImageBackprojectionOp::doc_Vector2f)
     .def(py::init<>())
     .def_readwrite("x", &nvidia::gxf::Vector2f::x)
     .def_readwrite("y", &nvidia::gxf::Vector2f::y)
   ;
 
-  py::class_<nvidia::gxf::CameraModel>(m, "CameraModel")
+  py::class_<nvidia::gxf::CameraModel>(m, "CameraModel", doc::TcnDepthImageBackprojectionOp::doc_CameraModel)
     .def(py::init<>())
     .def_readwrite("dimensions", &nvidia::gxf::CameraModel::dimensions)
     .def_readwrite("focal_length", &nvidia::gxf::CameraModel::focal_length)
@@ -123,7 +123,8 @@ PYBIND11_MODULE(_tcn_depthimage_backprojection, m) {
     .def_readwrite("distortion_type", &nvidia::gxf::CameraModel::distortion_type)
     .def_readwrite("distortion_coefficients", &nvidia::gxf::CameraModel::distortion_coefficients)
   ;
-  // py::class_<nvidia::gxf::Pose3D>(m, "Pose3D")
+
+  // py::class_<nvidia::gxf::Pose3D>(m, "Pose", doc::TcnDepthImageBackprojectionOp::doc_Pose)
   //   .def(py::init<>())
   //   .def_readwrite("rotation", &nvidia::gxf::Pose3D::rotation)
   //   .def_readwrite("translation", &nvidia::gxf::Pose3D::translation)
