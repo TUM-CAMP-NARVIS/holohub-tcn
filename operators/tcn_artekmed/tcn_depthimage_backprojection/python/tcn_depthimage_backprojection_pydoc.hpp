@@ -21,14 +21,14 @@
 
 #include "macros.hpp"
 
-namespace tcn::doc::TcnStreamSynchronizerOp {
+namespace tcn::doc::TcnDepthImageBackprojectionOp {
 
-PYDOC(TcnStreamSynchronizerOp, R"doc(
-Nv Video Decoder operator.
+PYDOC(TcnDepthImageBackprojectionOp, R"doc(
+TCN Artekmed Dephtimagepthi operator.
 )doc")
 
-// PyTcnStreamSynchronizerOp Constructor
-PYDOC(TcnStreamSynchronizerOp_python, R"doc(
+// PyTcnDepthImageBackprojectionOp Constructor
+PYDOC(TcnDepthImageBackprojectionOp_python, R"doc(
 Nv Video Decoder operator.
 
 Parameters
@@ -60,4 +60,4 @@ spec : holoscan.core.OperatorSpec
 )doc")
 
 
-}  // namespace holoscan::doc::TcnStreamSynchronizerOp
+}  // namespace holoscan::doc::TcnDepthImageBackprojectionOp

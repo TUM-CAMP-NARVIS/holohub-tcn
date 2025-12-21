@@ -39,7 +39,7 @@ using pybind11::literals::operator""_a;
 
 namespace py = pybind11;
 
-namespace holoscan::ops {
+namespace tcn::ops {
 
 /* Trampoline class for handling Python kwargs
  *
@@ -57,17 +57,17 @@ class PyTcnStreamSynchronizerOp : public TcnStreamSynchronizerOp {
   using TcnStreamSynchronizerOp::TcnStreamSynchronizerOp;
 
   // Define a constructor that fully initializes the object.
-  PyTcnStreamSynchronizerOp(Fragment* fragment, const py::args& args, int cuda_device_ordinal,
+  PyTcnStreamSynchronizerOp(holoscan::Fragment* fragment, const py::args& args, int cuda_device_ordinal,
                      std::shared_ptr<::holoscan::Allocator> allocator, int num_streams, bool verbose,
                      const std::string& name = "nv_video_decoder")
-      : TcnStreamSynchronizerOp(ArgList{Arg{"cuda_device_ordinal", cuda_device_ordinal},
-                                 Arg{"allocator", allocator},
-                                 Arg{"num_streams", num_streams},
-                                 Arg{"verbose", verbose}}) {
+      : TcnStreamSynchronizerOp(holoscan::ArgList{holoscan::Arg{"cuda_device_ordinal", cuda_device_ordinal},
+                                 holoscan::Arg{"allocator", allocator},
+                                 holoscan::Arg{"num_streams", num_streams},
+                                 holoscan::Arg{"verbose", verbose}}) {
     add_positional_condition_and_resource_args(this, args);
     name_ = name;
     fragment_ = fragment;
-    spec_ = std::make_shared<OperatorSpec>(fragment);
+    spec_ = std::make_shared<holoscan::OperatorSpec>(fragment);
     setup(*spec_.get());
   }
 };

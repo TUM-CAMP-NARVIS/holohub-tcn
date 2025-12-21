@@ -34,9 +34,9 @@
 
 #include "../common/utils.h"
 
-namespace holoscan::ops {
+namespace tcn::ops {
 
-void TcnStreamSynchronizerOp::setup(OperatorSpec& spec) {
+void TcnStreamSynchronizerOp::setup(holoscan::OperatorSpec& spec) {
   spec.param(num_streams_, "num_streams", "Number of Streams", "Number of input streams to synchronize.");
   HOLOSCAN_LOG_INFO("Synchronizer ports: {}", num_streams_.get());
 
@@ -53,7 +53,7 @@ void TcnStreamSynchronizerOp::setup(OperatorSpec& spec) {
              "cuda_device_ordinal",
              "CudaDeviceOrdinal",
              "Device to use for CUDA operations",
-             ParameterFlag::kOptional);
+             holoscan::ParameterFlag::kOptional);
 
   spec.param(allocator_, "allocator", "Allocator", "Allocator for output buffers.");
   spec.param(verbose_, "verbose", "Verbose", "Print detailed decoder information", false);
@@ -78,8 +78,8 @@ void TcnStreamSynchronizerOp::initialize() {
   // Initialize state for synchronizer
 }
 
-void TcnStreamSynchronizerOp::compute(InputContext& op_input, OutputContext& op_output,
-                                      ExecutionContext& context) {
+void TcnStreamSynchronizerOp::compute(holoscan::InputContext& op_input, holoscan::OutputContext& op_output,
+                                      holoscan::ExecutionContext& context) {
   auto enter_timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
                              std::chrono::steady_clock::now().time_since_epoch())
                              .count();
@@ -144,7 +144,7 @@ void TcnStreamSynchronizerOp::compute(InputContext& op_input, OutputContext& op_
 
   // maybe set metadata ..
 
-  auto output_result = gxf::Entity(std::move(output.value()));
+  auto output_result = holoscan::gxf::Entity(std::move(output.value()));
   op_output.emit(output_result, "output");
   last_emit_timestamp_ = emit_timestamp;
 }
