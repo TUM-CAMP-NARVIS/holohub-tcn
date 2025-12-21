@@ -18,9 +18,10 @@ from holoscan.conditions import AsynchronousCondition, AsynchronousEventState, B
 from holoscan.core import Application, ConditionType, IOSpec, Operator, OperatorSpec, Tracker
 from holoscan.schedulers import EventBasedScheduler, GreedyScheduler, MultiThreadScheduler
 from holoscan.operators import HolovizOp
+from holoscan.operators import holoviz
 
 from holohub.tcn_depthimage_backprojection import TcnDepthImageBackprojectionOp
-
+from holohub.tcn_depthimage_backprojection._tcn_depthimage_backprojection import CameraModel, make_pose
 
 import iceoryx2 as iox2
 from tcnart.core.semantic_type import SemanticType
@@ -136,8 +137,6 @@ class ShmSubscriberOp(Operator):
         log.debug(f"got data for {frame_ts} from queue")
         message = {k:hs.as_tensor(v) for k,v in data.items()}
 
-        import pdb;pdb.set_trace()
-
         self.async_cond_.event_state = AsynchronousEventState.EVENT_WAITING
         op_output.emit(message, "outputs", acq_timestamp=ts)
 
@@ -167,6 +166,7 @@ class ShmSubscriberOp(Operator):
             view.height = tile_size
             views.append(view)
             spec.views = views
+            spec.image_format = holoviz._holoviz_str_to_image_format["b8g8r8a8_unorm"] if "color" in port_name else holoviz._holoviz_str_to_image_format["r16_uint"]
             output_specs.append(spec)
 
         op_output.emit(output_specs, "output_specs", acq_timestamp=ts)
@@ -227,6 +227,7 @@ def main(config_file=None):
     # make configurable or use holoscan debug level here too
     logging.basicConfig(level=logging.INFO)
     set_log_level(LogLevel.INFO)
+    iox2.set_log_level(iox2.LogLevel.Trace)
 
     app = App()
     app.config(config_file)

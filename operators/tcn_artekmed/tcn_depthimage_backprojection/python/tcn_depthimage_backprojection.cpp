@@ -128,6 +128,7 @@ PYBIND11_MODULE(_tcn_depthimage_backprojection, m) {
   //   .def_readwrite("rotation", &nvidia::gxf::Pose3D::rotation)
   //   .def_readwrite("translation", &nvidia::gxf::Pose3D::translation)
   // ;
+  m.def("make_pose", []() { nvidia::gxf::Pose3D pose{}; return pose;});
 
   py::class_<TcnDepthImageBackprojectionOp, PyTcnDepthImageBackprojectionOp, holoscan::Operator, std::shared_ptr<TcnDepthImageBackprojectionOp>>(
       m, "TcnDepthImageBackprojectionOp", doc::TcnDepthImageBackprojectionOp::doc_TcnDepthImageBackprojectionOp)
