@@ -19,6 +19,9 @@ from holoscan.core import Application, ConditionType, IOSpec, Operator, Operator
 from holoscan.schedulers import EventBasedScheduler, GreedyScheduler, MultiThreadScheduler
 from holoscan.operators import HolovizOp
 
+from holohub.tcn_depthimage_backprojection import TcnDepthImageBackprojectionOp
+
+
 import iceoryx2 as iox2
 from tcnart.core.semantic_type import SemanticType
 from shm_receiver import ShmSynchronizedBufferReceiver
@@ -132,6 +135,8 @@ class ShmSubscriberOp(Operator):
         frame_ts, data = self.buffer.get()
         log.debug(f"got data for {frame_ts} from queue")
         message = {k:hs.as_tensor(v) for k,v in data.items()}
+
+        import pdb;pdb.set_trace()
 
         self.async_cond_.event_state = AsynchronousEventState.EVENT_WAITING
         op_output.emit(message, "outputs", acq_timestamp=ts)

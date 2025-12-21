@@ -13,9 +13,10 @@ void TcnDepthImageBackprojectionOp::setup(holoscan::OperatorSpec& spec) {
   // Inputs
   spec.input<holoscan::Tensor>("depth_image");     // device, [H, W], uint16
   spec.input<holoscan::Tensor>("xy_table");        // device, [H, W, 2], float32
+  spec.input<nvidia::gxf::CameraModel>("depth_params");    // host/device, raw bytes of CameraParameters
   spec.input<nvidia::gxf::CameraModel>("color_params");    // host/device, raw bytes of CameraParameters
-  spec.input<holoscan::Tensor>("color_to_depth");  // host/device, [4,4], float32
-  spec.input<holoscan::Tensor>("depth_extrinsics");// host/device, [4,4], float32
+  spec.input<nvidia::gxf::Pose3D>("color_to_depth");  // host/device, [4,4], float32
+  spec.input<nvidia::gxf::Pose3D>("depth_extrinsics");// host/device, [4,4], float32
 
   // Outputs (planar)
   spec.output<holoscan::Tensor>("positions");  // device, [H, W, 3], float32

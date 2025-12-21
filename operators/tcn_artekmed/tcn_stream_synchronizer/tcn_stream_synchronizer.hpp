@@ -28,13 +28,13 @@
 #include "holoscan/core/operator.hpp"
 #include "holoscan/utils/cuda_stream_handler.hpp"
 
-namespace holoscan::ops {
+namespace tcn::ops {
 
 /**
  * @brief Operator to synchronize multiple video streams.
  *
  */
-class TcnStreamSynchronizerOp : public Operator {
+class TcnStreamSynchronizerOp : public holoscan::Operator {
  public:
   HOLOSCAN_OPERATOR_FORWARD_ARGS(TcnStreamSynchronizerOp)
 
@@ -42,21 +42,21 @@ class TcnStreamSynchronizerOp : public Operator {
 
   void setup(OperatorSpec& spec) override;
   void initialize() override;
-  void compute(InputContext& op_input, OutputContext& op_output,
-               ExecutionContext& context) override;
+  void compute(holoscan::InputContext& op_input, holoscan::OutputContext& op_output,
+               holoscan::ExecutionContext& context) override;
   void stop() override;
 
  private:
   std::vector<std::string> in_port_names;
 
-  Parameter<int> cuda_device_ordinal_;
-  Parameter<int> width_;
-  Parameter<int> height_;
-  Parameter<std::shared_ptr<holoscan::Allocator>> allocator_;
-  Parameter<int> num_streams_;
-  Parameter<bool> verbose_;
+  holoscan::Parameter<int> cuda_device_ordinal_;
+  holoscan::Parameter<int> width_;
+  holoscan::Parameter<int> height_;
+  holoscan::Parameter<std::shared_ptr<holoscan::Allocator>> allocator_;
+  holoscan::Parameter<int> num_streams_;
+  holoscan::Parameter<bool> verbose_;
 
-  CudaStreamHandler cuda_stream_handler_;
+  holoscan::CudaStreamHandler cuda_stream_handler_;
 
   // CUDA
   CUcontext cu_context_ = nullptr;
@@ -65,6 +65,6 @@ class TcnStreamSynchronizerOp : public Operator {
   uint64_t last_emit_timestamp_ = 0;
 };
 
-}  // namespace holoscan::ops
+}  // namespace tcn::ops
 
 #endif /* TCN_STREAM_SYNCHRONIZER_TCN_STREAM_SYNCHRONIZER_HPP */

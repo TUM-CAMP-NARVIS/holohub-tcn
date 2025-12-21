@@ -13,17 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-cmake_minimum_required(VERSION 3.20)
-project(tcn_shm_receiver LANGUAGES NONE)
+include(pybind11_add_holohub_module)
 
-find_package(holoscan 3.7.0 REQUIRED CONFIG
-             PATHS "/opt/nvidia/holoscan" "/workspace/holoscan-sdk/install")
-
-# Enable the operators
-add_library(tcn_shm_receiver INTERFACE)
-target_link_libraries(tcn_shm_receiver INTERFACE
-    holoscan::core
-    holoscan::ops::format_converter
-    holoscan::ops::holoviz
-    holoscan::ops::tcn_depthimage_backprojection
+pybind11_add_holohub_module(
+    CPP_CMAKE_TARGET tcn_depthimage_backprojection
+    CLASS_NAME "TcnDepthImageBackprojectionOp"
+    SOURCES tcn_depthimage_backprojection.cpp
 )
