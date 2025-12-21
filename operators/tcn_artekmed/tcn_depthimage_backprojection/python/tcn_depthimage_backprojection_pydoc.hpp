@@ -59,5 +59,24 @@ spec : holoscan.core.OperatorSpec
     The operator specification.
 )doc")
 
+PYDOC(DistortionType, R"doc(
+DistortionType
+)doc")
+
+PYDOC(Vector2u, R"doc(
+Vector2u
+)doc")
+
+PYDOC(Vector2f, R"doc(
+Vector2f
+)doc")
+
+PYDOC(CameraModel, R"doc(
+CameraModel
+)doc")
+
+PYDOC(Pose, R"doc(
+Pose3D
+)doc")
 
 }  // namespace holoscan::doc::TcnDepthImageBackprojectionOp
