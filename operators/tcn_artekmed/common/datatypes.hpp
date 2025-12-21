@@ -5,9 +5,9 @@
 #include <Eigen/Core>
 
 // Simple math structs compatible with CUDA device code
-struct float2 { float x, y; };
-struct float3 { float x, y, z; };
-struct float4 { float x, y, z, w; };
+//struct float2 { float x, y; };
+//struct float3 { float x, y, z; };
+//struct float4 { float x, y, z, w; };
 
 struct float4x4 {
   // Column-major like in original code

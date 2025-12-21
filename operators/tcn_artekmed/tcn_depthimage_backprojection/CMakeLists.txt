@@ -21,7 +21,7 @@ find_package(holoscan 3.0 REQUIRED CONFIG
 
 # Decoder Operator
 add_library(tcn_depthimage_backprojection SHARED
-        tcn_depthimage_backprojection.cpp
+        tcn_depthimage_backprojection.cu
         tcn_depthimage_backprojection_kernel.cu
 )
 add_library(holoscan::ops::tcn_depthimage_backprojection ALIAS tcn_depthimage_backprojection)
@@ -29,6 +29,10 @@ add_library(holoscan::ops::tcn_depthimage_backprojection ALIAS tcn_depthimage_ba
 target_link_libraries(tcn_depthimage_backprojection PUBLIC
   holoscan::core
   cuda
+)
+target_compile_options(tcn_depthimage_backprojection
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
 )
 target_include_directories(tcn_depthimage_backprojection PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
