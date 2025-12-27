@@ -26,7 +26,7 @@ from holoscan.operators import holoviz
 from holoscan.pose_tree import SO3, Pose3, PoseTreeManager, PoseTree, PoseTreeAccessMethod
 
 from holohub.tcn_depthimage_backprojection import TcnDepthImageBackprojectionOp
-from holohub.tcn_depthimage_backprojection._tcn_depthimage_backprojection import CameraModel, DistortionType, make_pose
+from holohub.tcn_depthimage_backprojection._tcn_depthimage_backprojection import CameraModel, DistortionType, RigidTransform, CameraParameters, make_rigid_transform
 
 import iceoryx2 as iox2
 from tcnart.core.semantic_type import SemanticType
@@ -159,7 +159,7 @@ class DeviceContextService(DefaultFragmentService):
 
         return np.array(xy_lookup_table.data, dtype=np.float32).reshape((xy_lookup_table.height, xy_lookup_table.width, 2))
 
-    def get_depth_extrinsics(self, camera_name: str) -> Pose3 | None:
+    def get_depth_extrinsics(self, camera_name: str) -> RigidTransform | None:
         calib = self.get_device_calibration(camera_name)
         if calib is None:
             return None
@@ -169,7 +169,7 @@ class DeviceContextService(DefaultFragmentService):
         params = calib["cameraPose"]
         return self._pose3d_from_dict(params)
 
-    def get_color_to_depth(self, camera_name: str) -> Pose3 | None:
+    def get_color_to_depth(self, camera_name: str) -> RigidTransform | None:
         calib = self.get_device_calibration(camera_name)
         if calib is None:
             return None
@@ -180,19 +180,19 @@ class DeviceContextService(DefaultFragmentService):
         return self._pose3d_from_dict(params)
 
 
-    def _pose3d_from_dict(self, params) -> Pose3 | None:
-        return Pose3(
-            SO3.from_quaternion(np.asarray([
+    def _pose3d_from_dict(self, params) -> RigidTransform | None:
+        return make_rigid_transform(
+            hs.as_tensor(np.asarray([
+                params["translation"]["x"],
+                params["translation"]["y"],
+                params["translation"]["z"],
+            ])),
+            hs.as_tensor(np.asarray([
                 params["rotation"]["x"],
                 params["rotation"]["y"],
                 params["rotation"]["z"],
                 params["rotation"]["w"],
-            ])),
-            np.asarray([
-                params["translation"]["x"],
-                params["translation"]["y"],
-                params["translation"]["z"],
-            ])
+            ]))
         )
 
 
@@ -410,7 +410,7 @@ class PointCloudDummySinkOp(Operator):
     def compute(self, op_input, op_output, context):
         sig1 = op_input.receive("positions")
         sig2 = op_input.receive("texcoords")
-        print("received positions and texcoords")
+        # print("received positions and texcoords")
 
 class App(hs.core.Application):
     def compose(self):
@@ -498,11 +498,7 @@ class App(hs.core.Application):
                 )
             self.add_flow(split_op, bp_op, {
                 (channel_name, "depth_image"),
-                (f"{channel_name}_xy_table", "xy_table"),
-                (f"{channel_name}_depth_params", "depth_params"),
-                (f"{channel_name}_color_params", "color_params"),
-                (f"{channel_name}_color_to_depth", "color_to_depth"),
-                (f"{channel_name}_depth_extrinsics", "depth_extrinsics"),
+                (f"{channel_name}_xy_table", "xy_table")
             })
             sink_ops.append(bp_op)
 
@@ -546,13 +542,13 @@ class App(hs.core.Application):
 def main(config_file=None):
     # make configurable or use holoscan debug level here too
     logging.basicConfig(level=logging.INFO)
-    set_log_level(LogLevel.TRACE)
+    set_log_level(LogLevel.INFO)
     iox2.set_log_level(iox2.LogLevel.Warn)
 
     app = App()
     app.config(config_file)
 
-    scheduler = EventBasedScheduler(app, worker_thread_number=8, name="ebs")
+    scheduler = EventBasedScheduler(app, worker_thread_number=24, name="ebs")
     app.scheduler(scheduler)
 
     with Tracker(app) as tracker:

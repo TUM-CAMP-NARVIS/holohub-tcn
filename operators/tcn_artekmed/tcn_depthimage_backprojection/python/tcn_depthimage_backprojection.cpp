@@ -30,6 +30,7 @@
 
 #include <holoscan/python/core/emitter_receiver_registry.hpp>
 
+#include "../../common/datatypes.hpp"
 #include "../tcn_depthimage_backprojection.cuh"
 #include "./tcn_depthimage_backprojection_pydoc.hpp"
 
@@ -64,9 +65,9 @@ class PyTcnDepthImageBackprojectionOp : public TcnDepthImageBackprojectionOp {
                                   std::shared_ptr<holoscan::Allocator> allocator,
                                   float depth_units_per_meter, float near_limit_m,
                                   float far_limit_m, int color_image_width, int color_image_height,
-                                  std::shared_ptr<nvidia::gxf::CameraModel> color_params,
-                                  std::shared_ptr<holoscan::Pose3f> depth_extrinsics,
-                                  std::shared_ptr<holoscan::Pose3f> color_to_depth,
+                                  nvidia::gxf::CameraModel color_params,
+                                  RigidTransform depth_extrinsics,
+                                  RigidTransform color_to_depth,
                                   const std::string& name = "tcn_depthimage_backprojection")
       : TcnDepthImageBackprojectionOp(
             holoscan::ArgList{holoscan::Arg{"allocator", allocator},
@@ -117,10 +118,29 @@ PYBIND11_MODULE(_tcn_depthimage_backprojection, m) {
       .def(py::init<>())
       .def_readwrite("x", &nvidia::gxf::Vector2u::x)
       .def_readwrite("y", &nvidia::gxf::Vector2u::y);
+
   py::class_<nvidia::gxf::Vector2f>(m, "Vector2f", doc::TcnDepthImageBackprojectionOp::doc_Vector2f)
       .def(py::init<>())
       .def_readwrite("x", &nvidia::gxf::Vector2f::x)
       .def_readwrite("y", &nvidia::gxf::Vector2f::y);
+
+  py::class_<CameraParameters>(m, "CameraParameters")
+        .def(py::init<>())
+        .def_readwrite("fx", &CameraParameters::fx)
+        .def_readwrite("fy", &CameraParameters::fy)
+        .def_readwrite("cx", &CameraParameters::cx)
+        .def_readwrite("cy", &CameraParameters::cy)
+        .def_readwrite("k1", &CameraParameters::k1)
+        .def_readwrite("k2", &CameraParameters::k2)
+        .def_readwrite("k3", &CameraParameters::k3)
+        .def_readwrite("k4", &CameraParameters::k4)
+        .def_readwrite("k5", &CameraParameters::k5)
+        .def_readwrite("k6", &CameraParameters::k6)
+        .def_readwrite("codx", &CameraParameters::codx)
+        .def_readwrite("cody", &CameraParameters::cody)
+        .def_readwrite("p1", &CameraParameters::p1)
+        .def_readwrite("p2", &CameraParameters::p2)
+        .def_readwrite("is_distorted", &CameraParameters::is_distorted);
 
   py::class_<nvidia::gxf::CameraModel>(
       m, "CameraModel", doc::TcnDepthImageBackprojectionOp::doc_CameraModel)
@@ -132,14 +152,16 @@ PYBIND11_MODULE(_tcn_depthimage_backprojection, m) {
       .def_readwrite("distortion_type", &nvidia::gxf::CameraModel::distortion_type)
       .def_readwrite("distortion_coefficients", &nvidia::gxf::CameraModel::distortion_coefficients);
 
-  // py::class_<nvidia::gxf::Pose3D>(m, "Pose", doc::TcnDepthImageBackprojectionOp::doc_Pose)
-  //   .def(py::init<>())
-  //   .def_readwrite("rotation", &nvidia::gxf::Pose3D::rotation)
-  //   .def_readwrite("translation", &nvidia::gxf::Pose3D::translation)
-  // ;
-  m.def("make_pose", []() {
-    nvidia::gxf::Pose3D pose{};
-    return pose;
+  py::class_<RigidTransform>(m, "RigidTransform", doc::TcnDepthImageBackprojectionOp::doc_Pose)
+    .def(py::init<Eigen::Vector3f, Eigen::Quaternion<float>>())
+    .def_readwrite("rotation", &RigidTransform::rotation)
+    .def_readwrite("translation", &RigidTransform::translation)
+    ;
+
+  m.def("make_rigid_transform", [](holoscan::Tensor translation, holoscan::Tensor rotation) {
+    const Eigen::Map<Eigen::Vector3f> t(static_cast<float*>(translation.data()));
+    const Eigen::Map<Eigen::Vector4f> r(static_cast<float*>(rotation.data()));
+    return RigidTransform(t, Eigen::Quaternion<float>(r));
   });
 
   py::class_<TcnDepthImageBackprojectionOp,
@@ -157,9 +179,9 @@ PYBIND11_MODULE(_tcn_depthimage_backprojection, m) {
                     float,
                     int,
                     int,
-                    std::shared_ptr<nvidia::gxf::CameraModel>,
-                    std::shared_ptr<holoscan::Pose3f>,
-                    std::shared_ptr<holoscan::Pose3f>,
+                    nvidia::gxf::CameraModel,
+                    RigidTransform,
+                    RigidTransform,
                     const std::string&>(),
            "fragment"_a,
            "allocator"_a,
@@ -168,9 +190,9 @@ PYBIND11_MODULE(_tcn_depthimage_backprojection, m) {
            "far_limit_m"_a = 10.f,
            "color_image_width"_a = 1920,
            "color_image_height"_a = 1080,
-           "color_params"_a,
-           "depth_extrinsics"_a,
-           "color_to_depth"_a,
+           "color_params"_a = nvidia::gxf::CameraModel{},
+           "depth_extrinsics"_a = RigidTransform{},
+           "color_to_depth"_a = RigidTransform{},
            "name"_a = "tcn_depthimage_backprojection"s,
            doc::TcnDepthImageBackprojectionOp::doc_TcnDepthImageBackprojectionOp)
       .def("initialize",
@@ -184,9 +206,14 @@ PYBIND11_MODULE(_tcn_depthimage_backprojection, m) {
   // Import the emitter/receiver registry from holoscan.core and pass it to this function to
   // register this new C++ type with the SDK.
   m.def("register_types", [](holoscan::EmitterReceiverRegistry& registry) {
-    HOLOSCAN_LOG_INFO("TCN SHM Receiver - register typ");
-    // registry.add_emitter_receiver<std::vector<ApriltagDetectorOp::output_corners>>(
-    //     "std::vector<ApriltagDetectorOp::output_corners>"s);
+    HOLOSCAN_LOG_INFO("TCN SHM Receiver - register types");
+    // registry.add_emitter_receiver<nvidia::gxf::CameraModel>(
+    //     "nvidia::gxf::CameraModel"s);
+    // registry.add_emitter_receiver<holoscan::Pose3f>(
+    //     "holoscan::Pose3f"s);
+    // should have some reasonable namespacing here ..
+    registry.add_emitter_receiver<RigidTransform>(
+        "RigidTransform"s);
   });
 }  // PYBIND11_MODULE NOLINT
 }  // namespace tcn::ops
