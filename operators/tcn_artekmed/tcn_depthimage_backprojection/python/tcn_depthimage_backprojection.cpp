@@ -23,10 +23,13 @@
 #include <memory>
 #include <string>
 
+#include "gxf/multimedia/camera.hpp"
 #include "holoscan/core/fragment.hpp"
 #include "holoscan/core/operator.hpp"
 #include "holoscan/core/operator_spec.hpp"
-#include "gxf/multimedia/camera.hpp"
+
+#include <holoscan/python/core/emitter_receiver_registry.hpp>
+
 #include "../tcn_depthimage_backprojection.cuh"
 #include "./tcn_depthimage_backprojection_pydoc.hpp"
 
@@ -58,17 +61,23 @@ class PyTcnDepthImageBackprojectionOp : public TcnDepthImageBackprojectionOp {
 
   // Define a constructor that fully initializes the object.
   PyTcnDepthImageBackprojectionOp(holoscan::Fragment* fragment, const py::args& args,
-                     std::shared_ptr<::holoscan::Allocator> allocator,
-                     float depth_units_per_meter, float near_limit_m, float far_limit_m,
-                     int color_image_width, int color_image_height,
-                     const std::string& name = "tcn_depthimage_backprojection")
-      : TcnDepthImageBackprojectionOp(holoscan::ArgList{
-                                 holoscan::Arg{"allocator", allocator},
-                                 holoscan::Arg{"depth_units_per_meter", depth_units_per_meter},
-                                 holoscan::Arg{"near_limit_m", near_limit_m},
-                                 holoscan::Arg{"far_limit_m", far_limit_m},
-                                 holoscan::Arg{"color_image_width", color_image_width},
-                                 holoscan::Arg{"color_image_height", color_image_height}}) {
+                                  std::shared_ptr<holoscan::Allocator> allocator,
+                                  float depth_units_per_meter, float near_limit_m,
+                                  float far_limit_m, int color_image_width, int color_image_height,
+                                  std::shared_ptr<nvidia::gxf::CameraModel> color_params,
+                                  std::shared_ptr<holoscan::Pose3f> depth_extrinsics,
+                                  std::shared_ptr<holoscan::Pose3f> color_to_depth,
+                                  const std::string& name = "tcn_depthimage_backprojection")
+      : TcnDepthImageBackprojectionOp(
+            holoscan::ArgList{holoscan::Arg{"allocator", allocator},
+                              holoscan::Arg{"depth_units_per_meter", depth_units_per_meter},
+                              holoscan::Arg{"near_limit_m", near_limit_m},
+                              holoscan::Arg{"far_limit_m", far_limit_m},
+                              holoscan::Arg{"color_image_width", color_image_width},
+                              holoscan::Arg{"color_image_height", color_image_height},
+                              holoscan::Arg{"color_params", color_params},
+                              holoscan::Arg{"depth_extrinsics", depth_extrinsics},
+                              holoscan::Arg{"color_to_depth", color_to_depth}}) {
     add_positional_condition_and_resource_args(this, args);
     name_ = name;
     fragment_ = fragment;
@@ -81,7 +90,7 @@ class PyTcnDepthImageBackprojectionOp : public TcnDepthImageBackprojectionOp {
 
 PYBIND11_MODULE(_tcn_depthimage_backprojection, m) {
   m.doc() = R"pbdoc(
-        Holoscan SDK Python Bindings
+        Holoscan SDK TCN DepthImage Backprojection Python Bindings
         ---------------------------------------
         .. currentmodule:: _tcn_depthimage_backprojection
         .. autosummary::
@@ -94,53 +103,63 @@ PYBIND11_MODULE(_tcn_depthimage_backprojection, m) {
   m.attr("__version__") = "dev";
 #endif
 
-  py::enum_<nvidia::gxf::DistortionType>(m, "DistortionType", doc::TcnDepthImageBackprojectionOp::doc_DistortionType)
-    .value("Perspective", nvidia::gxf::DistortionType::Perspective)
-    .value("Brown", nvidia::gxf::DistortionType::Brown)
-    .value("Polynomial", nvidia::gxf::DistortionType::Polynomial)
-    .value("FisheyeEquidistant", nvidia::gxf::DistortionType::FisheyeEquidistant)
-    .value("FisheyeEquisolid", nvidia::gxf::DistortionType::FisheyeEquisolid)
-    .value("FisheyeOrthoGraphic", nvidia::gxf::DistortionType::FisheyeOrthoGraphic)
-    .value("FisheyeStereographic", nvidia::gxf::DistortionType::FisheyeStereographic);
+  py::enum_<nvidia::gxf::DistortionType>(
+      m, "DistortionType", doc::TcnDepthImageBackprojectionOp::doc_DistortionType)
+      .value("Perspective", nvidia::gxf::DistortionType::Perspective)
+      .value("Brown", nvidia::gxf::DistortionType::Brown)
+      .value("Polynomial", nvidia::gxf::DistortionType::Polynomial)
+      .value("FisheyeEquidistant", nvidia::gxf::DistortionType::FisheyeEquidistant)
+      .value("FisheyeEquisolid", nvidia::gxf::DistortionType::FisheyeEquisolid)
+      .value("FisheyeOrthoGraphic", nvidia::gxf::DistortionType::FisheyeOrthoGraphic)
+      .value("FisheyeStereographic", nvidia::gxf::DistortionType::FisheyeStereographic);
 
   py::class_<nvidia::gxf::Vector2u>(m, "Vector2u", doc::TcnDepthImageBackprojectionOp::doc_Vector2u)
-    .def(py::init<>())
-    .def_readwrite("x", &nvidia::gxf::Vector2u::x)
-    .def_readwrite("y", &nvidia::gxf::Vector2u::y)
-  ;
+      .def(py::init<>())
+      .def_readwrite("x", &nvidia::gxf::Vector2u::x)
+      .def_readwrite("y", &nvidia::gxf::Vector2u::y);
   py::class_<nvidia::gxf::Vector2f>(m, "Vector2f", doc::TcnDepthImageBackprojectionOp::doc_Vector2f)
-    .def(py::init<>())
-    .def_readwrite("x", &nvidia::gxf::Vector2f::x)
-    .def_readwrite("y", &nvidia::gxf::Vector2f::y)
-  ;
+      .def(py::init<>())
+      .def_readwrite("x", &nvidia::gxf::Vector2f::x)
+      .def_readwrite("y", &nvidia::gxf::Vector2f::y);
 
-  py::class_<nvidia::gxf::CameraModel>(m, "CameraModel", doc::TcnDepthImageBackprojectionOp::doc_CameraModel)
-    .def(py::init<>())
-    .def_readwrite("dimensions", &nvidia::gxf::CameraModel::dimensions)
-    .def_readwrite("focal_length", &nvidia::gxf::CameraModel::focal_length)
-    .def_readwrite("principal_point", &nvidia::gxf::CameraModel::principal_point)
-    .def_readwrite("skew_value", &nvidia::gxf::CameraModel::skew_value)
-    .def_readwrite("distortion_type", &nvidia::gxf::CameraModel::distortion_type)
-    .def_readwrite("distortion_coefficients", &nvidia::gxf::CameraModel::distortion_coefficients)
-  ;
+  py::class_<nvidia::gxf::CameraModel>(
+      m, "CameraModel", doc::TcnDepthImageBackprojectionOp::doc_CameraModel)
+      .def(py::init<>())
+      .def_readwrite("dimensions", &nvidia::gxf::CameraModel::dimensions)
+      .def_readwrite("focal_length", &nvidia::gxf::CameraModel::focal_length)
+      .def_readwrite("principal_point", &nvidia::gxf::CameraModel::principal_point)
+      .def_readwrite("skew_value", &nvidia::gxf::CameraModel::skew_value)
+      .def_readwrite("distortion_type", &nvidia::gxf::CameraModel::distortion_type)
+      .def_readwrite("distortion_coefficients", &nvidia::gxf::CameraModel::distortion_coefficients);
 
   // py::class_<nvidia::gxf::Pose3D>(m, "Pose", doc::TcnDepthImageBackprojectionOp::doc_Pose)
   //   .def(py::init<>())
   //   .def_readwrite("rotation", &nvidia::gxf::Pose3D::rotation)
   //   .def_readwrite("translation", &nvidia::gxf::Pose3D::translation)
   // ;
-  m.def("make_pose", []() { nvidia::gxf::Pose3D pose{}; return pose;});
+  m.def("make_pose", []() {
+    nvidia::gxf::Pose3D pose{};
+    return pose;
+  });
 
-  py::class_<TcnDepthImageBackprojectionOp, PyTcnDepthImageBackprojectionOp, holoscan::Operator, std::shared_ptr<TcnDepthImageBackprojectionOp>>(
-      m, "TcnDepthImageBackprojectionOp", doc::TcnDepthImageBackprojectionOp::doc_TcnDepthImageBackprojectionOp)
+  py::class_<TcnDepthImageBackprojectionOp,
+             PyTcnDepthImageBackprojectionOp,
+             holoscan::Operator,
+             std::shared_ptr<TcnDepthImageBackprojectionOp>>(
+      m,
+      "TcnDepthImageBackprojectionOp",
+      doc::TcnDepthImageBackprojectionOp::doc_TcnDepthImageBackprojectionOp)
       .def(py::init<holoscan::Fragment*,
                     const py::args&,
-                    std::shared_ptr<::holoscan::Allocator>,
+                    std::shared_ptr<holoscan::Allocator>,
                     float,
                     float,
                     float,
                     int,
                     int,
+                    std::shared_ptr<nvidia::gxf::CameraModel>,
+                    std::shared_ptr<holoscan::Pose3f>,
+                    std::shared_ptr<holoscan::Pose3f>,
                     const std::string&>(),
            "fragment"_a,
            "allocator"_a,
@@ -149,9 +168,25 @@ PYBIND11_MODULE(_tcn_depthimage_backprojection, m) {
            "far_limit_m"_a = 10.f,
            "color_image_width"_a = 1920,
            "color_image_height"_a = 1080,
+           "color_params"_a,
+           "depth_extrinsics"_a,
+           "color_to_depth"_a,
            "name"_a = "tcn_depthimage_backprojection"s,
            doc::TcnDepthImageBackprojectionOp::doc_TcnDepthImageBackprojectionOp)
-      .def("initialize", &TcnDepthImageBackprojectionOp::initialize, doc::TcnDepthImageBackprojectionOp::doc_initialize)
-      .def("setup", &TcnDepthImageBackprojectionOp::setup, "spec"_a, doc::TcnDepthImageBackprojectionOp::doc_setup);
+      .def("initialize",
+           &TcnDepthImageBackprojectionOp::initialize,
+           doc::TcnDepthImageBackprojectionOp::doc_initialize)
+      .def("setup",
+           &TcnDepthImageBackprojectionOp::setup,
+           "spec"_a,
+           doc::TcnDepthImageBackprojectionOp::doc_setup);
+
+  // Import the emitter/receiver registry from holoscan.core and pass it to this function to
+  // register this new C++ type with the SDK.
+  m.def("register_types", [](holoscan::EmitterReceiverRegistry& registry) {
+    HOLOSCAN_LOG_INFO("TCN SHM Receiver - register typ");
+    // registry.add_emitter_receiver<std::vector<ApriltagDetectorOp::output_corners>>(
+    //     "std::vector<ApriltagDetectorOp::output_corners>"s);
+  });
 }  // PYBIND11_MODULE NOLINT
-}  // namespace holoscan::ops
+}  // namespace tcn::ops

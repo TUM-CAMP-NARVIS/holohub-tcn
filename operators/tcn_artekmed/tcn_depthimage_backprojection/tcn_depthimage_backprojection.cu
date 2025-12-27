@@ -4,6 +4,13 @@
 #include "tcn_depthimage_backprojection_kernel.cuh"
 
 #include <cuda_runtime.h>
+#include "../common/datatypes.hpp"
+
+#include <Eigen/src/Geometry/Quaternion.h>
+#include <Eigen/Core>
+#include <gxf/std/tensor.hpp>
+#include "holoscan/pose_tree/math/pose3.hpp"
+#include "holoscan/pose_tree/math/so3.hpp"
 
 namespace tcn::ops {
 
@@ -11,12 +18,8 @@ void TcnDepthImageBackprojectionOp::setup(holoscan::OperatorSpec& spec) {
   using holoscan::Arg;
 
   // Inputs
-  spec.input<holoscan::Tensor>("depth_image");     // device, [H, W], uint16
-  spec.input<holoscan::Tensor>("xy_table");        // device, [H, W, 2], float32
-  spec.input<nvidia::gxf::CameraModel>("depth_params");    // host/device, raw bytes of CameraParameters
-  spec.input<nvidia::gxf::CameraModel>("color_params");    // host/device, raw bytes of CameraParameters
-  spec.input<nvidia::gxf::Pose3D>("color_to_depth");  // host/device, [4,4], float32
-  spec.input<nvidia::gxf::Pose3D>("depth_extrinsics");// host/device, [4,4], float32
+  spec.input<holoscan::gxf::Entity>("depth_image");  // device, [H, W], uint16
+  spec.input<holoscan::gxf::Entity>("xy_table");     // device, [H, W, 2], float32
 
   // Outputs (planar)
   spec.output<holoscan::Tensor>("positions");  // device, [H, W, 3], float32
@@ -24,12 +27,15 @@ void TcnDepthImageBackprojectionOp::setup(holoscan::OperatorSpec& spec) {
 
   // Configurable params (optional)
   spec.param(allocator_, "allocator", "Allocator", "Allocator used to allocate tensor output.");
-  spec.param(depth_units_per_meter_, "depth_units_per_meter",
-             "Depth units per meter", "Scaling from depth units to meters", 1000.0f);
-  spec.param(near_limit_m_, "near_limit_m",
-             "Near depth limit (m)", "Discard depths below this", 0.1f);
-  spec.param(far_limit_m_, "far_limit_m",
-             "Far depth limit (m)", "Discard depths above this", 10.0f);
+  spec.param(depth_units_per_meter_,
+             "depth_units_per_meter",
+             "Depth units per meter",
+             "Scaling from depth units to meters",
+             1000.0f);
+  spec.param(
+      near_limit_m_, "near_limit_m", "Near depth limit (m)", "Discard depths below this", 0.1f);
+  spec.param(
+      far_limit_m_, "far_limit_m", "Far depth limit (m)", "Discard depths above this", 10.0f);
   spec.param(color_image_width_, "color_image_width", "Color image width", "", 1920);
   spec.param(color_image_height_, "color_image_height", "Color image height", "", 1080);
   spec.param(cuda_stream_pool_,
@@ -37,11 +43,23 @@ void TcnDepthImageBackprojectionOp::setup(holoscan::OperatorSpec& spec) {
              "CUDA Stream Pool",
              "Instance of gxf::CudaStreamPool.",
              holoscan::ParameterFlag::kOptional);
+  spec.param(depth_extrinsics_,
+             "depth_extrinsics",
+             "Depth Camera Extrinsics",
+             "Camera Pose of the Depth Sensor.");
+  spec.param(color_to_depth_,
+              "color_to_depth",
+              "Color to Depth Sensor Transform",
+              "Tranform from Camera to Depth Sensor");
+  spec.param(color_camera_params_,
+             "color_camera_params",
+             "Color Camera Parameters",
+             "Intrinsic and Distortion Parameters");
 }
 
 void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
-                               holoscan::OutputContext& op_output,
-                               holoscan::ExecutionContext& context) {
+                                            holoscan::OutputContext& op_output,
+                                            holoscan::ExecutionContext& context) {
   // Get CUDA stream from Holoscan
   cudaStream_t stream = nullptr;
   if (cuda_stream_pool_.try_get()) {
@@ -50,32 +68,59 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
       stream = maybe_stream.value()->stream().value();
     }
   }
-  if (!stream) stream = 0;
+  if (!stream)
+    stream = nullptr;
 
   // Receive tensors
-  auto depth_t = op_input.receive<holoscan::Tensor>("depth_image").value();
-  auto xy_t    = op_input.receive<holoscan::Tensor>("xy_table").value();
-  auto cp_t    = op_input.receive<holoscan::Tensor>("color_params").value();
-  auto c2d_t   = op_input.receive<holoscan::Tensor>("color_to_depth").value();
-  auto de_t    = op_input.receive<holoscan::Tensor>("depth_extrinsics").value();
+  auto maybe_depth_t_entity = op_input.receive<holoscan::gxf::Entity>("depth_image");
+  if (!maybe_depth_t_entity) {
+    throw std::runtime_error("Failed to read depth_image entity");
+  }
+  auto depth_t = maybe_depth_t_entity.value().get<holoscan::Tensor>("");
 
-  const auto& depth_shape = depth_t.shape();  // [H,W]
+  auto maybe_xy_t_entity = op_input.receive<holoscan::gxf::Entity>("xy_table");
+  if (!maybe_xy_t_entity) {
+    throw std::runtime_error("Failed to read xy_table entity");
+  }
+  auto xy_t = maybe_xy_t_entity.value().get<holoscan::Tensor>("");
+
+  if (!color_camera_params_.get() || !color_to_depth_.get() || !depth_extrinsics_.get()) {
+    throw std::runtime_error("Missing device parameters.");
+  }
+  auto& cp_t = *color_camera_params_.get();
+  auto& c2d_t = *color_to_depth_.get();
+  auto& de_t = *depth_extrinsics_.get();
+
+  const auto& depth_shape = depth_t->shape();  // [H,W]
   const int H = static_cast<int>(depth_shape[0]);
   const int W = static_cast<int>(depth_shape[1]);
 
   // Map tensors to raw device pointers
-  auto* depth_ptr = static_cast<uint16_t*>(depth_t.data());
-  auto* xy_ptr    = static_cast<float*>(xy_t.data());
+  auto* depth_ptr = static_cast<uint16_t*>(depth_t->data());
+  auto* xy_ptr = static_cast<float*>(xy_t->data());
 
   // Camera parameters
-  CameraParameters color_params{};
-  std::memcpy(&color_params, cp_t.data(), sizeof(color_params));
+  CameraParameters color_params;
+  color_params.cx = cp_t.principal_point.x;
+  color_params.cy = cp_t.principal_point.y;
+  color_params.fx = cp_t.focal_length.x;
+  color_params.fy = cp_t.focal_length.y;
+  assert(cp_t.distortion_coefficients.size() == 8);
+  color_params.k1 = cp_t.distortion_coefficients[0];
+  color_params.k2 = cp_t.distortion_coefficients[1];
+  color_params.p1 = cp_t.distortion_coefficients[2];
+  color_params.p2 = cp_t.distortion_coefficients[3];
+  color_params.k3 = cp_t.distortion_coefficients[4];
+  color_params.k4 = cp_t.distortion_coefficients[5];
+  color_params.k5 = cp_t.distortion_coefficients[6];
+  color_params.k6 = cp_t.distortion_coefficients[7];
+  color_params.codx = 0;
+  color_params.cody = 0;
+  color_params.is_distorted = true;
 
   // Matrices (float32[4,4])
-  Eigen::Matrix4f color_to_depth = Eigen::Map<Eigen::Matrix<float,4,4,Eigen::RowMajor>>(
-      static_cast<float*>(c2d_t.data()));
-  Eigen::Matrix4f depth_extrinsics = Eigen::Map<Eigen::Matrix<float,4,4,Eigen::RowMajor>>(
-      static_cast<float*>(de_t.data()));
+  Eigen::Matrix4f color_to_depth = c2d_t.matrix();
+  Eigen::Matrix4f depth_extrinsics = de_t.matrix();
 
   // Allocate Holoscan outputs (device)
   auto gxf_context = context.context();
@@ -89,10 +134,15 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
   auto positions_shape = nvidia::gxf::Shape{{H, W, 3}};
   const auto positions_dtype = nvidia::gxf::PrimitiveType::kFloat32;
   const uint64_t positions_bytes_per_element = nvidia::gxf::PrimitiveTypeSize(positions_dtype);
-  auto positions_strides = nvidia::gxf::ComputeTrivialStrides(positions_shape, positions_bytes_per_element);
+  auto positions_strides =
+      nvidia::gxf::ComputeTrivialStrides(positions_shape, positions_bytes_per_element);
 
-  auto positions_result = positions->reshapeCustom(
-        positions_shape, positions_dtype, positions_bytes_per_element, positions_strides, positions_storage_type, allocator.value());
+  auto positions_result = positions->reshapeCustom(positions_shape,
+                                                   positions_dtype,
+                                                   positions_bytes_per_element,
+                                                   positions_strides,
+                                                   positions_storage_type,
+                                                   allocator.value());
   if (!positions_result) {
     HOLOSCAN_LOG_ERROR("failed to generate positions tensor");
   }
@@ -102,10 +152,15 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
   auto texcoords_shape = nvidia::gxf::Shape{{H, W, 2}};
   const auto texcoords_dtype = nvidia::gxf::PrimitiveType::kFloat32;
   const uint64_t texcoords_bytes_per_element = nvidia::gxf::PrimitiveTypeSize(texcoords_dtype);
-  auto texcoords_strides = nvidia::gxf::ComputeTrivialStrides(texcoords_shape, texcoords_bytes_per_element);
+  auto texcoords_strides =
+      nvidia::gxf::ComputeTrivialStrides(texcoords_shape, texcoords_bytes_per_element);
 
-  auto texcoords_result = texcoords->reshapeCustom(
-        texcoords_shape, texcoords_dtype, texcoords_bytes_per_element, texcoords_strides, texcoords_storage_type, allocator.value());
+  auto texcoords_result = texcoords->reshapeCustom(texcoords_shape,
+                                                   texcoords_dtype,
+                                                   texcoords_bytes_per_element,
+                                                   texcoords_strides,
+                                                   texcoords_storage_type,
+                                                   allocator.value());
   if (!texcoords_result) {
     HOLOSCAN_LOG_ERROR("failed to generate positions tensor");
   }
@@ -113,14 +168,12 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
   float* pos_ptr = nullptr;
   float* tex_ptr = nullptr;
 
-  auto maybe_positions_data = positions->data<float>();
-  if (maybe_positions_data) {
+  if (auto maybe_positions_data = positions->data<float>()) {
     pos_ptr = maybe_positions_data.value();
   } else {
     HOLOSCAN_LOG_ERROR("error access positions tensor data");
   }
-  auto maybe_texcoords_data = texcoords->data<float>();
-  if (maybe_texcoords_data) {
+  if (auto maybe_texcoords_data = texcoords->data<float>()) {
     tex_ptr = maybe_texcoords_data.value();
   } else {
     HOLOSCAN_LOG_ERROR("error access texcoord tensor data");
@@ -149,4 +202,4 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
   op_output.emit(texcoords, "texcoords");
 }
 
-} // namespace tcn::ops
+}  // namespace tcn::ops

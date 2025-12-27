@@ -1,14 +1,22 @@
 // For format details, see https://aka.ms/vscode-remote/devcontainer.json or
 // https://code.visualstudio.com/docs/remote/devcontainerjson-reference
 {
-    "name": "C++",
+    "name": "TCN Artekmed",
+    "initializeCommand": ".devcontainer/initialize-command.sh",
+    "postStartCommand": ".devcontainer/post-start-command.sh",
     "build": {
-        "dockerfile": "../applications/volume_rendering_xr/Dockerfile",
+        "dockerfile": "../Dockerfile",
         "target": "dev",
-        "context": "..",
+        "context": "../../../",
         "args": {
+            "BASE_IMAGE": "nvcr.io/nvidia/clara-holoscan/holoscan:v3.9.0-cuda13",
+            "WORKSPACE_DIR": "${containerWorkspaceFolder}",
             "BUILDKIT_INLINE_CACHE": "1" // Enable Docker BuildKit cache
-        }
+        },
+        "options": [
+            "--progress=plain",
+            "--network=host",
+        ]
     },
     "runArgs": [
         "--runtime=nvidia",
@@ -20,6 +28,14 @@
     ],
     "containerEnv": {
         "DISPLAY": "${localEnv:DISPLAY}",
+        // Wayland support
+        "XDG_RUNTIME_DIR": "${localEnv:XDG_RUNTIME_DIR}",
+        "XDG_SESSION_TYPE": "${localEnv:XDG_SESSION_TYPE}",
+        "NVIDIA_DRIVER_CAPABILITIES": "all",
+        "HOLOSCAN_INPUT_PATH": "/opt/nvidia/holoscan/data",
+        "HOLOSCAN_ROOT": "/opt/nvidia/holoscan",
+        "WORKSPACE_DIR": "${containerWorkspaceFolder}",
+        "CUPY_CACHE_DIR": "/workspace/holohub/.cupy/kernel_cache",
         // Set JIT compilation cache paths
         //  https://developer.nvidia.com/blog/cuda-pro-tip-understand-fat-binaries-jit-caching/
         "CUDA_CACHE_PATH": "${containerWorkspaceFolder}/.cache/ComputeCache",
@@ -29,48 +45,23 @@
         "__GL_SHADER_DISK_CACHE_PATH": "${containerWorkspaceFolder}/.cache/GLCache"
     },
     "mounts": [
-        "source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind",
-        // Mount Vulkan driver ICD configuration.
-        "source=/usr/share/vulkan/icd.d/nvidia_icd.json,target=/usr/share/vulkan/icd.d/nvidia_icd.json,type=bind",
-        // Mount ssh keys to container to be able to use the internal NVIDIA git repo
-        "source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/home/holoscan-openxr/.ssh,type=bind",
-        "source=/lib/aarch64-linux-gnu/nvoptix.bin,target=/lib/aarch64-linux-gnu/nvoptix.bin,type=bind",
+        // icoryx2 support
+        "source=/tmp/iceoryx2,target=/tmp/iceoryx2,type=bind",
+        // Wayland support
+        "source=${localEnv:XDG_RUNTIME_DIR},target=${localEnv:XDG_RUNTIME_DIR},type=bind,consistency=cached",
 
     ],
-    "workspaceFolder": "/workspace/holoscan-openxr",
-    "workspaceMount": "source=${localWorkspaceFolder},target=${containerWorkspaceFolder},type=bind",
+    "workspaceFolder": "/workspace/holohub",
+    "workspaceMount": "source=${localWorkspaceFolder}/../../,target=${containerWorkspaceFolder},type=bind",
     // Configure tool-specific properties.
     "customizations": {
         // Configure properties specific to VS Code.
-        "vscode": {
-            // Set *default* container specific settings.json values on container create.
-            "settings": {
-                "testMate.cpp.test.advancedExecutables": [
-                    {
-                        "name": "${filename}",
-                        "description": "${relDirpath}/",
-                        "pattern": "${command:cmake.buildDirectory}/applications/volume_rendering_xr/**/*{test,Test,TEST}*",
-                        "cwd": "${command:cmake.buildDirectory}"
-                    },
-                ],
-            },
-            // Add the IDs of extensions you want installed when the container is created.
-            "extensions": [
-                "akiramiyakoda.cppincludeguard",
-                "ms-vscode.cpptools-extension-pack",
-                "matepek.vscode-catch2-test-adapter",
-                "ms-vscode.makefile-tools",
-                "shardulm94.trailing-spaces",
-                "stkb.rewrap",
-                "shd101wyy.markdown-preview-enhanced"
-            ]
-        }
     },
-    "initializeCommand": "${localWorkspaceFolder}/applications/volume_rendering_xr/thirdparty/magicleap.sh",
+    // "initializeCommand": "${localWorkspaceFolder}/applications/tcn_artekmed/thirdparty/magicleap.sh",
     // Use 'forwardPorts' to make a list of ports inside the container available locally.
     // "forwardPorts": [],
     // Use 'postCreateCommand' to run commands after the container is created.
     // "postCreateCommand": "gcc -v",
     // Comment out this line to run as root instead.
-    "remoteUser": "holoscan-openxr"
+    //"remoteUser": "holoscan"
 }

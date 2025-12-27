@@ -13,9 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_holohub_application(tcn_zenoh_receiver DEPENDS OPERATORS
-                          nv_video_decoder
-                          )
+#add_holohub_application(tcn_zenoh_receiver DEPENDS OPERATORS
+#                          nv_video_decoder
+#                          )
 
 add_holohub_application(tcn_shm_receiver DEPENDS OPERATORS
                           tcn_depthimage_backprojection
