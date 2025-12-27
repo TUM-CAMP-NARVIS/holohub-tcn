@@ -17,6 +17,16 @@ namespace tcn::ops {
 void TcnDepthImageBackprojectionOp::setup(holoscan::OperatorSpec& spec) {
   using holoscan::Arg;
 
+  register_converter<Eigen::Vector3f>();
+  register_converter<Eigen::Quaternionf>();
+  register_converter<RigidTransform>();
+  register_converter<CameraParameters>();
+
+  register_converter<nvidia::gxf::Vector2f>();
+  register_converter<nvidia::gxf::Vector2u>();
+  register_converter<nvidia::gxf::DistortionType>();
+  register_converter<nvidia::gxf::CameraModel>();
+
   // Inputs
   spec.input<holoscan::gxf::Entity>("depth_image");  // device, [H, W], uint16
   spec.input<holoscan::gxf::Entity>("xy_table");     // device, [H, W, 2], float32
@@ -51,8 +61,8 @@ void TcnDepthImageBackprojectionOp::setup(holoscan::OperatorSpec& spec) {
               "color_to_depth",
               "Color to Depth Sensor Transform",
               "Tranform from Camera to Depth Sensor");
-  spec.param(color_camera_params_,
-             "color_camera_params",
+  spec.param(color_params_,
+             "color_params",
              "Color Camera Parameters",
              "Intrinsic and Distortion Parameters");
 }
@@ -84,12 +94,9 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
   }
   auto xy_t = maybe_xy_t_entity.value().get<holoscan::Tensor>("");
 
-  if (!color_camera_params_.get() || !color_to_depth_.get() || !depth_extrinsics_.get()) {
-    throw std::runtime_error("Missing device parameters.");
-  }
-  auto& cp_t = *color_camera_params_.get();
-  auto& c2d_t = *color_to_depth_.get();
-  auto& de_t = *depth_extrinsics_.get();
+  auto& cp_t = color_params_.get();
+  auto& c2d_t = color_to_depth_.get();
+  auto& de_t = depth_extrinsics_.get();
 
   const auto& depth_shape = depth_t->shape();  // [H,W]
   const int H = static_cast<int>(depth_shape[0]);
@@ -98,6 +105,12 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
   // Map tensors to raw device pointers
   auto* depth_ptr = static_cast<uint16_t*>(depth_t->data());
   auto* xy_ptr = static_cast<float*>(xy_t->data());
+
+  Eigen::Matrix4f color_to_depth;
+  c2d_t.toMatrix4f(color_to_depth);
+
+  Eigen::Matrix4f depth_extrinsics;
+  de_t.toMatrix4f(depth_extrinsics);
 
   // Camera parameters
   CameraParameters color_params;
@@ -119,17 +132,29 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
   color_params.is_distorted = true;
 
   // Matrices (float32[4,4])
-  Eigen::Matrix4f color_to_depth = c2d_t.matrix();
-  Eigen::Matrix4f depth_extrinsics = de_t.matrix();
 
   // Allocate Holoscan outputs (device)
   auto gxf_context = context.context();
+
+  auto positions_entity = nvidia::gxf::Entity::New(gxf_context);
+  if (!positions_entity) {
+    throw std::runtime_error("Failed to allocate message for output positions tensor.");
+  }
+
+  auto texcoords_entity = nvidia::gxf::Entity::New(gxf_context);
+  if (!texcoords_entity) {
+    throw std::runtime_error("Failed to allocate message for output texcoords tensor.");
+  }
 
   // get Handle to underlying nvidia::gxf::Allocator from std::shared_ptr<holoscan::Allocator>
   auto allocator =
       nvidia::gxf::Handle<nvidia::gxf::Allocator>::Create(gxf_context, allocator_->gxf_cid());
 
-  auto positions = std::make_shared<nvidia::gxf::Tensor>();
+  auto maybe_positions = positions_entity.value().add<nvidia::gxf::Tensor>();
+  if (!maybe_positions) {
+    throw std::runtime_error("Failed to allocate message for positions.");
+  }
+  auto& positions = maybe_positions.value();
   auto positions_storage_type = nvidia::gxf::MemoryStorageType::kDevice;
   auto positions_shape = nvidia::gxf::Shape{{H, W, 3}};
   const auto positions_dtype = nvidia::gxf::PrimitiveType::kFloat32;
@@ -147,7 +172,11 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
     HOLOSCAN_LOG_ERROR("failed to generate positions tensor");
   }
 
-  auto texcoords = std::make_shared<nvidia::gxf::Tensor>();
+  auto maybe_texcoords = texcoords_entity.value().add<nvidia::gxf::Tensor>();
+  if (!maybe_texcoords) {
+    throw std::runtime_error("Failed to allocate message for texcoords.");
+  }
+  auto& texcoords = maybe_texcoords.value();
   auto texcoords_storage_type = nvidia::gxf::MemoryStorageType::kDevice;
   auto texcoords_shape = nvidia::gxf::Shape{{H, W, 2}};
   const auto texcoords_dtype = nvidia::gxf::PrimitiveType::kFloat32;
@@ -198,8 +227,11 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
   const dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
   backprojection_u16_kernel<<<grid, block, 0, stream>>>(params);
 
-  op_output.emit(positions, "positions");
-  op_output.emit(texcoords, "texcoords");
+  auto positions_message = holoscan::gxf::Entity(std::move(positions_entity.value()));
+  op_output.emit(positions_message, "positions");
+
+  auto texcoords_message = holoscan::gxf::Entity(std::move(texcoords_entity.value()));
+  op_output.emit(texcoords_message, "texcoords");
 }
 
 }  // namespace tcn::ops
