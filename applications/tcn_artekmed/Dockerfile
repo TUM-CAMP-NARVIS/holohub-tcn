@@ -63,22 +63,76 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /tmp/dependencies
+
 WORKDIR /tmp/dependencies
-RUN git clone https://github.com/pybind/pybind11 && \
+RUN rm -Rf /tmp/depencencies/pybind11 && \
+    git clone https://github.com/pybind/pybind11 && \
     cd pybind11 && \
     git checkout v2.13.6 && \
     mkdir build && \
     cd build && \
-    cmake -G "Ninja" .. -DCMAKE_BUILD_TYPE=Release && \
-    cmake --build . --config Release&& \
+    cmake -G "Ninja" .. -DCMAKE_BUILD_TYPE=Release -DPYBIND11_TEST=OFF && \
+    cmake --build . --config Release -- -j 8  && \
     cmake --install .
 
-RUN git clone https://github.com/TUM-CAMP-NARVIS/xylt.git && \
+WORKDIR /tmp/dependencies
+RUN rm -Rf /tmp/dependencies/xylt && \
+    git clone https://github.com/TUM-CAMP-NARVIS/xylt.git && \
     cd xylt && \
     mkdir build && \
     cd build && \
     cmake -G "Ninja" .. -DCMAKE_BUILD_TYPE=Release && \
     cmake --build . --config Release && \
-    cmake --install . --prefix=/usr
+    cmake --install . --prefix=/usr && \
+    cp /tmp/dependencies/xylt/build/pyxylt.cpython*.so /usr/local/lib/python3.12/dist-packages/
 
 WORKDIR /
+
+## Dev container
+FROM base as dev
+
+
+ARG WORKSPACE_DIR=/workspace/holohub
+
+# Keep the user as holoscan since the Holoscan Container already has the user setup
+ARG USERNAME=holoscan
+ARG USER_UID=1000
+ARG USER_GID=$USER_UID
+
+# Remove existing conflicting user
+# see https://bugs.launchpad.net/cloud-images/+bug/2005129
+RUN getent passwd $USER_UID | cut -d: -f1 | xargs -r userdel -r || true
+
+# Remove existing conflicting home directory
+RUN if [ -d "/home/$USERNAME" ] ; then ls -l /home/$USERNAME && rm -rf /home/$USERNAME ; fi
+
+# Create the user
+RUN groupadd --gid $USER_GID $USERNAME \
+    && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \
+    # [Optional] Add sudo support. Omit if you don't need to install software after connecting.
+    && apt-get update \
+    && apt-get install -y sudo \
+    && echo $USERNAME ALL=\(root\) NOPASSWD:ALL > /etc/sudoers.d/$USERNAME \
+    && chmod 0440 /etc/sudoers.d/$USERNAME \
+    && chown -R $USERNAME /home/$USERNAME
+
+# [Optional] Uncomment this section to install additional vcpkg ports.
+# RUN su vscode -c "${VCPKG_ROOT}/vcpkg install <your-port-name-here>"
+
+# Install additional packages
+RUN apt-get update \
+    && export DEBIAN_FRONTEND=noninteractive \
+    && apt-get -y install --no-install-recommends  \
+        build-essential \
+        ccache \
+        gdb \
+        git-lfs \
+    && apt-get autoremove -y \
+    && apt-get clean -y \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set the default user.
+# (See https://code.visualstudio.com/remote/advancedcontainers/add-nonroot-user)
+USER $USERNAME
+
+ENV PYTHONPATH=/usr/local/lib/python3.10/dist-packages:$PYTHONPATH

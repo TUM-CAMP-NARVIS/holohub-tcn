@@ -18,12 +18,12 @@ class ShmSynchronizedBufferReceiver:
 
     @staticmethod
     def discover_devices():
-        camera_names = []
+        camera_names = set()
         services = iox2.Service.list(iox2.config.global_config(), iox2.ServiceType.Ipc)
         for service in services:
             match = DEVICE_CONTEXT_MATCH.match(service.name().to_string())
             if match:
-                camera_names.append(match.group(1))
+                camera_names.add(match.group(1))
         return list(sorted(camera_names))
 
     def retrieve_device_context(self, camera_name):

@@ -3,9 +3,8 @@
 #include <holoscan/holoscan.hpp>
 #include <Eigen/Core>
 #include "holoscan/core/resources/gxf/cuda_stream_pool.hpp"
+#include "holoscan/pose_tree/math/pose3.hpp"
 
-#include "../common/datatypes.hpp"
-#include "tcn_depthimage_backprojection_kernel.cuh"
 
 namespace tcn::ops {
 
@@ -25,6 +24,9 @@ class TcnDepthImageBackprojectionOp : public holoscan::Operator {
   holoscan::Parameter<float> far_limit_m_;
   holoscan::Parameter<int> color_image_width_;
   holoscan::Parameter<int> color_image_height_;
+  holoscan::Parameter<std::shared_ptr<nvidia::gxf::CameraModel>> color_camera_params_;
+  holoscan::Parameter<std::shared_ptr<holoscan::Pose3f>> depth_extrinsics_;
+  holoscan::Parameter<std::shared_ptr<holoscan::Pose3f>> color_to_depth_;
 
   ///  @brief Optional CUDA stream pool for allocation of an internal CUDA stream if none is
   ///  available in the incoming messages.
