@@ -53,7 +53,7 @@ class DeviceContextService(DefaultFragmentService):
         self._device_contexts = device_contexts
         self.portname_cameraname_match = re.compile("^(camera[0-9]+)_.*$")
 
-    def get_camera_name_from_port_name(self, port_name: str) -> str | None:
+    def get_camera_name_from_port_name(self, port_name: str) -> Optional[str]:
         m = self.portname_cameraname_match.match(port_name)
         if m is not None:
             return m.group(1)
@@ -77,7 +77,7 @@ class DeviceContextService(DefaultFragmentService):
             return None
         return ctx["calibration"]
 
-    def get_depth_camera_model(self, camera_name: str) -> CameraModel | None:
+    def get_depth_camera_model(self, camera_name: str) -> Optional[CameraModel]:
         calib = self.get_device_calibration(camera_name)
         if calib is None:
             return None
@@ -87,7 +87,7 @@ class DeviceContextService(DefaultFragmentService):
         params = calib["depthCameraParameters"]
         return self._camera_model_from_dict(params)
 
-    def get_color_camera_model(self, camera_name: str) -> CameraModel | None:
+    def get_color_camera_model(self, camera_name: str) -> Optional[CameraModel]:
         calib = self.get_device_calibration(camera_name)
         if calib is None:
             return None
@@ -120,7 +120,7 @@ class DeviceContextService(DefaultFragmentService):
 
         return model
 
-    def get_xy_table_intrinsics(self, camera_name: str) -> IntrinsicParameters | None:
+    def get_xy_table_intrinsics(self, camera_name: str) -> Optional[IntrinsicParameters]:
         model = self.get_depth_camera_model(camera_name)
         if model is None:
             return None
@@ -145,8 +145,8 @@ class DeviceContextService(DefaultFragmentService):
         ]
         return intrinsics
 
-    def get_xy_table(self, camera_name: str) -> np.ndarray | None:
-        intrinsics : IntrinsicParameters | None = self.get_xy_table_intrinsics(camera_name)
+    def get_xy_table(self, camera_name: str) -> Optional[np.ndarray]:
+        intrinsics : Optional[IntrinsicParameters] = self.get_xy_table_intrinsics(camera_name)
         if intrinsics is None:
             return None
         log.info(f"Creating xy-table for {camera_name}")
@@ -159,7 +159,7 @@ class DeviceContextService(DefaultFragmentService):
 
         return np.array(xy_lookup_table.data, dtype=np.float32).reshape((xy_lookup_table.height, xy_lookup_table.width, 2))
 
-    def get_depth_extrinsics(self, camera_name: str) -> RigidTransform | None:
+    def get_depth_extrinsics(self, camera_name: str) -> Optional[RigidTransform]:
         calib = self.get_device_calibration(camera_name)
         if calib is None:
             return None
@@ -169,7 +169,7 @@ class DeviceContextService(DefaultFragmentService):
         params = calib["cameraPose"]
         return self._pose3d_from_dict(params)
 
-    def get_color_to_depth(self, camera_name: str) -> RigidTransform | None:
+    def get_color_to_depth(self, camera_name: str) -> Optional[RigidTransform]:
         calib = self.get_device_calibration(camera_name)
         if calib is None:
             return None
@@ -180,7 +180,7 @@ class DeviceContextService(DefaultFragmentService):
         return self._pose3d_from_dict(params)
 
 
-    def _pose3d_from_dict(self, params) -> RigidTransform | None:
+    def _pose3d_from_dict(self, params) -> Optional[RigidTransform]:
         return make_rigid_transform(
             hs.as_tensor(np.asarray([
                 params["translation"]["x"],
@@ -241,28 +241,29 @@ class ShmSubscriberOp(Operator):
             return False
 
         # log.debug(f"on_receive frame with timestamp {user_header.timestamp}")
-        data = {}
+        color_data = {}
+        depth_data = {}
         frame_timestamp = user_header.timestamp
         for port in message.ports:
             if port.data.portType == shm_transport_enum.CameraPortType.colorimage:
                 # log.debug(f"added port data: {port.name}")
                 md = port.data.metadata
                 mv = memoryview(port.data.data)
-                data[port.name] = cp.asarray(np.frombuffer(mv, dtype=np.uint8).reshape(
+                color_data[port.name] = cp.asarray(np.frombuffer(mv, dtype=np.uint8).reshape(
                     md.header.dimY, md.header.dimX, int(md.header.bitsPerElement/8)
                 ))
             elif port.data.portType == shm_transport_enum.CameraPortType.depthimage:
                 # log.debug(f"added port data: {port.name}")
                 md = port.data.metadata
                 mv = memoryview(port.data.data)
-                data[port.name] = cp.asarray(np.frombuffer(mv, dtype=np.uint16).reshape(
+                depth_data[port.name] = cp.asarray(np.frombuffer(mv, dtype=np.uint16).reshape(
                     md.header.dimY, md.header.dimX, 1
                 ))
 
-        if data:
+        if color_data or depth_data:
             # how does ts relate to fragment.scheduler().clock.timestamp()?
             # log.debug(f"put data for {frame_timestamp} into queue")
-            self.buffer.put((frame_timestamp, data))
+            self.buffer.put((frame_timestamp, (color_data, depth_data)))
 
             if self.async_cond_.event_state == AsynchronousEventState.EVENT_WAITING:
                 self.async_cond_.event_state = AsynchronousEventState.EVENT_DONE
@@ -276,8 +277,10 @@ class ShmSubscriberOp(Operator):
                 log.warning("could not receive frame.")
 
     def setup(self, spec: OperatorSpec):
-        spec.output("outputs")
-        spec.output("output_specs")
+        spec.output("color_outputs")
+        spec.output("color_output_specs").condition(hs.core.ConditionType.NONE)
+        spec.output("depth_outputs")
+        spec.output("depth_output_specs").condition(hs.core.ConditionType.NONE)
 
     def start(self):
         self.subscriber.subscribe(self.stream_name)
@@ -290,21 +293,27 @@ class ShmSubscriberOp(Operator):
         clock = scheduler.clock
         ts = clock.timestamp()
 
-        frame_ts, data = self.buffer.get()
+        frame_ts, (color_data, depth_data) = self.buffer.get()
         log.debug(f"got data for {frame_ts} from queue")
-        message = {k:hs.as_tensor(v) for k,v in data.items()}
+
+        color_message = {k:hs.as_tensor(v) for k,v in color_data.items()}
+        depth_message = {k:hs.as_tensor(v) for k,v in depth_data.items()}
 
         self.async_cond_.event_state = AsynchronousEventState.EVENT_WAITING
-        op_output.emit(message, "outputs", acq_timestamp=ts)
+        op_output.emit(color_message, "color_outputs", acq_timestamp=ts)
+        op_output.emit(depth_message, "depth_outputs", acq_timestamp=ts)
 
-        num_videos = len(message.keys())
+        num_videos = len(color_message.keys())
+        # assume they are the same
+        #num_depth_videos = len(depth_message.keys())
+
 
         # Determine grid size (e.g., 2 for 2x2, 3 for 3x3)
         grid_size = int(np.ceil(np.sqrt(num_videos))) if num_videos > 0 else 1
         tile_size = 1.0 / grid_size
 
-        output_specs = []
-        for i, port_name in enumerate(message.keys()):
+        color_output_specs = []
+        for i, port_name in enumerate(color_message.keys()):
             # Compute row and column index
             row = i // grid_size
             col = i % grid_size
@@ -324,11 +333,35 @@ class ShmSubscriberOp(Operator):
             views.append(view)
             spec.views = views
             # hardcoded ..
-            if "color" in port_name:
-                spec.image_format = holoviz._holoviz_str_to_image_format["b8g8r8a8_unorm"]
-            output_specs.append(spec)
+            spec.image_format = holoviz._holoviz_str_to_image_format["b8g8r8a8_unorm"]
+            color_output_specs.append(spec)
 
-        op_output.emit(output_specs, "output_specs", acq_timestamp=ts)
+        op_output.emit(color_output_specs, "color_output_specs", acq_timestamp=ts)
+
+        depth_output_specs = []
+        for i, port_name in enumerate(depth_message.keys()):
+            # Compute row and column index
+            row = i // grid_size
+            col = i % grid_size
+
+            # Compute normalized offsets (0.0 to 1.0)
+            # Note: Holoviz usually uses (x, y) for offsets
+            offset_x = col * tile_size
+            offset_y = row * tile_size
+
+            # still using color as uint16 is not supported as depth-format
+            spec = HolovizOp.InputSpec(port_name, HolovizOp.InputType.COLOR)
+            views = []
+            view = HolovizOp.InputSpec.View()
+            view.offset_x = offset_x
+            view.offset_y = offset_y
+            view.width = tile_size
+            view.height = tile_size
+            views.append(view)
+            spec.views = views
+            depth_output_specs.append(spec)
+
+        op_output.emit(depth_output_specs, "depth_output_specs", acq_timestamp=ts)
 
 
     def stop(self):
@@ -338,7 +371,32 @@ class ShmSubscriberOp(Operator):
         self.future_.result()
 
 
-class CameraStreamExtractor(Operator):
+class XYLookupTableSourceOp(Operator):
+    def __init__(self, fragment: Any, *args, **kwargs):
+        self.ctx_service = None
+        self.xy_table_data = None
+        super().__init__(fragment, *args, **kwargs)
+
+    def initialize(self):
+        self.xy_table_data = cp.asarray(self.ctx_service.get_xy_table(self.camera_name))
+
+    def setup(self, spec: OperatorSpec):
+        spec.output("xy_table")
+        spec.param("camera_name")
+        self.ctx_service = self.service(DeviceContextService)
+
+    def compute(self, op_input, op_output, context):
+        if self.xy_table_data is not None:
+            try:
+                xytable_tensor = hs.as_tensor(self.xy_table_data)
+                op_output.emit({"": xytable_tensor}, "xy_table")
+            except Exception as e:
+                log.exception(e)
+        else:
+            log.error(f"XYLookupTableSourceOp: Could not create XY Table for camera: {self.camera_name}")
+
+
+class StreamSplitterOp(Operator):
 
     def __init__(
             self,
@@ -348,7 +406,6 @@ class CameraStreamExtractor(Operator):
             **kwargs,
         ):
         self.channel_config = channel_config
-        self.channel_static_buffers = {}
         # Need to call the base class constructor last
 
         super().__init__(fragment, *args, **kwargs)
@@ -356,47 +413,74 @@ class CameraStreamExtractor(Operator):
     def setup(self, spec: OperatorSpec):
         spec.input("receivers")
         for config in self.channel_config:
-            channel_name = config["name"]
-            spec.output(channel_name)
-            spec.output(f"{channel_name}_xy_table")
+            spec.output(config["name"])
 
-        self.ctx_service = self.service(DeviceContextService)
-        # self.pose_tree_manager = self.service(PoseTreeManager)
-        # pose_tree = self.pose_tree_manager.tree
-
-        for config in self.channel_config:
-            channel_name = config["name"]
-            camera_name = self.ctx_service.get_camera_name_from_port_name(channel_name)
-            xytable = self.ctx_service.get_xy_table(camera_name)
-            xytable_dev = cp.asarray(xytable)
-            self.channel_static_buffers[channel_name] = {
-                "xy_table": {"": hs.as_tensor(xytable_dev)},
-            }
 
     def compute(self, op_input, op_output, context):
         message = op_input.receive("receivers")
-
         for config in self.channel_config:
             channel_name = config["name"]
             di_tensor = hs.as_tensor(cp.asarray(message.get(channel_name)))
             op_output.emit({"": di_tensor}, channel_name)
-            for key, value in self.channel_static_buffers[channel_name].items():
-                if value is None:
-                    log.warning(f"static buffer {key} is None")
-                op_output.emit(value, f"{channel_name}_{key}")
 
 
-class BPDummySinkOp(Operator):
+class StreamMergerOp(Operator):
+
+    def __init__(
+            self,
+            fragment: Any,
+            input_names: Any,
+            message_name: str,
+            fuse_buffers: bool,
+            *args,
+            **kwargs,
+    ):
+        self.input_names = input_names
+        self.fuse_buffers = fuse_buffers
+        self.message_name = message_name
+        self.ctx_service = None
+        # Need to call the base class constructor last
+
+        super().__init__(fragment, *args, **kwargs)
+
+    def setup(self, spec: OperatorSpec):
+        for name in self.input_names:
+            spec.input(name)
+        spec.output("output")
+        self.ctx_service = self.service(DeviceContextService)
+
+
+    def compute(self, op_input, op_output, context):
+        all_messages = []
+        for name in self.input_names:
+            message = op_input.receive(name)
+            all_messages.append((name, cp.asarray(message.get(name))))
+
+        if self.fuse_buffers:
+            fused_buffer = cp.concatenate((m[1] for m in all_messages))
+            log.info("Fused buffer to {}".format(fused_buffer.shape))
+            di_tensor = hs.as_tensor(fused_buffer)
+            op_output.emit({self.message_name: di_tensor}, "output")
+        else:
+            out_message = dict()
+            for name, buffer in all_messages:
+                camera_name = self.ctx_service.get_camera_name_from_port_name(name)
+                message_name = f"{camera_name}_{self.message_name}"
+                di_tensor = hs.as_tensor(buffer)
+                out_message[message_name] = di_tensor
+            op_output.emit(out_message, "output")
+
+
+class DummySinkOp(Operator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
     def setup(self, spec: OperatorSpec):
-        spec.input("depth_image")
-        spec.input("xy_table")
+        spec.input("input")
 
     def compute(self, op_input, op_output, context):
-        sig1 = op_input.receive("depth_image")
-        sig2 = op_input.receive("xy_table")
+        sig1 = op_input.receive("input")
+        log.debug(f"DummySink received input {self.name}")
 
 
 class PointCloudDummySinkOp(Operator):
@@ -411,13 +495,16 @@ class PointCloudDummySinkOp(Operator):
         sig1 = op_input.receive("positions")
         sig2 = op_input.receive("texcoords")
         # print("received positions and texcoords")
+        import pdb;pdb.set_trace()
 
 class App(hs.core.Application):
     def compose(self):
+
         # Add your operators here
         print("Starting TCN Shm Receiver")
 
         shm_config = self.kwargs("shared_memory")
+        debug_output_config = self.kwargs("debug_output")
 
         stream_name = shm_config.get("stream_name")
         cycle_time_ms = shm_config.get("cycle_time_ms")
@@ -468,21 +555,112 @@ class App(hs.core.Application):
 
         log.info(f"Retrieve channel config for stream: {stream_name}")
         channels_config = shm_receiver.retrieve_channel_config(stream_name)
+
+        log.info(f"create subscriber op {stream_name}")
         subscriber_op = ShmSubscriberOp(self, shm_receiver, stream_name, channels_config, cycle_time_ms, name="shm_subscriber")
 
         depth_streams_config = []
+        color_streams_config = []
         for channel in channels_config["ports"]:
             if channel["status"]["portType"] == "depthimage":
                 depth_streams_config.append(channel)
+            elif channel["status"]["portType"] == "colorimage":
+                color_streams_config.append(channel)
 
-        split_op = CameraStreamExtractor(self, depth_streams_config, name="stream_splitter")
-        self.add_flow(subscriber_op, split_op, {("outputs", "receivers")})
+        log.info("create stream_splitter op")
+        split_op = StreamSplitterOp(self, depth_streams_config, name="stream_splitter")
+        self.add_flow(subscriber_op, split_op, {("depth_outputs", "receivers")})
 
+
+        points_visualizer = None
+        if debug_output_config.get("enable_pointcloud", False):
+            log.info("create pointclouds debug-view")
+            # configure pointcloud debug viewer
+            # num_pointclouds = len(camera_names)
+            # # Determine grid size (e.g., 2 for 2x2, 3 for 3x3)
+            # pointclouds_grid_size = int(np.ceil(np.sqrt(num_pointclouds))) if num_pointclouds > 0 else 1
+            # pointclouds_tile_size = 1.0 / pointclouds_grid_size
+
+            pointclouds_output_specs = []
+            # for i, camera_name in enumerate(camera_names):
+            #     # Compute row and column index
+            #     row = i // pointclouds_grid_size
+            #     col = i % pointclouds_grid_size
+            #
+            #     # Compute normalized offsets (0.0 to 1.0)
+            #     # Note: Holoviz usually uses (x, y) for offsets
+            #     offset_x = col * pointclouds_tile_size
+            #     offset_y = row * pointclouds_tile_size
+            #
+            #     spec = HolovizOp.InputSpec(camera_name, HolovizOp.InputType.POINTS_3D)
+            #     views = []
+            #     view = HolovizOp.InputSpec.View()
+            #     view.offset_x = offset_x
+            #     view.offset_y = offset_y
+            #     view.width = pointclouds_tile_size
+            #     view.height = pointclouds_tile_size
+            #     views.append(view)
+            #     spec.views = views
+            #     spec.color = [1.0, 0.0, 0.0, 1.0]
+            #     pointclouds_output_specs.append(spec)
+
+            # identity_pose = make_rigid_transform(
+            #     hs.as_tensor(np.asarray([0.,0.,0.])),
+            #     hs.as_tensor(np.asarray([0.,0.,0.,1.]))
+            # )
+
+
+            bg_spec = HolovizOp.InputSpec("dummy", HolovizOp.InputType.RECTANGLES)
+            bg_spec.priority = -1
+            bg_spec.color = [0.9, 0.9, 0.9, 1.0]
+            pointclouds_output_specs.append(bg_spec)
+
+            spec = HolovizOp.InputSpec("positions", HolovizOp.InputType.POINTS_3D)
+            views = []
+            view = HolovizOp.InputSpec.View()
+            view.offset_x = 0
+            view.offset_y = 0
+            view.width = 1
+            view.height = 1
+            views.append(view)
+            spec.views = views
+            spec.color = [1.0, 0.0, 0.0, 1.0]
+            pointclouds_output_specs.append(spec)
+
+            points_visualizer = HolovizOp(
+                self,
+                name="points_visualizer",
+                tensors=pointclouds_output_specs,
+                allocator=CudaStreamPool(
+                    self,
+                    name="cuda_stream",
+                    dev_id=0,
+                    stream_flags=0,
+                    stream_priority=0,
+                    reserved_size=1,
+                    max_size=len(camera_names),
+                ),
+                **self.kwargs("points_holoviz"),
+            )
+
+        log.info("define per depthimage processing pipeline")
         sink_ops = []
+
+        merge_connections = []
         for channel in depth_streams_config:
             channel_name = channel["name"]
             camera_name = ctx_service.get_camera_name_from_port_name(channel_name)
             color_params = ctx_service.get_color_camera_model(camera_name)
+
+            log.info(f"create xylookuptable source: {camera_name}")
+            xylt_op = XYLookupTableSourceOp(self,
+                                            CountCondition(self, count=1),
+                                            name=f"xylt_loader_{camera_name}",
+                                            camera_name=camera_name,
+                                            )
+            sink_ops.append(xylt_op)
+
+            log.info(f"create backprojection: {camera_name}")
             bp_op = TcnDepthImageBackprojectionOp(
                 self, 
                 allocator=RMMAllocator(self, name=f"rmm-allocator_{channel_name}", **self.kwargs("rmm_allocator")),
@@ -494,22 +672,46 @@ class App(hs.core.Application):
                 color_params=ctx_service.get_depth_camera_model(camera_name),
                 depth_extrinsics=ctx_service.get_depth_extrinsics(camera_name),
                 color_to_depth=ctx_service.get_color_to_depth(camera_name),
+                out_tensor_name=camera_name,
+                enable_positions=True,
+                # points visualizer does not consume texcoords
+                enable_texcoords=points_visualizer is None,
+                enable_depth_float=False,
                 name=f"{camera_name}_backprojection",
                 )
-            self.add_flow(split_op, bp_op, {
-                (channel_name, "depth_image"),
-                (f"{channel_name}_xy_table", "xy_table")
-            })
             sink_ops.append(bp_op)
 
-            sink_op = PointCloudDummySinkOp(self, name=f"{camera_name}_sink")
-            self.add_flow(bp_op, sink_op, {
-                ("positions", "positions"),
-                ("texcoords", "texcoords"),
-                })
-            sink_ops.append(sink_op)
+            self.add_flow(split_op, bp_op, {
+                (channel_name, "depth_image"),
+            })
+            self.add_flow(xylt_op, bp_op, {
+                ("xy_table", "xy_table")
+            })
 
-            # sink_op = SinkOp(self, name=f"{camera_name}_sink")
+            merge_connections.append((bp_op, {("positions", f"{camera_name}_positions")}))
+
+            # debug view..
+            if points_visualizer is not None:
+                self.add_flow(bp_op, points_visualizer, {("positions", "receivers")})
+            else:
+                sink_op = PointCloudDummySinkOp(self, name=f"{camera_name}_sink")
+                self.add_flow(bp_op, sink_op, {
+                    ("positions", "positions"),
+                    ("texcoords", "texcoords"),
+                    })
+                sink_ops.append(sink_op)
+
+        # merge Pointclouds
+        merge_inputs = list({list(v[1])[0][1] for v in merge_connections})
+        log.info(f"Merge Position Streams: {merge_inputs}")
+        merge_op = StreamMergerOp(self, merge_inputs, "positions", True)
+        for op, conn in merge_connections:
+            self.add_flow(op, merge_op, conn)
+
+        self.add_flow(merge_op, points_visualizer, {("output", "receivers")})
+
+
+        # sink_op = SinkOp(self, name=f"{camera_name}_sink")
             # self.add_flow(split_op, sink_op, {
             #     (channel_name, "depth_image"),
             #     (f"{channel_name}_xy_table", "xy_table"),
@@ -520,23 +722,49 @@ class App(hs.core.Application):
             #     })
             # sink_ops.append(sink_op)
 
-        visualizer = HolovizOp(
-            self,
-            name="visualizer",
-            allocator=CudaStreamPool(
+        if debug_output_config.get("enable_colorimage", False):
+            log.info("create color visualizer")
+            color_visualizer = HolovizOp(
                 self,
-                name="cuda_stream",
-                dev_id=0,
-                stream_flags=0,
-                stream_priority=0,
-                reserved_size=1,
-                max_size=channels_config.get("numPorts", 1),
-            ),
-            **self.kwargs("holoviz"),
-        )
-        self.add_flow(subscriber_op, visualizer, {("outputs", "receivers")})
-        self.add_flow(subscriber_op, visualizer, {("output_specs", "input_specs")})
+                name="color_visualizer",
+                allocator=CudaStreamPool(
+                    self,
+                    name="cuda_stream",
+                    dev_id=0,
+                    stream_flags=0,
+                    stream_priority=0,
+                    reserved_size=1,
+                    max_size=len(color_streams_config),
+                ),
+                **self.kwargs("color_holoviz"),
+            )
 
+            self.add_flow(subscriber_op, color_visualizer, {("color_outputs", "receivers")})
+            self.add_flow(subscriber_op, color_visualizer, {("color_output_specs", "input_specs")})
+        else:
+            # need a consumer for color_images
+            ci_sink = DummySinkOp(self, name="color_image_sink")
+            self.add_flow(subscriber_op, ci_sink, {("color_outputs", "input")})
+
+        if debug_output_config.get("enable_depthimage", False):
+            log.info("create depth visualizer")
+            depth_visualizer = HolovizOp(
+                self,
+                name="depth_visualizer",
+                allocator=CudaStreamPool(
+                    self,
+                    name="cuda_stream",
+                    dev_id=0,
+                    stream_flags=0,
+                    stream_priority=0,
+                    reserved_size=1,
+                    max_size=len(depth_streams_config),
+                ),
+                **self.kwargs("depth_holoviz"),
+            )
+
+            self.add_flow(subscriber_op, depth_visualizer, {("depth_outputs", "receivers")})
+            self.add_flow(subscriber_op, depth_visualizer, {("depth_output_specs", "input_specs")})
 
 
 def main(config_file=None):

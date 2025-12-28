@@ -9,6 +9,7 @@ struct BackProjectionParams {
   const float2*   xy;       // [H*W], per-pixel (x,y)
   float* positions;         // [H*W*3]
   float* texcoords;         // [H*W*2]
+  float* depth_float;         // [H*W]
   int width;
   int height;
   float depth_units_per_meter;
@@ -17,6 +18,9 @@ struct BackProjectionParams {
   CameraParameters color_params;
   float4x4 color_to_depth;   // maps depth->color space
   float4x4 depth_extrinsics; // maps depth->world (or desired output space)
+  bool positions_enabled;
+  bool texcoords_enabled;
+  bool depth_float_enabled;
 };
 
 __global__ void backprojection_u16_kernel(BackProjectionParams bp);

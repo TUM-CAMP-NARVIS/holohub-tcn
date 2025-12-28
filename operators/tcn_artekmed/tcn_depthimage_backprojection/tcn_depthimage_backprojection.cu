@@ -17,23 +17,16 @@ namespace tcn::ops {
 void TcnDepthImageBackprojectionOp::setup(holoscan::OperatorSpec& spec) {
   using holoscan::Arg;
 
-  register_converter<Eigen::Vector3f>();
-  register_converter<Eigen::Quaternionf>();
-  register_converter<RigidTransform>();
-  register_converter<CameraParameters>();
-
-  register_converter<nvidia::gxf::Vector2f>();
-  register_converter<nvidia::gxf::Vector2u>();
-  register_converter<nvidia::gxf::DistortionType>();
-  register_converter<nvidia::gxf::CameraModel>();
+  HOLOSCAN_LOG_INFO("TcnDepthimageBackprojectionOp::setup");
 
   // Inputs
   spec.input<holoscan::gxf::Entity>("depth_image");  // device, [H, W], uint16
-  spec.input<holoscan::gxf::Entity>("xy_table");     // device, [H, W, 2], float32
+  spec.input<holoscan::gxf::Entity>("xy_table").condition(holoscan::ConditionType::kNone);     // device, [H, W, 2], float32
 
   // Outputs (planar)
-  spec.output<holoscan::Tensor>("positions");  // device, [H, W, 3], float32
-  spec.output<holoscan::Tensor>("texcoords");  // device, [H, W, 2], float32
+  spec.output<holoscan::gxf::Entity>("positions");
+  spec.output<holoscan::gxf::Entity>("texcoords");
+  spec.output<holoscan::gxf::Entity>("depth_float");
 
   // Configurable params (optional)
   spec.param(allocator_, "allocator", "Allocator", "Allocator used to allocate tensor output.");
@@ -65,7 +58,42 @@ void TcnDepthImageBackprojectionOp::setup(holoscan::OperatorSpec& spec) {
              "color_params",
              "Color Camera Parameters",
              "Intrinsic and Distortion Parameters");
+  spec.param(out_tensor_name_, "out_tensor_name", "Output Tensor Name", "", ""s);
+
+  spec.param(enable_positions_, "enable_positions", "Enable Positions Output", "", true);
+  spec.param(enable_texcoords_, "enable_texcoords", "Enable Texcoords Output", "", true);
+  spec.param(enable_depth_float_, "enable_depth_float", "Enable DepthFloat Output", "", false);
+
 }
+
+
+void TcnDepthImageBackprojectionOp::initialize() {
+  HOLOSCAN_LOG_INFO("TcnDepthimageBackprojectionOp::initialize");
+
+  // register type converters (args)
+  register_converter<Eigen::Vector3f>();
+  register_converter<Eigen::Quaternionf>();
+  register_converter<RigidTransform>();
+  register_converter<CameraParameters>();
+
+  register_converter<nvidia::gxf::Vector2f>();
+  register_converter<nvidia::gxf::Vector2u>();
+  register_converter<nvidia::gxf::DistortionType>();
+  register_converter<nvidia::gxf::CameraModel>();
+
+
+  positions_output_enabled_ = enable_conditional_port("positions", true);
+  texcoords_output_enabled_ = enable_conditional_port("texcoords", true);
+  depth_float_output_enabled_ = enable_conditional_port("depth_float", true);
+
+  if (texcoords_output_enabled_ && !positions_output_enabled_) {
+    throw std::runtime_error("positions output must be enabled for texture-coordinates output");
+  }
+
+  // parent class initialize() call must be after the argument additions above
+  Operator::initialize();
+}
+
 
 void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
                                             holoscan::OutputContext& op_output,
@@ -89,10 +117,14 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
   auto depth_t = maybe_depth_t_entity.value().get<holoscan::Tensor>("");
 
   auto maybe_xy_t_entity = op_input.receive<holoscan::gxf::Entity>("xy_table");
-  if (!maybe_xy_t_entity) {
-    throw std::runtime_error("Failed to read xy_table entity");
+  if (maybe_xy_t_entity) {
+    HOLOSCAN_LOG_INFO("received xy table input");
+    xylookup_table_tensor_ = maybe_xy_t_entity.value().get<holoscan::Tensor>("");
   }
-  auto xy_t = maybe_xy_t_entity.value().get<holoscan::Tensor>("");
+  if (!xylookup_table_tensor_) {
+    HOLOSCAN_LOG_DEBUG("missing xy lookup table");
+    return;
+  }
 
   auto& cp_t = color_params_.get();
   auto& c2d_t = color_to_depth_.get();
@@ -102,9 +134,13 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
   const int H = static_cast<int>(depth_shape[0]);
   const int W = static_cast<int>(depth_shape[1]);
 
+  assert(xylookup_table_tensor_->shape()[0] == depth_t->shape()[0]);
+  assert(xylookup_table_tensor_->shape()[1] == depth_t->shape()[1]);
+  assert(xylookup_table_tensor_->shape()[2] == 2);
+
   // Map tensors to raw device pointers
   auto* depth_ptr = static_cast<uint16_t*>(depth_t->data());
-  auto* xy_ptr = static_cast<float*>(xy_t->data());
+  auto* xy_ptr = static_cast<float*>(xylookup_table_tensor_->data());
 
   Eigen::Matrix4f color_to_depth;
   c2d_t.toMatrix4f(color_to_depth);
@@ -136,76 +172,128 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
   // Allocate Holoscan outputs (device)
   auto gxf_context = context.context();
 
-  auto positions_entity = nvidia::gxf::Entity::New(gxf_context);
-  if (!positions_entity) {
-    throw std::runtime_error("Failed to allocate message for output positions tensor.");
-  }
-
-  auto texcoords_entity = nvidia::gxf::Entity::New(gxf_context);
-  if (!texcoords_entity) {
-    throw std::runtime_error("Failed to allocate message for output texcoords tensor.");
-  }
-
   // get Handle to underlying nvidia::gxf::Allocator from std::shared_ptr<holoscan::Allocator>
   auto allocator =
       nvidia::gxf::Handle<nvidia::gxf::Allocator>::Create(gxf_context, allocator_->gxf_cid());
 
-  auto maybe_positions = positions_entity.value().add<nvidia::gxf::Tensor>();
-  if (!maybe_positions) {
-    throw std::runtime_error("Failed to allocate message for positions.");
-  }
-  auto& positions = maybe_positions.value();
-  auto positions_storage_type = nvidia::gxf::MemoryStorageType::kDevice;
-  auto positions_shape = nvidia::gxf::Shape{{H, W, 3}};
-  const auto positions_dtype = nvidia::gxf::PrimitiveType::kFloat32;
-  const uint64_t positions_bytes_per_element = nvidia::gxf::PrimitiveTypeSize(positions_dtype);
-  auto positions_strides =
-      nvidia::gxf::ComputeTrivialStrides(positions_shape, positions_bytes_per_element);
-
-  auto positions_result = positions->reshapeCustom(positions_shape,
-                                                   positions_dtype,
-                                                   positions_bytes_per_element,
-                                                   positions_strides,
-                                                   positions_storage_type,
-                                                   allocator.value());
-  if (!positions_result) {
-    HOLOSCAN_LOG_ERROR("failed to generate positions tensor");
-  }
-
-  auto maybe_texcoords = texcoords_entity.value().add<nvidia::gxf::Tensor>();
-  if (!maybe_texcoords) {
-    throw std::runtime_error("Failed to allocate message for texcoords.");
-  }
-  auto& texcoords = maybe_texcoords.value();
-  auto texcoords_storage_type = nvidia::gxf::MemoryStorageType::kDevice;
-  auto texcoords_shape = nvidia::gxf::Shape{{H, W, 2}};
-  const auto texcoords_dtype = nvidia::gxf::PrimitiveType::kFloat32;
-  const uint64_t texcoords_bytes_per_element = nvidia::gxf::PrimitiveTypeSize(texcoords_dtype);
-  auto texcoords_strides =
-      nvidia::gxf::ComputeTrivialStrides(texcoords_shape, texcoords_bytes_per_element);
-
-  auto texcoords_result = texcoords->reshapeCustom(texcoords_shape,
-                                                   texcoords_dtype,
-                                                   texcoords_bytes_per_element,
-                                                   texcoords_strides,
-                                                   texcoords_storage_type,
-                                                   allocator.value());
-  if (!texcoords_result) {
-    HOLOSCAN_LOG_ERROR("failed to generate positions tensor");
-  }
-
   float* pos_ptr = nullptr;
   float* tex_ptr = nullptr;
+  float* dmf_ptr = nullptr;
 
-  if (auto maybe_positions_data = positions->data<float>()) {
-    pos_ptr = maybe_positions_data.value();
-  } else {
-    HOLOSCAN_LOG_ERROR("error access positions tensor data");
+  nvidia::gxf::Entity positions_entity;
+  nvidia::gxf::Entity texcoords_entity;
+  nvidia::gxf::Entity depth_float_entity;
+
+  nvidia::gxf::Handle<nvidia::gxf::Tensor> positions = nullptr;
+  nvidia::gxf::Handle<nvidia::gxf::Tensor> texcoords = nullptr;
+  nvidia::gxf::Handle<nvidia::gxf::Tensor> depth_float = nullptr;
+
+  if (positions_output_enabled_) {
+    auto maybe_positions_entity = nvidia::gxf::Entity::New(gxf_context);
+    if (!maybe_positions_entity) {
+      throw std::runtime_error("Failed to allocate message for output positions tensor.");
+    }
+    positions_entity = std::move(maybe_positions_entity.value());
+    auto maybe_positions = positions_entity.add<nvidia::gxf::Tensor>(out_tensor_name_.get().c_str());
+    if (!maybe_positions) {
+      throw std::runtime_error("Failed to allocate message for positions.");
+    }
+    positions = maybe_positions.value();
+    auto positions_storage_type = nvidia::gxf::MemoryStorageType::kDevice;
+    auto positions_shape = nvidia::gxf::Shape{{1, H*W, 3}};
+    constexpr auto positions_dtype = nvidia::gxf::PrimitiveType::kFloat32;
+    const uint64_t positions_bytes_per_element = nvidia::gxf::PrimitiveTypeSize(positions_dtype);
+    auto positions_strides =
+        nvidia::gxf::ComputeTrivialStrides(positions_shape, positions_bytes_per_element);
+
+    auto positions_result = positions->reshapeCustom(positions_shape,
+                                                     positions_dtype,
+                                                     positions_bytes_per_element,
+                                                     positions_strides,
+                                                     positions_storage_type,
+                                                     allocator.value());
+    if (!positions_result) {
+      HOLOSCAN_LOG_ERROR("failed to generate positions tensor");
+    }
+
+    if (auto maybe_positions_data = positions->data<float>()) {
+      pos_ptr = maybe_positions_data.value();
+    } else {
+      HOLOSCAN_LOG_ERROR("error access positions tensor data");
+    }
   }
-  if (auto maybe_texcoords_data = texcoords->data<float>()) {
-    tex_ptr = maybe_texcoords_data.value();
-  } else {
-    HOLOSCAN_LOG_ERROR("error access texcoord tensor data");
+
+  if (texcoords_output_enabled_) {
+    auto maybe_texcoords_entity = nvidia::gxf::Entity::New(gxf_context);
+    if (!maybe_texcoords_entity) {
+      throw std::runtime_error("Failed to allocate message for output texcoords tensor.");
+    }
+    texcoords_entity = std::move(maybe_texcoords_entity.value());
+    auto maybe_texcoords = texcoords_entity.add<nvidia::gxf::Tensor>(out_tensor_name_.get().c_str());
+    if (!maybe_texcoords) {
+      throw std::runtime_error("Failed to allocate message for texcoords.");
+    }
+    texcoords = maybe_texcoords.value();
+    auto texcoords_storage_type = nvidia::gxf::MemoryStorageType::kDevice;
+    auto texcoords_shape = nvidia::gxf::Shape{{1, H*W, 2}};
+    constexpr auto texcoords_dtype = nvidia::gxf::PrimitiveType::kFloat32;
+    const uint64_t texcoords_bytes_per_element = nvidia::gxf::PrimitiveTypeSize(texcoords_dtype);
+    auto texcoords_strides =
+        nvidia::gxf::ComputeTrivialStrides(texcoords_shape, texcoords_bytes_per_element);
+
+    auto texcoords_result = texcoords->reshapeCustom(texcoords_shape,
+                                                     texcoords_dtype,
+                                                     texcoords_bytes_per_element,
+                                                     texcoords_strides,
+                                                     texcoords_storage_type,
+                                                     allocator.value());
+    if (!texcoords_result) {
+      HOLOSCAN_LOG_ERROR("failed to generate positions tensor");
+    }
+
+
+    if (auto maybe_texcoords_data = texcoords->data<float>()) {
+      tex_ptr = maybe_texcoords_data.value();
+    } else {
+      HOLOSCAN_LOG_ERROR("error access texcoord tensor data");
+    }
+  }
+
+  if (depth_float_output_enabled_) {
+    auto maybe_depth_float_entity = nvidia::gxf::Entity::New(gxf_context);
+    if (!maybe_depth_float_entity) {
+      throw std::runtime_error("Failed to allocate message for output depth_float tensor.");
+    }
+    depth_float_entity = std::move(maybe_depth_float_entity.value());
+
+    auto maybe_depth_float = depth_float_entity.add<nvidia::gxf::Tensor>(out_tensor_name_.get().c_str());
+    if (!maybe_depth_float) {
+      throw std::runtime_error("Failed to allocate message for depth_float.");
+    }
+    depth_float = maybe_depth_float.value();
+    auto depth_float_storage_type = nvidia::gxf::MemoryStorageType::kDevice;
+    auto depth_float_shape = nvidia::gxf::Shape{{H, W, 1}};
+    constexpr auto depth_float_dtype = nvidia::gxf::PrimitiveType::kFloat32;
+    const uint64_t depth_float_bytes_per_element = nvidia::gxf::PrimitiveTypeSize(depth_float_dtype);
+    auto depth_float_strides =
+        nvidia::gxf::ComputeTrivialStrides(depth_float_shape, depth_float_bytes_per_element);
+
+    auto depth_float_result = depth_float->reshapeCustom(depth_float_shape,
+                                                     depth_float_dtype,
+                                                     depth_float_bytes_per_element,
+                                                     depth_float_strides,
+                                                     depth_float_storage_type,
+                                                     allocator.value());
+    if (!depth_float_result) {
+      HOLOSCAN_LOG_ERROR("failed to generate depth_float tensor");
+    }
+
+
+    if (auto maybe_depth_float_data = depth_float->data<float>()) {
+      dmf_ptr = maybe_depth_float_data.value();
+    } else {
+      HOLOSCAN_LOG_ERROR("error access depth_float tensor data");
+    }
   }
 
   // Launch kernel
@@ -214,6 +302,7 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
   params.xy = reinterpret_cast<const float2*>(xy_ptr);
   params.positions = pos_ptr;
   params.texcoords = tex_ptr;
+  params.depth_float = dmf_ptr;
   params.width = W;
   params.height = H;
   params.depth_units_per_meter = depth_units_per_meter_;
@@ -222,16 +311,82 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
   params.color_params = color_params;
   params.color_to_depth = float4x4Cast(color_to_depth);
   params.depth_extrinsics = float4x4Cast(depth_extrinsics);
+  params.positions_enabled = positions_output_enabled_;
+  params.texcoords_enabled = texcoords_output_enabled_;
+  params.depth_float_enabled = depth_float_output_enabled_;
 
   const dim3 block(16, 16);
   const dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
   backprojection_u16_kernel<<<grid, block, 0, stream>>>(params);
 
-  auto positions_message = holoscan::gxf::Entity(std::move(positions_entity.value()));
-  op_output.emit(positions_message, "positions");
+  if (positions_output_enabled_) {
+    auto positions_message = holoscan::gxf::Entity(std::move(positions_entity));
+    op_output.emit(positions_message, "positions");
+  }
 
-  auto texcoords_message = holoscan::gxf::Entity(std::move(texcoords_entity.value()));
-  op_output.emit(texcoords_message, "texcoords");
+  if (texcoords_output_enabled_) {
+    auto texcoords_message = holoscan::gxf::Entity(std::move(texcoords_entity));
+    op_output.emit(texcoords_message, "texcoords");
+  }
+
+  if (depth_float_output_enabled_) {
+    auto depth_float_message = holoscan::gxf::Entity(std::move(depth_float_entity));
+    op_output.emit(depth_float_message, "depth_float");
+  }
 }
 
+
+bool TcnDepthImageBackprojectionOp::enable_conditional_port(const std::string& port_name,
+                                        bool set_none_condition_on_disabled) {
+  bool enable_port = false;
+
+  // Check if the boolean argument with the name "enable_(port_name)" is present.
+  const std::string enable_port_name = std::string("enable_") + port_name;
+  auto enable_port_arg =
+      std::find_if(args().begin(), args().end(), [&enable_port_name](const auto& arg) {
+        return (arg.name() == enable_port_name);
+      });
+
+  // If present ...
+  if (enable_port_arg != args().end()) {
+    // ... and with a value ...
+    if (enable_port_arg->has_value()) {
+      // ...try extracting a boolean value through YAML::Node or generic bool cast
+      std::any& any_arg = enable_port_arg->value();
+      if (enable_port_arg->arg_type().element_type() == holoscan::ArgElementType::kYAMLNode) {
+        auto& arg_value = std::any_cast<YAML::Node&>(any_arg);
+        bool parse_ok = YAML::convert<bool>::decode(arg_value, enable_port);
+        if (!parse_ok) {
+          HOLOSCAN_LOG_ERROR("Could not parse YAML parameter '{}' as a 'bool' type",
+                             enable_port_name);
+          enable_port = false;
+        }
+      } else {
+        try {
+          enable_port = std::any_cast<bool>(any_arg);
+        } catch (const std::bad_any_cast& e) {
+          HOLOSCAN_LOG_ERROR(
+              "Could not cast parameter '{}' as 'bool': {}", enable_port_name, e.what());
+        }
+      }
+    }
+    // If the "enable_(port_name)" argument is present, we remove it so that it won't
+    // be passed on further, since we only care about "(port_name)" afterwards.
+    args().erase(enable_port_arg);
+  }
+
+  // Disable the '(port_name)' argument based on the value of "enable_(port_name)"
+  // if (!enable_port) {
+  //   add_arg(holoscan::Arg(port_name) = static_cast<holoscan::IOSpec*>(nullptr));
+  // }
+
+  // If 'set_none_condition_on_disabled' is true and the port (named by 'port_name') is disabled,
+  // insert ConditionType::kNone condition so that its default condition
+  // (DownstreamMessageAffordableCondition) is not added during Operator::initialize().
+  if (!enable_port && set_none_condition_on_disabled) {
+    spec()->outputs()[port_name]->condition(holoscan::ConditionType::kNone);
+  }
+
+  return enable_port;
+}
 }  // namespace tcn::ops
