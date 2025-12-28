@@ -4,15 +4,32 @@ application:
   inputFormats: []
   outputFormats: ["screen"]
 
+debug_output:
+  enable_colorimage: False
+  enable_depthimage: False
+  enable_pointcloud: True
+
 resources:
-  cpu: 8
+  cpu: 24
   gpu: 1
   memory: 1Gi
   gpuMemory: 1Gi
 
 
-holoviz:
-  window_title: "TCN Artekmed Shm Receiver"
+depth_holoviz:
+  window_title: "Artekmed Depthimages"
+  width: 800
+  height: 640
+  framerate: 60
+
+color_holoviz:
+  window_title: "Artekmed Colorimages"
+  width: 800
+  height: 640
+  framerate: 60
+
+points_holoviz:
+  window_title: "Artekmed Pointclouds"
   width: 800
   height: 640
   framerate: 60

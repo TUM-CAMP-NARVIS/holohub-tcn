@@ -68,6 +68,10 @@ class PyTcnDepthImageBackprojectionOp : public TcnDepthImageBackprojectionOp {
                                   nvidia::gxf::CameraModel color_params,
                                   RigidTransform depth_extrinsics,
                                   RigidTransform color_to_depth,
+                                  const std::string& out_tensor_name,
+                                  bool enable_positions = true,
+                                  bool enable_texcoords = false,
+                                  bool enable_depth_float = false,
                                   const std::string& name = "tcn_depthimage_backprojection")
       : TcnDepthImageBackprojectionOp(
             holoscan::ArgList{holoscan::Arg{"allocator", allocator},
@@ -78,7 +82,12 @@ class PyTcnDepthImageBackprojectionOp : public TcnDepthImageBackprojectionOp {
                               holoscan::Arg{"color_image_height", color_image_height},
                               holoscan::Arg{"color_params", color_params},
                               holoscan::Arg{"depth_extrinsics", depth_extrinsics},
-                              holoscan::Arg{"color_to_depth", color_to_depth}}) {
+                              holoscan::Arg{"color_to_depth", color_to_depth},
+                              holoscan::Arg{"out_tensor_name", out_tensor_name},
+                              holoscan::Arg{"enable_positions", enable_positions},
+                              holoscan::Arg{"enable_texcoords", enable_texcoords},
+                              holoscan::Arg{"enable_depth_float", enable_depth_float}
+            }) {
     add_positional_condition_and_resource_args(this, args);
     name_ = name;
     fragment_ = fragment;
@@ -158,7 +167,7 @@ PYBIND11_MODULE(_tcn_depthimage_backprojection, m) {
     .def_readwrite("translation", &RigidTransform::translation)
     ;
 
-  m.def("make_rigid_transform", [](holoscan::Tensor translation, holoscan::Tensor rotation) {
+  m.def("make_rigid_transform", [](const holoscan::Tensor& translation, const holoscan::Tensor& rotation) {
     const Eigen::Map<Eigen::Vector3f> t(static_cast<float*>(translation.data()));
     const Eigen::Map<Eigen::Vector4f> r(static_cast<float*>(rotation.data()));
     return RigidTransform(t, Eigen::Quaternion<float>(r));
@@ -182,17 +191,25 @@ PYBIND11_MODULE(_tcn_depthimage_backprojection, m) {
                     nvidia::gxf::CameraModel,
                     RigidTransform,
                     RigidTransform,
+                    const std::string&,
+                    bool,
+                    bool,
+                    bool,
                     const std::string&>(),
            "fragment"_a,
            "allocator"_a,
            "depth_units_per_meter"_a = 1000.f,
            "near_limit_m"_a = 0.01f,
            "far_limit_m"_a = 10.f,
-           "color_image_width"_a = 1920,
-           "color_image_height"_a = 1080,
+           "color_image_width"_a = 320,
+           "color_image_height"_a = 288,
            "color_params"_a = nvidia::gxf::CameraModel{},
            "depth_extrinsics"_a = RigidTransform{},
            "color_to_depth"_a = RigidTransform{},
+           "out_tensor_name"_a = ""s,
+           "enable_positions"_a = true,
+           "enable_texcoords"_a = true,
+           "enable_depth_float"_a = false,
            "name"_a = "tcn_depthimage_backprojection"s,
            doc::TcnDepthImageBackprojectionOp::doc_TcnDepthImageBackprojectionOp)
       .def("initialize",
