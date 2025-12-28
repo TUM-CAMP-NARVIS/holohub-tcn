@@ -3,8 +3,8 @@ import ctypes
 import logging
 import iceoryx2 as iox2
 
-from shm_types import ShmSerializedMessage, ShmSerializedStreamHeader, PubSubEvent
-from shm_serde import decode_shm_buffer_connection_status, decode_shm_device_context, decode_buffer_descriptor
+from .shm_types import ShmSerializedMessage, ShmSerializedStreamHeader, PubSubEvent
+from .shm_serde import decode_shm_buffer_connection_status, decode_shm_device_context, decode_buffer_descriptor
 
 log = logging.getLogger(__name__)
 DEVICE_CONTEXT_MATCH = re.compile(r'^(.+)\/DEVICE_CONTEXT\/SensorCalibration$')
