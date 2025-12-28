@@ -15,9 +15,11 @@
  * limitations under the License.
  */
 
-#include <pybind11/complex.h>
+#include <pybind11/eigen.h>
+#include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <pybind11/complex.h>
 
 #include <cstdint>
 #include <memory>
@@ -163,14 +165,17 @@ PYBIND11_MODULE(_tcn_depthimage_backprojection, m) {
 
   py::class_<RigidTransform>(m, "RigidTransform", doc::TcnDepthImageBackprojectionOp::doc_Pose)
     .def(py::init<Eigen::Vector3f, Eigen::Quaternion<float>>())
-    .def_readwrite("rotation", &RigidTransform::rotation)
-    .def_readwrite("translation", &RigidTransform::translation)
+    .def_property("translation",
+            [](const RigidTransform& p) { return p.translation; },  // getter
+            [](RigidTransform& p, const Eigen::Vector3f& v) { p.translation = v; })  // setter
+    .def_property("rotation",
+        [](const RigidTransform& p) { return p.rotation.coeffs(); },
+        // order: x,y,z,w
+        [](RigidTransform& p, const Eigen::Vector4f& q) { p.rotation = Eigen::Quaternionf(q.w(), q.x(), q.y(), q.z()); })
     ;
 
-  m.def("make_rigid_transform", [](const holoscan::Tensor& translation, const holoscan::Tensor& rotation) {
-    const Eigen::Map<Eigen::Vector3f> t(static_cast<float*>(translation.data()));
-    const Eigen::Map<Eigen::Vector4f> r(static_cast<float*>(rotation.data()));
-    return RigidTransform(t, Eigen::Quaternion<float>(r));
+  m.def("make_rigid_transform", [](const Eigen::Vector3f& translation, const Eigen::Vector4f& rotation) {
+    return RigidTransform(translation, Eigen::Quaternion<float>(rotation));
   });
 
   py::class_<TcnDepthImageBackprojectionOp,

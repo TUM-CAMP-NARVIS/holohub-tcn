@@ -19,6 +19,7 @@ project(tcn_depthimage_backprojection LANGUAGES CXX CUDA)
 find_package(holoscan 3.0 REQUIRED CONFIG
              PATHS "/opt/nvidia/holoscan" "/workspace/holoscan-sdk/install")
 
+find_package(Eigen3 REQUIRED NO_MODULE)
 # Decoder Operator
 add_library(tcn_depthimage_backprojection SHARED
         tcn_depthimage_backprojection.cu
@@ -29,6 +30,8 @@ add_library(holoscan::ops::tcn_depthimage_backprojection ALIAS tcn_depthimage_ba
 target_link_libraries(tcn_depthimage_backprojection PUBLIC
   holoscan::core
   cuda
+  PRIVATE
+  Eigen3::Eigen
 )
 target_compile_options(tcn_depthimage_backprojection
   PRIVATE
