@@ -14,14 +14,14 @@ class StreamMergerOp(Operator):
     def __init__(
             self,
             fragment: Any,
-            port_names: Any,
+            input_port_names: Any,
             input_message_name: str,
             output_message_name: str,
             fuse_buffers: bool,
             *args,
             **kwargs,
     ):
-        self.port_names = port_names
+        self.input_port_names = input_port_names
         self.fuse_buffers = fuse_buffers
         self.input_message_name = input_message_name
         self.output_message_name = output_message_name
@@ -31,7 +31,7 @@ class StreamMergerOp(Operator):
         super().__init__(fragment, *args, **kwargs)
 
     def setup(self, spec: OperatorSpec):
-        for name in self.port_names:
+        for name in self.input_port_names:
             spec.input(name)
         spec.output("output")
         self.ctx_service = self.service(DeviceContextService)
@@ -39,10 +39,13 @@ class StreamMergerOp(Operator):
 
     def compute(self, op_input, op_output, context):
         all_messages = []
-        for name in self.port_names:
+        for name in self.input_port_names:
             message = op_input.receive(name)
             log.debug(f"Merge {name} message: {message.keys()} -> {self.input_message_name}")
-            all_messages.append((name, cp.asarray(message.get(self.input_message_name))))
+            value = message.get(self.input_message_name)
+            if value is None:
+                raise ValueError(f"Invalid payload for message with keys: {list(message.keys())} for {self.input_message_name}")
+            all_messages.append((name, cp.asarray(value)))
 
         if self.fuse_buffers:
             fused_buffer = cp.concatenate((m[1] for m in all_messages))

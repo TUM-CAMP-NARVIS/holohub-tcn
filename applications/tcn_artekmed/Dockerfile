@@ -86,6 +86,40 @@ RUN rm -Rf /tmp/dependencies/xylt && \
     cmake --install . --prefix=/usr && \
     cp /tmp/dependencies/xylt/build/pyxylt.cpython*.so /usr/local/lib/python3.12/dist-packages/
 
+
+# Install additional packages
+RUN apt-get update \
+    && export DEBIAN_FRONTEND=noninteractive \
+    && apt-get -y install --no-install-recommends  \
+        build-essential \
+        ccache \
+        gdb \
+        git-lfs \
+    && apt-get autoremove -y \
+    && apt-get clean -y \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install dependencies for Slang (CMake, Vulkan, etc.)
+RUN apt-get update && apt-get install -y \
+    wget \
+    unzip \
+    cmake \
+    libvulkan-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download and install latest Slang release (adjust version as needed)
+WORKDIR /tmp/dependencies/slang
+ARG SLANG_VERSION=2025.24.2  # Check https://github.com/shader-slang/slang/releases
+RUN wget https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/slang-${SLANG_VERSION}-linux-x86_64.zip \
+    && unzip slang-${SLANG_VERSION}-linux-x86_64.zip -d /tmp/dependencies/slang \
+    && rm slang-${SLANG_VERSION}-linux-x86_64.zip \
+    && ln -s /tmp/dependencies/slang/bin/slangc /usr/local/bin/slangc \
+    && ln -s /tmp/dependencies/slang/bin/slangd /usr/local/bin/slangd
+
+
+# Set PATH and verify
+ENV PATH="/tmp/dependencies/slang/bin:${PATH}"
+
 WORKDIR /
 
 ## Dev container
@@ -118,18 +152,6 @@ RUN groupadd --gid $USER_GID $USERNAME \
 
 # [Optional] Uncomment this section to install additional vcpkg ports.
 # RUN su vscode -c "${VCPKG_ROOT}/vcpkg install <your-port-name-here>"
-
-# Install additional packages
-RUN apt-get update \
-    && export DEBIAN_FRONTEND=noninteractive \
-    && apt-get -y install --no-install-recommends  \
-        build-essential \
-        ccache \
-        gdb \
-        git-lfs \
-    && apt-get autoremove -y \
-    && apt-get clean -y \
-    && rm -rf /var/lib/apt/lists/*
 
 # Set the default user.
 # (See https://code.visualstudio.com/remote/advancedcontainers/add-nonroot-user)
