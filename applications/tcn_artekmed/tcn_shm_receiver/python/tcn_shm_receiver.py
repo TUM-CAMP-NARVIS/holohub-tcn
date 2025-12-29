@@ -209,7 +209,8 @@ class App(hs.core.Application):
         log.info("define per depthimage processing pipeline")
         sink_ops = []
 
-        merge_connections = []
+        position_merge_connections = []
+        texcoords_merge_connections = []
         for channel in depth_streams_config:
             channel_name = channel["name"]
             camera_name = ctx_service.get_camera_name_from_port_name(channel_name)
@@ -236,7 +237,7 @@ class App(hs.core.Application):
                 depth_extrinsics=ctx_service.get_depth_extrinsics(camera_name),
                 color_to_depth=ctx_service.get_color_to_depth(camera_name),
                 # out_tensor_name=camera_name,
-                out_tensor_name="positions",
+                out_tensor_name="output",
                 enable_positions=True,
                 # points visualizer does not consume texcoords
                 enable_texcoords=points_visualizer is None,
@@ -252,27 +253,27 @@ class App(hs.core.Application):
                 ("xy_table", "xy_table")
             })
 
-            merge_connections.append((bp_op, {("positions", f"{camera_name}_positions")}))
+            position_merge_connections.append((bp_op, {("positions", f"{camera_name}_positions")}))
+            texcoords_merge_connections.append((bp_op, {("texcoords", f"{camera_name}_texcoords")}))
 
             # debug view..
-            if points_visualizer is not None:
-                self.add_flow(bp_op, points_visualizer, {("positions", "receivers")})
-            else:
-                sink_op = PointCloudDummySinkOp(self, name=f"{camera_name}_sink")
-                self.add_flow(bp_op, sink_op, {
-                    ("positions", "positions"),
-                    ("texcoords", "texcoords"),
-                    })
-                sink_ops.append(sink_op)
+            # if points_visualizer is not None:
+            #     self.add_flow(bp_op, points_visualizer, {("positions", "receivers")})
+            # else:
+            #     sink_op = PointCloudDummySinkOp(self, name=f"{camera_name}_sink")
+            #     self.add_flow(bp_op, sink_op, {
+            #         ("positions", "positions"),
+            #         ("texcoords", "texcoords"),
+            #         })
+            #     sink_ops.append(sink_op)
 
         # merge Pointclouds
-        merge_inputs = list({list(v[1])[0][1] for v in merge_connections})
+        merge_inputs = list({list(v[1])[0][1] for v in position_merge_connections})
         log.info(f"Merge Position Streams: {merge_inputs}")
-        merge_op = StreamMergerOp(self, merge_inputs, "positions", "positions", True, name="point_fusion")
-        for op, conn in merge_connections:
-            self.add_flow(op, merge_op, conn)
-
-        self.add_flow(merge_op, points_visualizer, {("output", "receivers")})
+        position_merge_op = StreamMergerOp(self, merge_inputs, "output", "positions", True, name="point_fusion")
+        for op, conn in position_merge_connections:
+            self.add_flow(op, position_merge_op, conn)
+        self.add_flow(position_merge_op, points_visualizer, {("output", "receivers")})
 
 
         # sink_op = SinkOp(self, name=f"{camera_name}_sink")

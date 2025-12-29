@@ -56,6 +56,12 @@
     // Configure tool-specific properties.
     "customizations": {
         // Configure properties specific to VS Code.
+        "jetbrains": {
+            "plugins": [
+                "slanglsp",
+                "com.redhat.devtools.lsp4ij"
+            ]
+        }
     },
     // "initializeCommand": "${localWorkspaceFolder}/applications/tcn_artekmed/thirdparty/magicleap.sh",
     // Use 'forwardPorts' to make a list of ports inside the container available locally.

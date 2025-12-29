@@ -26,4 +26,5 @@ target_link_libraries(tcn_shm_receiver INTERFACE
     holoscan::ops::format_converter
     holoscan::ops::holoviz
     holoscan::ops::tcn_depthimage_backprojection
+    holoscan::ops::slang_shader
 )
