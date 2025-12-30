@@ -32,9 +32,6 @@ from holoscan.core import Operator, OperatorSpec
 from holoscan.operators import HolovizOp
 from holoscan.operators import holoviz
 
-from holohub.tcn_depthimage_backprojection import TcnDepthImageBackprojectionOp
-from holohub.tcn_depthimage_backprojection._tcn_depthimage_backprojection import CameraModel, DistortionType, RigidTransform, CameraParameters, make_rigid_transform
-
 
 class ShmSubscriberOp(Operator):
     """Simple zenoh subscriber.
@@ -50,6 +47,7 @@ class ShmSubscriberOp(Operator):
     def __init__(
             self,
             fragment: Any,
+            pool: Any,
             subscriber: Any,
             stream_name: str,
             channel_config: Any,
@@ -57,11 +55,11 @@ class ShmSubscriberOp(Operator):
             *args,
             **kwargs,
     ):
+        self.pool = pool
         self.subscriber = subscriber
         self.channel_config = channel_config
         self.stream_name = stream_name
         self.cycle_time_ms = cycle_time_ms
-        self.pool = None
 
         self.executor_ = ThreadPoolExecutor(max_workers=1)
         self.future_ = None  # will be set during start()
@@ -124,7 +122,6 @@ class ShmSubscriberOp(Operator):
 
     def start(self):
         self.subscriber.subscribe(self.stream_name)
-
         self.future_ = self.executor_.submit(self.receiver_mainloop)
         assert isinstance(self.future_, Future)
 
@@ -132,6 +129,8 @@ class ShmSubscriberOp(Operator):
         scheduler = self.fragment.scheduler()
         clock = scheduler.clock
         ts = clock.timestamp()
+
+        # Todo: so far i did not find a way to efficiently allocate from BlockMemory on Device
 
         frame_ts, (color_data, depth_data) = self.buffer.get()
         log.debug(f"got data for {frame_ts} from queue")

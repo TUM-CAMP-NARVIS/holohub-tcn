@@ -70,10 +70,13 @@ class PyTcnDepthImageBackprojectionOp : public TcnDepthImageBackprojectionOp {
                                   nvidia::gxf::CameraModel color_params,
                                   RigidTransform depth_extrinsics,
                                   RigidTransform color_to_depth,
+                                  const std::string& in_tensor_name,
                                   const std::string& out_tensor_name,
                                   bool enable_positions = true,
                                   bool enable_texcoords = false,
                                   bool enable_depth_float = false,
+                                  int cuda_device_ordinal = 0,
+                                  std::shared_ptr<holoscan::CudaStreamPool> cuda_stream_pool = nullptr,
                                   const std::string& name = "tcn_depthimage_backprojection")
       : TcnDepthImageBackprojectionOp(
             holoscan::ArgList{holoscan::Arg{"allocator", allocator},
@@ -85,10 +88,13 @@ class PyTcnDepthImageBackprojectionOp : public TcnDepthImageBackprojectionOp {
                               holoscan::Arg{"color_params", color_params},
                               holoscan::Arg{"depth_extrinsics", depth_extrinsics},
                               holoscan::Arg{"color_to_depth", color_to_depth},
+                              holoscan::Arg{"in_tensor_name", in_tensor_name},
                               holoscan::Arg{"out_tensor_name", out_tensor_name},
                               holoscan::Arg{"enable_positions", enable_positions},
                               holoscan::Arg{"enable_texcoords", enable_texcoords},
-                              holoscan::Arg{"enable_depth_float", enable_depth_float}
+                              holoscan::Arg{"enable_depth_float", enable_depth_float},
+                              holoscan::Arg{"cuda_device_ordinal", cuda_device_ordinal},
+                              holoscan::Arg{"cuda_stream_pool", cuda_stream_pool}
             }) {
     add_positional_condition_and_resource_args(this, args);
     name_ = name;
@@ -197,9 +203,12 @@ PYBIND11_MODULE(_tcn_depthimage_backprojection, m) {
                     RigidTransform,
                     RigidTransform,
                     const std::string&,
+                    const std::string&,
                     bool,
                     bool,
                     bool,
+                    int,
+                    std::shared_ptr<holoscan::CudaStreamPool>,
                     const std::string&>(),
            "fragment"_a,
            "allocator"_a,
@@ -211,10 +220,13 @@ PYBIND11_MODULE(_tcn_depthimage_backprojection, m) {
            "color_params"_a = nvidia::gxf::CameraModel{},
            "depth_extrinsics"_a = RigidTransform{},
            "color_to_depth"_a = RigidTransform{},
+           "in_tensor_name"_a = ""s,
            "out_tensor_name"_a = ""s,
            "enable_positions"_a = true,
            "enable_texcoords"_a = true,
            "enable_depth_float"_a = false,
+           "cuda_device_ordinal"_a = 0,
+           "cuda_stream_pool"_a = py::none(),
            "name"_a = "tcn_depthimage_backprojection"s,
            doc::TcnDepthImageBackprojectionOp::doc_TcnDepthImageBackprojectionOp)
       .def("initialize",
@@ -228,7 +240,7 @@ PYBIND11_MODULE(_tcn_depthimage_backprojection, m) {
   // Import the emitter/receiver registry from holoscan.core and pass it to this function to
   // register this new C++ type with the SDK.
   m.def("register_types", [](holoscan::EmitterReceiverRegistry& registry) {
-    HOLOSCAN_LOG_INFO("TCN SHM Receiver - register types");
+    HOLOSCAN_LOG_DEBUG("TCN SHM Receiver - register types");
     // registry.add_emitter_receiver<nvidia::gxf::CameraModel>(
     //     "nvidia::gxf::CameraModel"s);
     // registry.add_emitter_receiver<holoscan::Pose3f>(

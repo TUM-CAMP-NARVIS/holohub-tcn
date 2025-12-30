@@ -125,7 +125,7 @@ class ShmSynchronizedBufferReceiver:
                     buf_type = ctypes.c_uint8 * payload.len()
                     buf = ctypes.cast(payload.as_ptr(), ctypes.POINTER(buf_type)).contents
                     with decode_buffer_descriptor(memoryview(buf)) as message:
-                        log.debug(f"decoded frame: {user_header.timestamp}")
+                        #log.debug(f"decoded frame: {user_header.timestamp}")
                         return callback(user_header, message)
                 else:
                     self.node.wait(cycle_time)

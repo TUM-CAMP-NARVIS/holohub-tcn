@@ -36,6 +36,20 @@ struct CameraParameters {
   int is_distorted{0};  // 1 = distorted, 0 = undistorted
 };
 
+struct CameraQualityWeightParams {
+  float angleRejectLimit = 3.1415926535f / 9.f;
+  float angleRejectEnvelope = 1;
+  float offsetEnvelope = 1;
+
+  float depthNearLimit = 0.1f;
+  float depthFarLimit = 8.0f;
+
+  __host__ __device__ __forceinline__
+  bool isEnabled() const noexcept {
+    return angleRejectLimit != 0 || offsetEnvelope != 0;
+  }
+};
+
 struct RigidTransform {
   Eigen::Vector3f translation;
   Eigen::Quaternion<float> rotation;

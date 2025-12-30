@@ -9,6 +9,7 @@ import iceoryx2 as iox2
 import numpy as np
 import holoscan as hs
 from holohub.tcn_depthimage_backprojection import TcnDepthImageBackprojectionOp
+from holohub.tcn_depthimage_temporal_filter import TcnDepthImageTemporalFilterOp
 from holohub.tcn_depthimage_backprojection._tcn_depthimage_backprojection import CameraModel, DistortionType, \
     RigidTransform, CameraParameters, make_rigid_transform
 from operators.tcn_artekmed.tcn_shm_io import ShmSubscriberOp, DeviceContextService, XYLookupTableSourceOp, create_shm_subscriber
@@ -21,8 +22,9 @@ from holoscan.operators import HolovizOp
 from holoscan.operators import holoviz
 from holoscan.pose_tree import Pose3
 from holoscan.resources import CudaStreamPool
+from holoscan.resources import BlockMemoryPool, MemoryStorageType
 from holoscan.resources import RMMAllocator
-from holoscan.schedulers import EventBasedScheduler
+from holoscan.schedulers import EventBasedScheduler, GreedyScheduler
 
 from holoscan.pose_tree import PoseTreeManager, SO3
 
@@ -73,10 +75,14 @@ class App(hs.core.Application):
         # Add your operators here
         print("Starting TCN Shm Receiver")
 
+        camera_streams_config = self.kwargs("camera_stream_processing")
+        cuda_device_id = camera_streams_config.get("device_id", 0)
+        block_memory_buffer_size = camera_streams_config.get("buffer_size", 8)
+
         shm_config = self.kwargs("shared_memory")
         debug_output_config = self.kwargs("debug_output")
 
-        stream_name = shm_config.get("stream_name")
+        shm_stream_name = shm_config.get("stream_name")
         cycle_time_ms = shm_config.get("cycle_time_ms")
 
         node, shm_receiver = create_shm_subscriber()
@@ -122,19 +128,44 @@ class App(hs.core.Application):
             pts.tree.set(color_channel_name, depth_channel_name, 0,
                          convert_rigid_transform_to_pose3(ctx_service.get_color_to_depth(name)))
 
-        log.info(f"Retrieve channel config for stream: {stream_name}")
-        channels_config = shm_receiver.retrieve_channel_config(stream_name)
-
-        log.info(f"create subscriber op {stream_name}")
-        subscriber_op = ShmSubscriberOp(self, shm_receiver, stream_name, channels_config, cycle_time_ms, name="shm_subscriber")
+        log.info(f"Retrieve channel config for stream: {shm_stream_name}")
+        channels_config = shm_receiver.retrieve_channel_config(shm_stream_name)
 
         depth_streams_config = []
         color_streams_config = []
+        max_frame_size = 0
+        num_channels = len(channels_config["ports"])
+
         for channel in channels_config["ports"]:
+            max_frame_size = max(max_frame_size, channel["status"]["bufferInfo"]["frameSize"])
             if channel["status"]["portType"] == "depthimage":
                 depth_streams_config.append(channel)
             elif channel["status"]["portType"] == "colorimage":
                 color_streams_config.append(channel)
+
+        log.info(f"create cuda-stream pool with {num_channels} reserved streams on device {cuda_device_id}")
+        cuda_stream_pool = CudaStreamPool(
+            self,
+            name="cuda_stream_pool",
+            dev_id=cuda_device_id,
+            stream_flags=0,
+            stream_priority=0,
+            reserved_size=num_channels,
+            max_size=256,
+        )
+
+        log.info(f"create device-memory pool with {max_frame_size} bytes, {num_channels * block_memory_buffer_size} blocks on device {cuda_device_id}")
+        device_memory_pool = BlockMemoryPool(
+            self,
+            name="shm_subscriber_device_pool",
+            storage_type=MemoryStorageType.DEVICE,
+            block_size=max_frame_size,
+            num_blocks=num_channels * block_memory_buffer_size,
+            dev_id=cuda_device_id
+        )
+
+        log.info(f"create subscriber op {shm_stream_name}")
+        subscriber_op = ShmSubscriberOp(self, device_memory_pool, shm_receiver, shm_stream_name, channels_config, cycle_time_ms, name="shm_subscriber")
 
         log.info("create stream_splitter op")
         split_op = StreamSplitterOp(self, [v["name"] for v in depth_streams_config], name="stream_splitter")
@@ -194,15 +225,8 @@ class App(hs.core.Application):
                 self,
                 name="points_visualizer",
                 tensors=pointclouds_output_specs,
-                allocator=CudaStreamPool(
-                    self,
-                    name="cuda_stream",
-                    dev_id=0,
-                    stream_flags=0,
-                    stream_priority=0,
-                    reserved_size=1,
-                    max_size=len(camera_names),
-                ),
+                allocator=device_memory_pool,
+                cuda_stream_pool=cuda_stream_pool,
                 **self.kwargs("points_holoviz"),
             )
 
@@ -216,6 +240,24 @@ class App(hs.core.Application):
             camera_name = ctx_service.get_camera_name_from_port_name(channel_name)
             color_params = ctx_service.get_color_camera_model(camera_name)
 
+            ditf_op = TcnDepthImageTemporalFilterOp(
+                self,
+                allocator=device_memory_pool,
+                cuda_stream_pool=cuda_stream_pool,
+                persistence=3,
+                delta=30,
+                alpha=0.15,
+                in_tensor_name="",
+                out_tensor_name="",
+                cuda_device_ordinal=cuda_device_id,
+                name=f"{camera_name}_temporal_filter",
+
+            )
+            sink_ops.append(ditf_op)
+            self.add_flow(split_op, ditf_op, {
+                (channel_name, "input"),
+            })
+
             log.info(f"create xylookuptable source: {camera_name}")
             xylt_op = XYLookupTableSourceOp(self,
                                             CountCondition(self, count=1),
@@ -226,8 +268,9 @@ class App(hs.core.Application):
 
             log.info(f"create backprojection: {camera_name}")
             bp_op = TcnDepthImageBackprojectionOp(
-                self, 
-                allocator=RMMAllocator(self, name=f"rmm-allocator_{channel_name}", **self.kwargs("rmm_allocator")),
+                self,
+                allocator=device_memory_pool,
+                cuda_stream_pool=cuda_stream_pool,
                 depth_units_per_meter=1000.0,
                 near_limit_m=0.01,
                 far_limit_m=10.0,
@@ -237,17 +280,19 @@ class App(hs.core.Application):
                 depth_extrinsics=ctx_service.get_depth_extrinsics(camera_name),
                 color_to_depth=ctx_service.get_color_to_depth(camera_name),
                 # out_tensor_name=camera_name,
+                in_tensor_name="",
                 out_tensor_name="output",
                 enable_positions=True,
                 # points visualizer does not consume texcoords
                 enable_texcoords=points_visualizer is None,
                 enable_depth_float=False,
+                cuda_device_ordinal=cuda_device_id,
                 name=f"{camera_name}_backprojection",
                 )
             sink_ops.append(bp_op)
 
-            self.add_flow(split_op, bp_op, {
-                (channel_name, "depth_image"),
+            self.add_flow(ditf_op, bp_op, {
+                ("output", "depth_image"),
             })
             self.add_flow(xylt_op, bp_op, {
                 ("xy_table", "xy_table")
@@ -292,15 +337,8 @@ class App(hs.core.Application):
             color_visualizer = HolovizOp(
                 self,
                 name="color_visualizer",
-                allocator=CudaStreamPool(
-                    self,
-                    name="cuda_stream",
-                    dev_id=0,
-                    stream_flags=0,
-                    stream_priority=0,
-                    reserved_size=1,
-                    max_size=len(color_streams_config),
-                ),
+                allocator=device_memory_pool,
+                cuda_stream_pool=cuda_stream_pool,
                 **self.kwargs("color_holoviz"),
             )
 
@@ -316,15 +354,8 @@ class App(hs.core.Application):
             depth_visualizer = HolovizOp(
                 self,
                 name="depth_visualizer",
-                allocator=CudaStreamPool(
-                    self,
-                    name="cuda_stream",
-                    dev_id=0,
-                    stream_flags=0,
-                    stream_priority=0,
-                    reserved_size=1,
-                    max_size=len(depth_streams_config),
-                ),
+                allocator=device_memory_pool,
+                cuda_stream_pool=cuda_stream_pool,
                 **self.kwargs("depth_holoviz"),
             )
 
@@ -334,14 +365,25 @@ class App(hs.core.Application):
 
 def main(config_file=None):
     # make configurable or use holoscan debug level here too
-    logging.basicConfig(level=logging.INFO)
-    set_log_level(LogLevel.INFO)
-    iox2.set_log_level(iox2.LogLevel.Warn)
+    configure_debug = False
+
+    if configure_debug:
+        logging.basicConfig(level=logging.DEBUG)
+        set_log_level(LogLevel.TRACE)
+        iox2.set_log_level(iox2.LogLevel.Warn)
+    else:
+        logging.basicConfig(level=logging.INFO)
+        set_log_level(LogLevel.INFO)
+        iox2.set_log_level(iox2.LogLevel.Warn)
 
     app = App()
     app.config(config_file)
 
-    scheduler = EventBasedScheduler(app, worker_thread_number=24, name="ebs")
+    if configure_debug:
+        scheduler = GreedyScheduler(app, name="gs", stop_on_deadlock=True)
+    else:
+        scheduler = EventBasedScheduler(app, worker_thread_number=24, name="ebs")
+
     app.scheduler(scheduler)
 
     with Tracker(app) as tracker:
