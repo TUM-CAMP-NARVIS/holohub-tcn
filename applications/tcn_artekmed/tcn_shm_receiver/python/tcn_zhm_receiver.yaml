@@ -4,6 +4,16 @@ application:
   inputFormats: []
   outputFormats: ["screen"]
 
+camera_stream_processing:
+  device_id: 0
+  buffer_size: 8
+
+shared_memory:
+  stream_name: "camera_streams"
+  cycle_time_ms: 1
+
+rmm_allocator:
+
 debug_output:
   enable_colorimage: False
   enable_depthimage: False
@@ -34,12 +44,6 @@ points_holoviz:
   height: 640
   framerate: 60
 
-shared_memory:
-  stream_name: "camera_streams"
-  cycle_time_ms: 1
-
-
-rmm_allocator:
 
 pose_tree_config:
   number_frames: 1024                # default: 1024

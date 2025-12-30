@@ -1,6 +1,6 @@
 {
 	"operator": {
-		"name": "TcnDepthImageBackprojectionOp",
+		"name": "TcnDepthImageTemporalFilterOp",
 		"description": "This operator projects a depthimage into a pointcloud.",
 		"authors": [
 			{

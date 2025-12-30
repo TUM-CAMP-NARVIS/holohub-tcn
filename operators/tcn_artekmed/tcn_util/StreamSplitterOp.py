@@ -28,7 +28,12 @@ class StreamSplitterOp(Operator):
 
 
     def compute(self, op_input, op_output, context):
+        # @clarify: what if there is a cuda stream on the upstream?
         message = op_input.receive("receivers")
         for channel_name in self.channel_names:
+            stream_ptr = context.allocate_cuda_stream(f"{self.name}_{channel_name}")
+            if stream_ptr is None:
+                raise RuntimeError("Failed to allocate cuda stream from stream-pool.")
             di_tensor = hs.as_tensor(cp.asarray(message.get(channel_name)))
             op_output.emit({"": di_tensor}, channel_name)
+            op_output.set_cuda_stream(stream_ptr, channel_name)

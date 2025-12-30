@@ -39,13 +39,22 @@ class StreamMergerOp(Operator):
 
     def compute(self, op_input, op_output, context):
         all_messages = []
+        input_streams = []
         for name in self.input_port_names:
             message = op_input.receive(name)
+            port_stream = op_input.receive_cuda_stream(name, False)
+            if port_stream:
+                input_streams.append(port_stream)
             log.debug(f"Merge {name} message: {message.keys()} -> {self.input_message_name}")
             value = message.get(self.input_message_name)
             if value is None:
                 raise ValueError(f"Invalid payload for message with keys: {list(message.keys())} for {self.input_message_name}")
             all_messages.append((name, cp.asarray(value)))
+
+        output_stream = None
+        if input_streams:
+            output_stream = context.allocate_cuda_stream(self.name)
+            context.synchronize_streams(input_streams, output_stream)
 
         if self.fuse_buffers:
             fused_buffer = cp.concatenate((m[1] for m in all_messages))
@@ -60,3 +69,6 @@ class StreamMergerOp(Operator):
                 di_tensor = hs.as_tensor(buffer)
                 out_message[message_name] = di_tensor
             op_output.emit(out_message, "output")
+
+        if output_stream is not None:
+            op_output.set_cuda_stream(output_stream, "output")

@@ -36,4 +36,5 @@
 #set(NVC_SDK_PATH ${NVC_SDK_DIR} CACHE PATH "Path to NVIDIA Video Codec SDK")
 
 add_holohub_operator(tcn_depthimage_backprojection)
+add_holohub_operator(tcn_depthimage_temporal_filter)
 #add_holohub_operator(tcn_stream_synchronizer)
