@@ -7,6 +7,12 @@ application:
 camera_stream_processing:
   device_id: 0
   buffer_size: 8
+  enable_temporal_filter: true
+
+depthimage_temporal_filter:
+  alpha: 0.15
+  delta: 30
+  persistence: 3
 
 shared_memory:
   stream_name: "camera_streams"

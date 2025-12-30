@@ -165,10 +165,10 @@ class App(hs.core.Application):
         )
 
         log.info(f"create subscriber op {shm_stream_name}")
-        subscriber_op = ShmSubscriberOp(self, device_memory_pool, shm_receiver, shm_stream_name, channels_config, cycle_time_ms, name="shm_subscriber")
+        subscriber_op = ShmSubscriberOp(self, cuda_stream_pool, device_memory_pool, shm_receiver, shm_stream_name, channels_config, cycle_time_ms, name="shm_subscriber")
 
         log.info("create stream_splitter op")
-        split_op = StreamSplitterOp(self, [v["name"] for v in depth_streams_config], name="stream_splitter")
+        split_op = StreamSplitterOp(self, cuda_stream_pool, [v["name"] for v in depth_streams_config], name="stream_splitter")
         self.add_flow(subscriber_op, split_op, {("depth_outputs", "receivers")})
 
 
@@ -240,23 +240,25 @@ class App(hs.core.Application):
             camera_name = ctx_service.get_camera_name_from_port_name(channel_name)
             color_params = ctx_service.get_color_camera_model(camera_name)
 
-            ditf_op = TcnDepthImageTemporalFilterOp(
-                self,
-                allocator=device_memory_pool,
-                cuda_stream_pool=cuda_stream_pool,
-                persistence=3,
-                delta=30,
-                alpha=0.15,
-                in_tensor_name="",
-                out_tensor_name="",
-                cuda_device_ordinal=cuda_device_id,
-                name=f"{camera_name}_temporal_filter",
-
-            )
-            sink_ops.append(ditf_op)
-            self.add_flow(split_op, ditf_op, {
-                (channel_name, "input"),
-            })
+            prev_op = split_op
+            prev_output = channel_name
+            if camera_streams_config.get("enable_temporal_filter", False):
+                ditf_op = TcnDepthImageTemporalFilterOp(
+                    self,
+                    allocator=device_memory_pool,
+                    cuda_stream_pool=cuda_stream_pool,
+                    in_tensor_name="",
+                    out_tensor_name="",
+                    cuda_device_ordinal=cuda_device_id,
+                    name=f"{camera_name}_temporal_filter",
+                    **self.kwargs("depthimage_temporal_filter"),
+                )
+                sink_ops.append(ditf_op)
+                self.add_flow(split_op, ditf_op, {
+                    (channel_name, "input"),
+                })
+                prev_op = ditf_op
+                prev_output = "output"
 
             log.info(f"create xylookuptable source: {camera_name}")
             xylt_op = XYLookupTableSourceOp(self,
@@ -291,8 +293,8 @@ class App(hs.core.Application):
                 )
             sink_ops.append(bp_op)
 
-            self.add_flow(ditf_op, bp_op, {
-                ("output", "depth_image"),
+            self.add_flow(prev_op, bp_op, {
+                (prev_output, "depth_image"),
             })
             self.add_flow(xylt_op, bp_op, {
                 ("xy_table", "xy_table")
@@ -315,7 +317,7 @@ class App(hs.core.Application):
         # merge Pointclouds
         merge_inputs = list({list(v[1])[0][1] for v in position_merge_connections})
         log.info(f"Merge Position Streams: {merge_inputs}")
-        position_merge_op = StreamMergerOp(self, merge_inputs, "output", "positions", True, name="point_fusion")
+        position_merge_op = StreamMergerOp(self, cuda_stream_pool, merge_inputs, "output", "positions", True, name="point_fusion")
         for op, conn in position_merge_connections:
             self.add_flow(op, position_merge_op, conn)
         self.add_flow(position_merge_op, points_visualizer, {("output", "receivers")})
@@ -386,7 +388,9 @@ def main(config_file=None):
 
     app.scheduler(scheduler)
 
-    with Tracker(app) as tracker:
+    with Tracker(app,
+                 num_start_messages_to_skip=15,
+                 num_last_messages_to_discard=15) as tracker:
         try:
             app.run()
         except KeyboardInterrupt:

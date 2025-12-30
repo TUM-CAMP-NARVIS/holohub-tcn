@@ -1,7 +1,7 @@
 #pragma once
 
 #include <holoscan/holoscan.hpp>
-#include "holoscan/utils/cuda_stream_handler.hpp"
+// #include "holoscan/utils/cuda_stream_handler.hpp"
 #include "../common/datatypes.hpp"
 
 namespace tcn::ops {
@@ -46,7 +46,7 @@ class TcnDepthImageBackprojectionOp : public holoscan::Operator {
   bool texcoords_output_enabled_ = false;
   bool depth_float_output_enabled_ = false;
 
-  holoscan::CudaStreamHandler cuda_stream_handler_;
+  // holoscan::CudaStreamHandler cuda_stream_handler_;
   CUcontext cu_context_ = nullptr;
   CUdevice cu_device_{};
 

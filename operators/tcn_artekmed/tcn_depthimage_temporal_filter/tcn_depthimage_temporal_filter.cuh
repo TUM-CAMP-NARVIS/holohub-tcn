@@ -1,7 +1,7 @@
 #pragma once
 
 #include <holoscan/holoscan.hpp>
-#include "holoscan/utils/cuda_stream_handler.hpp"
+// #include "holoscan/utils/cuda_stream_handler.hpp"
 
 namespace tcn::ops {
 
@@ -23,20 +23,20 @@ class TcnDepthImageTemporalFilterOp : public holoscan::Operator {
   holoscan::Parameter<std::shared_ptr<holoscan::Allocator>> allocator_{nullptr};
   holoscan::Parameter<int> cuda_device_ordinal_;
 
-  holoscan::Parameter<uint8_t> temporal_filter_persistence_;
-  holoscan::Parameter<uint16_t> temporal_filter_delta_;
-  holoscan::Parameter<float> temporal_filter_alpha_;
+  holoscan::Parameter<uint8_t> persistence_;
+  holoscan::Parameter<uint16_t> delta_;
+  holoscan::Parameter<float> alpha_;
   holoscan::Parameter<std::string> in_tensor_name_;
   holoscan::Parameter<std::string> out_tensor_name_;
 
-  std::shared_ptr<nvidia::gxf::Tensor> temporal_filter_buffer_last_frame_;
-  std::shared_ptr<nvidia::gxf::Tensor> temporal_filter_buffer_history_;
-  std::shared_ptr<nvidia::gxf::Tensor> temporal_filter_buffer_persistence_map_;
+  std::shared_ptr<nvidia::gxf::Tensor> buffer_last_frame_;
+  std::shared_ptr<nvidia::gxf::Tensor> buffer_history_;
+  std::shared_ptr<nvidia::gxf::Tensor> buffer_persistence_map_;
 
   // internal state
   int current_frame_index_{0};
 
-  holoscan::CudaStreamHandler cuda_stream_handler_;
+  // holoscan::CudaStreamHandler cuda_stream_handler_;
   CUcontext cu_context_ = nullptr;
   CUdevice cu_device_{};
 

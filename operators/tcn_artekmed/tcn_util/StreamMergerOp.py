@@ -4,6 +4,7 @@ from typing import Any
 import cupy as cp
 import holoscan as hs
 from holoscan.core import Operator, OperatorSpec
+from holoscan.conditions import CudaStreamCondition
 
 from operators.tcn_artekmed.tcn_shm_io import DeviceContextService
 log = logging.getLogger("StreamMergerOp")
@@ -14,6 +15,7 @@ class StreamMergerOp(Operator):
     def __init__(
             self,
             fragment: Any,
+            cuda_stream_pool: Any,
             input_port_names: Any,
             input_message_name: str,
             output_message_name: str,
@@ -26,9 +28,9 @@ class StreamMergerOp(Operator):
         self.input_message_name = input_message_name
         self.output_message_name = output_message_name
         self.ctx_service = None
-        # Need to call the base class constructor last
 
-        super().__init__(fragment, *args, **kwargs)
+        # Need to call the base class constructor last
+        super().__init__(fragment, cuda_stream_pool, *args, **kwargs)
 
     def setup(self, spec: OperatorSpec):
         for name in self.input_port_names:
@@ -55,20 +57,21 @@ class StreamMergerOp(Operator):
         if input_streams:
             output_stream = context.allocate_cuda_stream(self.name)
             context.synchronize_streams(input_streams, output_stream)
+            op_output.set_cuda_stream(output_stream, "output")
 
         if self.fuse_buffers:
-            fused_buffer = cp.concatenate((m[1] for m in all_messages))
+            with cp.cuda.ExternalStream(output_stream):
+                fused_buffer = cp.concatenate((m[1] for m in all_messages), axis=1)
             log.debug("Fused buffer to {}".format(fused_buffer.shape))
             di_tensor = hs.as_tensor(fused_buffer)
             op_output.emit({self.output_message_name: di_tensor}, "output")
         else:
             out_message = dict()
-            for name, buffer in all_messages:
-                camera_name = self.ctx_service.get_camera_name_from_port_name(name)
-                message_name = f"{camera_name}_{self.output_message_name}"
-                di_tensor = hs.as_tensor(buffer)
-                out_message[message_name] = di_tensor
+            with cp.cuda.ExternalStream(output_stream):
+                for name, buffer in all_messages:
+                    camera_name = self.ctx_service.get_camera_name_from_port_name(name)
+                    message_name = f"{camera_name}_{self.output_message_name}"
+                    di_tensor = hs.as_tensor(buffer)
+                    out_message[message_name] = di_tensor
             op_output.emit(out_message, "output")
 
-        if output_stream is not None:
-            op_output.set_cuda_stream(output_stream, "output")

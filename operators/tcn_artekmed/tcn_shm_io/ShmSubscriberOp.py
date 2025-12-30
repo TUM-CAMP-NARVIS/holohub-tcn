@@ -47,6 +47,7 @@ class ShmSubscriberOp(Operator):
     def __init__(
             self,
             fragment: Any,
+            cuda_stream_pool: Any,
             pool: Any,
             subscriber: Any,
             stream_name: str,
@@ -67,7 +68,7 @@ class ShmSubscriberOp(Operator):
         self.buffer = queue.Queue()
 
         # Need to call the base class constructor last
-        super().__init__(fragment, self.async_cond_, *args, **kwargs)
+        super().__init__(fragment, cuda_stream_pool, self.async_cond_, *args, **kwargs)
 
     def on_receive(self, user_header: Any, message: Any):
         """Function to be supplied as callback
