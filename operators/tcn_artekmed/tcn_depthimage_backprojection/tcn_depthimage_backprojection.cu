@@ -64,7 +64,7 @@ void TcnDepthImageBackprojectionOp::setup(holoscan::OperatorSpec& spec) {
              "CudaDeviceOrdinal",
              "Device to use for CUDA operations",
              holoscan::ParameterFlag::kOptional);
-  cuda_stream_handler_.define_params(spec);
+  // cuda_stream_handler_.define_params(spec);
 }
 
 
@@ -111,15 +111,13 @@ void TcnDepthImageBackprojectionOp::start() {
 void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
                                             holoscan::OutputContext& op_output,
                                             holoscan::ExecutionContext& context) {
-
-  cudaStream_t cuda_stream = op_input.receive_cuda_stream("depth_image", true, false);
-
   // Receive tensors
   auto maybe_depth_t_entity = op_input.receive<holoscan::gxf::Entity>("depth_image");
   if (!maybe_depth_t_entity) {
     throw std::runtime_error("Failed to read depth_image entity");
   }
   auto depth_t = maybe_depth_t_entity.value().get<holoscan::Tensor>(in_tensor_name_.get().c_str());
+  cudaStream_t cuda_stream = op_input.receive_cuda_stream("depth_image", true, false);
 
   auto maybe_xy_t_entity = op_input.receive<holoscan::gxf::Entity>("xy_table");
   if (maybe_xy_t_entity) {
@@ -288,20 +286,20 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
 
   if (positions_output_enabled_) {
     auto positions_message = holoscan::gxf::Entity(std::move(positions_entity));
+    // op_output.set_cuda_stream(cuda_stream, "positions");
     op_output.emit(positions_message, "positions");
-    op_output.set_cuda_stream(cuda_stream, "positions");
   }
 
   if (texcoords_output_enabled_) {
     auto texcoords_message = holoscan::gxf::Entity(std::move(texcoords_entity));
+    // op_output.set_cuda_stream(cuda_stream, "texcoords");
     op_output.emit(texcoords_message, "texcoords");
-    op_output.set_cuda_stream(cuda_stream, "texcoords");
   }
 
   if (depth_float_output_enabled_) {
     auto depth_float_message = holoscan::gxf::Entity(std::move(depth_float_entity));
+    // op_output.set_cuda_stream(cuda_stream, "depth_float");
     op_output.emit(depth_float_message, "depth_float");
-    op_output.set_cuda_stream(cuda_stream, "depth_float");
   }
 }
 

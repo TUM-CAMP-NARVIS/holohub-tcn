@@ -12,14 +12,14 @@ class StreamSplitterOp(Operator):
     def __init__(
             self,
             fragment: Any,
+            cuda_stream_pool: Any,
             channel_names: Any,
             *args,
             **kwargs,
     ):
         self.channel_names = channel_names
         # Need to call the base class constructor last
-
-        super().__init__(fragment, *args, **kwargs)
+        super().__init__(fragment, cuda_stream_pool, *args, **kwargs)
 
     def setup(self, spec: OperatorSpec):
         spec.input("receivers")
@@ -34,6 +34,7 @@ class StreamSplitterOp(Operator):
             stream_ptr = context.allocate_cuda_stream(f"{self.name}_{channel_name}")
             if stream_ptr is None:
                 raise RuntimeError("Failed to allocate cuda stream from stream-pool.")
-            di_tensor = hs.as_tensor(cp.asarray(message.get(channel_name)))
-            op_output.emit({"": di_tensor}, channel_name)
+            with cp.cuda.ExternalStream(stream_ptr):
+                di_tensor = hs.as_tensor(cp.asarray(message.get(channel_name)))
             op_output.set_cuda_stream(stream_ptr, channel_name)
+            op_output.emit({"": di_tensor}, channel_name)

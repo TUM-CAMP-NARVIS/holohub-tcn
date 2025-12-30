@@ -24,9 +24,9 @@ void TcnDepthImageTemporalFilterOp::setup(holoscan::OperatorSpec& spec) {
 
   // Configurable params (optional)
   spec.param(allocator_, "allocator", "Allocator", "Allocator used to allocate tensor output.");
-  spec.param(temporal_filter_persistence_, "persistence", "Temporal Filter Persistence", "", static_cast<uint8_t>(8));
-  spec.param(temporal_filter_delta_, "delta", "Temporal Filter Delta", "", static_cast<uint16_t>(30));
-  spec.param(temporal_filter_alpha_, "alpha", "Temporal Filter Alpha", "", 0.15f);
+  spec.param(persistence_, "persistence", "Temporal Filter Persistence", "", static_cast<uint8_t>(8));
+  spec.param(delta_, "delta", "Temporal Filter Delta", "", static_cast<uint16_t>(30));
+  spec.param(alpha_, "alpha", "Temporal Filter Alpha", "", 0.15f);
   spec.param(in_tensor_name_, "in_tensor_name", "Input Tensor Name", "", ""s);
   spec.param(out_tensor_name_, "out_tensor_name", "Output Tensor Name", "", ""s);
 
@@ -35,7 +35,7 @@ void TcnDepthImageTemporalFilterOp::setup(holoscan::OperatorSpec& spec) {
              "CudaDeviceOrdinal",
              "Device to use for CUDA operations",
              holoscan::ParameterFlag::kOptional);
-  cuda_stream_handler_.define_params(spec);
+  // cuda_stream_handler_.define_params(spec);
 }
 
 
@@ -71,13 +71,8 @@ void TcnDepthImageTemporalFilterOp::compute(holoscan::InputContext& op_input,
     throw std::runtime_error("Failed to read input entity");
   }
 
-  // get the CUDA stream from the input message
-  gxf_result_t stream_handler_result = cuda_stream_handler_.from_message(context.context(), maybe_depth_t_entity.value());
-  if (stream_handler_result != GXF_SUCCESS) {
-    throw std::runtime_error("Failed to get the CUDA stream from incoming messages");
-  }
-
   auto depth_t = maybe_depth_t_entity.value().get<holoscan::Tensor>(in_tensor_name_.get().c_str());
+  cudaStream_t cuda_stream = op_input.receive_cuda_stream("input", true, false);
 
   const auto& depth_shape = depth_t->shape();  // [H,W]
   const int H = static_cast<int>(depth_shape[0]);
@@ -87,7 +82,6 @@ void TcnDepthImageTemporalFilterOp::compute(holoscan::InputContext& op_input,
   auto* depth_ptr = static_cast<uint16_t*>(depth_t->data());
 
   // Allocate Holoscan outputs (device)
-  cudaStream_t cuda_stream = op_input.receive_cuda_stream("input", true, false);
 
   // get Handle to underlying nvidia::gxf::Allocator from std::shared_ptr<holoscan::Allocator>
   auto allocator =
@@ -128,19 +122,19 @@ void TcnDepthImageTemporalFilterOp::compute(holoscan::InputContext& op_input,
   }
 
   // create / use last_frame device buffer
-  if (!temporal_filter_buffer_last_frame_) {
+  if (!buffer_last_frame_) {
     if (!tcn::allocate_tensor<uint16_t>(
       allocator.value(),
       cuda_stream,
       nvidia::gxf::Shape{{H, W, 1}},
       nvidia::gxf::MemoryStorageType::kDevice,
-      temporal_filter_buffer_last_frame_,
+      buffer_last_frame_,
       true
       )) {
       throw std::runtime_error("Failed to allocate message for last_frame.");
     }
   }
-  if (auto maybe_last_frame_data = temporal_filter_buffer_last_frame_->data<uint16_t>()) {
+  if (auto maybe_last_frame_data = buffer_last_frame_->data<uint16_t>()) {
     temporal_filter_last_frame_ptr = maybe_last_frame_data.value();
   } else {
     HOLOSCAN_LOG_ERROR("error access last_frame tensor data");
@@ -148,19 +142,19 @@ void TcnDepthImageTemporalFilterOp::compute(holoscan::InputContext& op_input,
   }
 
   // create / use history
-  if (!temporal_filter_buffer_history_) {
+  if (!buffer_history_) {
     if (!tcn::allocate_tensor<uint8_t>(
       allocator.value(),
       cuda_stream,
       nvidia::gxf::Shape{{H, W, 1}},
       nvidia::gxf::MemoryStorageType::kDevice,
-      temporal_filter_buffer_history_,
+      buffer_history_,
       true
       )) {
       throw std::runtime_error("Failed to allocate message for history.");
     }
   }
-  if (auto maybe_history_data = temporal_filter_buffer_history_->data<uint8_t>()) {
+  if (auto maybe_history_data = buffer_history_->data<uint8_t>()) {
     temporal_filter_history_ptr = maybe_history_data.value();
   } else {
     HOLOSCAN_LOG_ERROR("error access history tensor data");
@@ -168,10 +162,10 @@ void TcnDepthImageTemporalFilterOp::compute(holoscan::InputContext& op_input,
   }
 
   // persistence map
-  if (!temporal_filter_buffer_persistence_map_) {
+  if (!buffer_persistence_map_) {
     buildPersistenceMap(allocator.value(), cuda_stream);
   }
-  if (auto maybe_persistence_map_data = temporal_filter_buffer_persistence_map_->data<uint8_t>()) {
+  if (auto maybe_persistence_map_data = buffer_persistence_map_->data<uint8_t>()) {
     temporal_filter_persistence_map_ptr = maybe_persistence_map_data.value();
   } else {
     HOLOSCAN_LOG_ERROR("error access persistence_map tensor data");
@@ -188,8 +182,8 @@ void TcnDepthImageTemporalFilterOp::compute(holoscan::InputContext& op_input,
 
   params.width = W;
   params.height = H;
-  params.temporalFilterDelta = temporal_filter_delta_.get();
-  params.temporalFilterAlpha = temporal_filter_alpha_.get();
+  params.temporalFilterDelta = delta_.get();
+  params.temporalFilterAlpha = alpha_.get();
   params.temporalFilterOneMinusAlpha = 1.0f - params.temporalFilterAlpha;
 
   params.temporalFilterMask = 0x01 << current_frame_index_;
@@ -199,8 +193,8 @@ void TcnDepthImageTemporalFilterOp::compute(holoscan::InputContext& op_input,
   temporal_filtering_u16_kernel<<<grid, block, 0, cuda_stream>>>(params);
 
   auto filtered_image_message = holoscan::gxf::Entity(std::move(filtered_image_entity));
+  // op_output.set_cuda_stream(cuda_stream, "output");
   op_output.emit(filtered_image_message, "output");
-  op_output.set_cuda_stream(cuda_stream, "output");
 
   current_frame_index_ = (current_frame_index_+1)%8;
 }
@@ -219,7 +213,7 @@ void TcnDepthImageTemporalFilterOp::buildPersistenceMap(nvidia::gxf::Handle<nvid
     const uint8_t last_1 = (i & 64) != 0;
     const uint8_t last_frame = (i & 128) != 0;
     host_data[i] = 0;
-    switch(temporal_filter_persistence_.get()){
+    switch(persistence_.get()){
         case 1:
             if(last_frame+last_1+last_2+last_3+last_4+last_5+last_6+last_7 >= 8) {
                 host_data[i] = 1;
@@ -270,11 +264,11 @@ void TcnDepthImageTemporalFilterOp::buildPersistenceMap(nvidia::gxf::Handle<nvid
         stream,
         nvidia::gxf::Shape{{PERSISTENCE_MAP_SIZE}},
         nvidia::gxf::MemoryStorageType::kDevice,
-        temporal_filter_buffer_persistence_map_
+        buffer_persistence_map_
         )) {
     throw std::runtime_error("Failed to allocate message for persistence_mape.");
   }
-  if (auto maybe_gpu_data = temporal_filter_buffer_persistence_map_->data<uint8_t>()) {
+  if (auto maybe_gpu_data = buffer_persistence_map_->data<uint8_t>()) {
     // upload data
     HOLOSCAN_CUDA_CALL(cudaMemcpyAsync(maybe_gpu_data.value(), persistence_map.data(), PERSISTENCE_MAP_SIZE,
                                 cudaMemcpyHostToDevice, stream));
