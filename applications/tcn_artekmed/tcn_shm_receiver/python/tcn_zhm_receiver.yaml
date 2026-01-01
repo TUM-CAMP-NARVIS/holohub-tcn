@@ -8,11 +8,18 @@ camera_stream_processing:
   device_id: 0
   buffer_size: 8
   enable_temporal_filter: true
+  enable_background_substract: true
 
 depthimage_temporal_filter:
   alpha: 0.15
   delta: 30
   persistence: 3
+
+depthimage_fgbg_mask:
+  sensitivity: 1.5
+
+depthimage_apply_mask:
+  invert_mask: True
 
 shared_memory:
   stream_name: "camera_streams"

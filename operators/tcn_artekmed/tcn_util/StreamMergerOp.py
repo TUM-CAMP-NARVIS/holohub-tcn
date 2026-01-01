@@ -4,7 +4,6 @@ from typing import Any
 import cupy as cp
 import holoscan as hs
 from holoscan.core import Operator, OperatorSpec
-from holoscan.conditions import CudaStreamCondition
 
 from operators.tcn_artekmed.tcn_shm_io import DeviceContextService
 log = logging.getLogger("StreamMergerOp")

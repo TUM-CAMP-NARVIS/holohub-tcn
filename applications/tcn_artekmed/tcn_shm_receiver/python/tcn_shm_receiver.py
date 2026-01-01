@@ -13,7 +13,8 @@ from holohub.tcn_depthimage_temporal_filter import TcnDepthImageTemporalFilterOp
 from holohub.tcn_depthimage_backprojection._tcn_depthimage_backprojection import CameraModel, DistortionType, \
     RigidTransform, CameraParameters, make_rigid_transform
 from operators.tcn_artekmed.tcn_shm_io import ShmSubscriberOp, DeviceContextService, XYLookupTableSourceOp, create_shm_subscriber
-from operators.tcn_artekmed.tcn_util import StreamSplitterOp, StreamMergerOp
+from operators.tcn_artekmed.tcn_util import (StreamSplitterOp, StreamMergerOp,
+                                             DepthImageMaxDistanceOp, DepthImageForegroundBackgroundMaskOp, DepthImageApplyMaskOp )
 
 from holoscan.conditions import CountCondition
 from holoscan.core import Operator, OperatorSpec, Tracker
@@ -259,6 +260,55 @@ class App(hs.core.Application):
                 })
                 prev_op = ditf_op
                 prev_output = "output"
+
+            if camera_streams_config.get("enable_background_substract", False):
+                dimd_op = DepthImageMaxDistanceOp(
+                    self,
+                    allocator=device_memory_pool,
+                    cuda_stream_pool=cuda_stream_pool,
+                    name=f"{camera_name}_max_distance",
+                )
+                sink_ops.append(dimd_op)
+                self.add_flow(split_op, dimd_op, {
+                    (channel_name, "input"),
+                })
+                difgbg_op = DepthImageForegroundBackgroundMaskOp(
+                    self,
+                    allocator=device_memory_pool,
+                    enable_foreground=True,
+                    enable_background=False,
+                    cuda_stream_pool=cuda_stream_pool,
+                    name=f"{camera_name}_fg_bg_mask",
+                    **self.kwargs("depthimage_fgbg_mask")
+                )
+                sink_ops.append(difgbg_op)
+                self.add_flow(split_op, difgbg_op, {
+                    (channel_name, "depth_image"),
+                })
+                self.add_flow(dimd_op, difgbg_op, {
+                    ("output", "background_image"),
+                })
+                diam_op = DepthImageApplyMaskOp(
+                    self,
+                    allocator=device_memory_pool,
+                    cuda_stream_pool=cuda_stream_pool,
+                    name=f"{camera_name}_apply_mask",
+                    **self.kwargs("depthimage_apply_mask")
+                )
+                sink_ops.append(diam_op)
+                self.add_flow(split_op, diam_op, {
+                    (channel_name, "depth_image"),
+                })
+                self.add_flow(difgbg_op, diam_op, {
+                    ("foreground_mask", "mask_image"),
+                })
+
+                prev_op = diam_op
+                prev_output = "output"
+
+
+
+
 
             log.info(f"create xylookuptable source: {camera_name}")
             xylt_op = XYLookupTableSourceOp(self,
