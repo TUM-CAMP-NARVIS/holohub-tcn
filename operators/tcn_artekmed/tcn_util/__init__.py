@@ -1,4 +1,8 @@
 from .StreamMergerOp import StreamMergerOp
 from .StreamSplitterOp import StreamSplitterOp
-
-__all__ = ["StreamMergerOp", "StreamSplitterOp", ]
+from .DepthImageMaxDistanceOp import DepthImageMaxDistanceOp
+from .DepthImageForegroundBackgroundMaskOp import DepthImageForegroundBackgroundMaskOp
+from .DepthImageApplyMaskOp import DepthImageApplyMaskOp
+__all__ = ["StreamMergerOp", "StreamSplitterOp",
+           "DepthImageMaxDistanceOp", "DepthImageForegroundBackgroundMaskOp",
+           "DepthImageApplyMaskOp", ]
