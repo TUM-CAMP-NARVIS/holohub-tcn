@@ -10,6 +10,7 @@ import numpy as np
 import holoscan as hs
 from holohub.tcn_depthimage_backprojection import TcnDepthImageBackprojectionOp
 from holohub.tcn_depthimage_temporal_filter import TcnDepthImageTemporalFilterOp
+from holohub.tcn_depthimage_weights import TcnDepthImageWeightsOp
 from holohub.tcn_depthimage_backprojection._tcn_depthimage_backprojection import CameraModel, DistortionType, \
     RigidTransform, CameraParameters, make_rigid_transform
 from operators.tcn_artekmed.tcn_shm_io import ShmSubscriberOp, DeviceContextService, XYLookupTableSourceOp, create_shm_subscriber
@@ -176,40 +177,7 @@ class App(hs.core.Application):
         points_visualizer = None
         if debug_output_config.get("enable_pointcloud", False):
             log.info("create pointclouds debug-view")
-            # configure pointcloud debug viewer
-            # num_pointclouds = len(camera_names)
-            # # Determine grid size (e.g., 2 for 2x2, 3 for 3x3)
-            # pointclouds_grid_size = int(np.ceil(np.sqrt(num_pointclouds))) if num_pointclouds > 0 else 1
-            # pointclouds_tile_size = 1.0 / pointclouds_grid_size
-
             pointclouds_output_specs = []
-            # for i, camera_name in enumerate(camera_names):
-            #     # Compute row and column index
-            #     row = i // pointclouds_grid_size
-            #     col = i % pointclouds_grid_size
-            #
-            #     # Compute normalized offsets (0.0 to 1.0)
-            #     # Note: Holoviz usually uses (x, y) for offsets
-            #     offset_x = col * pointclouds_tile_size
-            #     offset_y = row * pointclouds_tile_size
-            #
-            #     spec = HolovizOp.InputSpec(camera_name, HolovizOp.InputType.POINTS_3D)
-            #     views = []
-            #     view = HolovizOp.InputSpec.View()
-            #     view.offset_x = offset_x
-            #     view.offset_y = offset_y
-            #     view.width = pointclouds_tile_size
-            #     view.height = pointclouds_tile_size
-            #     views.append(view)
-            #     spec.views = views
-            #     spec.color = [1.0, 0.0, 0.0, 1.0]
-            #     pointclouds_output_specs.append(spec)
-
-            # identity_pose = make_rigid_transform(
-            #     hs.as_tensor(np.asarray([0.,0.,0.])),
-            #     hs.as_tensor(np.asarray([0.,0.,0.,1.]))
-            # )
-
             spec = HolovizOp.InputSpec("positions", HolovizOp.InputType.POINTS_3D)
             views = []
             view = HolovizOp.InputSpec.View()
@@ -231,6 +199,48 @@ class App(hs.core.Application):
                 **self.kwargs("points_holoviz"),
             )
 
+
+        weights_visualizer = None
+        if debug_output_config.get("enable_weights", False):
+            log.info("create weights debug-view")
+            # configure weights debug viewer
+            num_weights = len(camera_names)
+            # Determine grid size (e.g., 2 for 2x2, 3 for 3x3)
+            weights_grid_size = int(np.ceil(np.sqrt(num_weights))) if num_weights > 0 else 1
+            weights_tile_size = 1.0 / weights_grid_size
+
+            weights_output_specs = []
+            for i, camera_name in enumerate(camera_names):
+                # Compute row and column index
+                row = i // weights_grid_size
+                col = i % weights_grid_size
+
+                # Compute normalized offsets (0.0 to 1.0)
+                # Note: Holoviz usually uses (x, y) for offsets
+                offset_x = col * weights_tile_size
+                offset_y = row * weights_tile_size
+
+                spec = HolovizOp.InputSpec(camera_name, HolovizOp.InputType.COLOR)
+                views = []
+                view = HolovizOp.InputSpec.View()
+                view.offset_x = offset_x
+                view.offset_y = offset_y
+                view.width = weights_tile_size
+                view.height = weights_tile_size
+                views.append(view)
+                spec.views = views
+                #spec.color = [1.0, 0.0, 0.0, 1.0]
+                weights_output_specs.append(spec)
+
+            weights_visualizer = HolovizOp(
+                self,
+                name="weights_visualizer",
+                tensors=weights_output_specs,
+                allocator=device_memory_pool,
+                cuda_stream_pool=cuda_stream_pool,
+                **self.kwargs("weights_holoviz"),
+            )
+
         log.info("define per depthimage processing pipeline")
         sink_ops = []
 
@@ -246,8 +256,8 @@ class App(hs.core.Application):
             if camera_streams_config.get("enable_temporal_filter", False):
                 ditf_op = TcnDepthImageTemporalFilterOp(
                     self,
+                    cuda_stream_pool,
                     allocator=device_memory_pool,
-                    cuda_stream_pool=cuda_stream_pool,
                     in_tensor_name="",
                     out_tensor_name="",
                     cuda_device_ordinal=cuda_device_id,
@@ -269,8 +279,8 @@ class App(hs.core.Application):
                     name=f"{camera_name}_max_distance",
                 )
                 sink_ops.append(dimd_op)
-                self.add_flow(split_op, dimd_op, {
-                    (channel_name, "input"),
+                self.add_flow(prev_op, dimd_op, {
+                    (prev_output, "input"),
                 })
                 difgbg_op = DepthImageForegroundBackgroundMaskOp(
                     self,
@@ -307,9 +317,6 @@ class App(hs.core.Application):
                 prev_output = "output"
 
 
-
-
-
             log.info(f"create xylookuptable source: {camera_name}")
             xylt_op = XYLookupTableSourceOp(self,
                                             CountCondition(self, count=1),
@@ -321,11 +328,8 @@ class App(hs.core.Application):
             log.info(f"create backprojection: {camera_name}")
             bp_op = TcnDepthImageBackprojectionOp(
                 self,
+                cuda_stream_pool,
                 allocator=device_memory_pool,
-                cuda_stream_pool=cuda_stream_pool,
-                depth_units_per_meter=1000.0,
-                near_limit_m=0.01,
-                far_limit_m=10.0,
                 color_image_width=color_params.dimensions.x,
                 color_image_height=color_params.dimensions.y,
                 color_params=ctx_service.get_depth_camera_model(camera_name),
@@ -340,6 +344,7 @@ class App(hs.core.Application):
                 enable_depth_float=False,
                 cuda_device_ordinal=cuda_device_id,
                 name=f"{camera_name}_backprojection",
+                **self.kwargs("depthimage_backprojection")
                 )
             sink_ops.append(bp_op)
 
@@ -353,16 +358,35 @@ class App(hs.core.Application):
             position_merge_connections.append((bp_op, {("positions", f"{camera_name}_positions")}))
             texcoords_merge_connections.append((bp_op, {("texcoords", f"{camera_name}_texcoords")}))
 
+            log.info(f"create compute weights: {camera_name}")
+            cp_op = TcnDepthImageWeightsOp(
+                self,
+                cuda_stream_pool,
+                allocator=device_memory_pool,
+                # out_tensor_name=camera_name,
+                in_tensor_name="",
+                out_tensor_name=camera_name,
+                cuda_device_ordinal=cuda_device_id,
+                name=f"{camera_name}_weights",
+                **self.kwargs("depthimage_weights")
+            )
+            sink_ops.append(cp_op)
+
+            self.add_flow(prev_op, cp_op, {
+                (prev_output, "depth_image"),
+            })
+            self.add_flow(xylt_op, cp_op, {
+                ("xy_table", "xy_table")
+            })
             # debug view..
-            # if points_visualizer is not None:
-            #     self.add_flow(bp_op, points_visualizer, {("positions", "receivers")})
-            # else:
-            #     sink_op = PointCloudDummySinkOp(self, name=f"{camera_name}_sink")
-            #     self.add_flow(bp_op, sink_op, {
-            #         ("positions", "positions"),
-            #         ("texcoords", "texcoords"),
-            #         })
-            #     sink_ops.append(sink_op)
+            if weights_visualizer is not None:
+                self.add_flow(cp_op, weights_visualizer, {("output", "receivers")})
+            else:
+                sink_op = DummySinkOp(self, name=f"{camera_name}_sink")
+                self.add_flow(cp_op, sink_op, {
+                    ("output", "input"),
+                    })
+                sink_ops.append(sink_op)
 
         # merge Pointclouds
         merge_inputs = list({list(v[1])[0][1] for v in position_merge_connections})

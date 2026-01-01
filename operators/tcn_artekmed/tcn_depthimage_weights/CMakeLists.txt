@@ -13,20 +13,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-cmake_minimum_required(VERSION 3.20)
-project(tcn_shm_receiver LANGUAGES NONE)
+cmake_minimum_required(VERSION 3.24)
+project(tcn_depthimage_weights LANGUAGES CXX CUDA)
 
-find_package(holoscan 3.7.0 REQUIRED CONFIG
+find_package(holoscan 3.0 REQUIRED CONFIG
              PATHS "/opt/nvidia/holoscan" "/workspace/holoscan-sdk/install")
 
-# Enable the operators
-add_library(tcn_shm_receiver INTERFACE)
-target_link_libraries(tcn_shm_receiver INTERFACE
-    holoscan::core
-    holoscan::ops::format_converter
-    holoscan::ops::holoviz
-    holoscan::ops::tcn_depthimage_backprojection
-    holoscan::ops::tcn_depthimage_temporal_filter
-    holoscan::ops::tcn_depthimage_weights
-    #holoscan::ops::slang_shader
+find_package(Eigen3 REQUIRED NO_MODULE)
+# Decoder Operator
+add_library(tcn_depthimage_weights SHARED
+        tcn_depthimage_weights.cu
+        tcn_depthimage_weights_kernel.cu
 )
+add_library(holoscan::ops::tcn_depthimage_weights ALIAS tcn_depthimage_weights)
+
+target_link_libraries(tcn_depthimage_weights PUBLIC
+  holoscan::core
+  cuda
+  PRIVATE
+  Eigen3::Eigen
+)
+target_compile_options(tcn_depthimage_weights
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+)
+target_include_directories(tcn_depthimage_weights PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+)
+
+add_subdirectory(python)

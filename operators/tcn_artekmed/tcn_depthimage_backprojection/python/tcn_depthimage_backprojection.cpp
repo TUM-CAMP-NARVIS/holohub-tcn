@@ -65,18 +65,20 @@ class PyTcnDepthImageBackprojectionOp : public TcnDepthImageBackprojectionOp {
   // Define a constructor that fully initializes the object.
   PyTcnDepthImageBackprojectionOp(holoscan::Fragment* fragment, const py::args& args,
                                   std::shared_ptr<holoscan::Allocator> allocator,
-                                  float depth_units_per_meter, float near_limit_m,
-                                  float far_limit_m, int color_image_width, int color_image_height,
-                                  nvidia::gxf::CameraModel color_params,
-                                  RigidTransform depth_extrinsics,
-                                  RigidTransform color_to_depth,
-                                  const std::string& in_tensor_name,
-                                  const std::string& out_tensor_name,
+                                  float depth_units_per_meter=1000.f,
+                                  float near_limit_m=0.01f,
+                                  float far_limit_m=10.f,
+                                  int color_image_width=320,
+                                  int color_image_height=288,
+                                  nvidia::gxf::CameraModel color_params=nvidia::gxf::CameraModel{},
+                                  RigidTransform depth_extrinsics=RigidTransform{},
+                                  RigidTransform color_to_depth=RigidTransform{},
+                                  const std::string& in_tensor_name="",
+                                  const std::string& out_tensor_name="",
                                   bool enable_positions = true,
                                   bool enable_texcoords = false,
                                   bool enable_depth_float = false,
                                   int cuda_device_ordinal = 0,
-                                  std::shared_ptr<holoscan::CudaStreamPool> cuda_stream_pool = nullptr,
                                   const std::string& name = "tcn_depthimage_backprojection")
       : TcnDepthImageBackprojectionOp(
             holoscan::ArgList{holoscan::Arg{"allocator", allocator},
@@ -93,8 +95,7 @@ class PyTcnDepthImageBackprojectionOp : public TcnDepthImageBackprojectionOp {
                               holoscan::Arg{"enable_positions", enable_positions},
                               holoscan::Arg{"enable_texcoords", enable_texcoords},
                               holoscan::Arg{"enable_depth_float", enable_depth_float},
-                              holoscan::Arg{"cuda_device_ordinal", cuda_device_ordinal},
-                              holoscan::Arg{"cuda_stream_pool", cuda_stream_pool}
+                              holoscan::Arg{"cuda_device_ordinal", cuda_device_ordinal}
             }) {
     add_positional_condition_and_resource_args(this, args);
     name_ = name;
@@ -208,7 +209,6 @@ PYBIND11_MODULE(_tcn_depthimage_backprojection, m) {
                     bool,
                     bool,
                     int,
-                    std::shared_ptr<holoscan::CudaStreamPool>,
                     const std::string&>(),
            "fragment"_a,
            "allocator"_a,
@@ -226,7 +226,6 @@ PYBIND11_MODULE(_tcn_depthimage_backprojection, m) {
            "enable_texcoords"_a = true,
            "enable_depth_float"_a = false,
            "cuda_device_ordinal"_a = 0,
-           "cuda_stream_pool"_a = py::none(),
            "name"_a = "tcn_depthimage_backprojection"s,
            doc::TcnDepthImageBackprojectionOp::doc_TcnDepthImageBackprojectionOp)
       .def("initialize",

@@ -9,6 +9,7 @@ camera_stream_processing:
   buffer_size: 8
   enable_temporal_filter: true
   enable_background_substract: true
+  enable_compute_weights: true
 
 depthimage_temporal_filter:
   alpha: 0.15
@@ -21,6 +22,22 @@ depthimage_fgbg_mask:
 depthimage_apply_mask:
   invert_mask: True
 
+depthimage_backprojection:
+  depth_units_per_meter: 1000.0
+  near_limit_m: 0.01
+  far_limit_m: 10.0
+
+
+depthimage_weights:
+  depth_units_per_meter: 1000.0
+  # 20 degree (PI / 9.0)
+  angle_reject_limit: 0.3490658503988659
+  angle_reject_envelope: 1.0
+  offset_envelope: 1.0
+  depth_near_limit: 0.1
+  depth_far_limit: 8.0
+
+
 shared_memory:
   stream_name: "camera_streams"
   cycle_time_ms: 1
@@ -30,6 +47,7 @@ rmm_allocator:
 debug_output:
   enable_colorimage: False
   enable_depthimage: False
+  enable_weights: False
   enable_pointcloud: True
 
 resources:
@@ -53,6 +71,12 @@ color_holoviz:
 
 points_holoviz:
   window_title: "Artekmed Pointclouds"
+  width: 800
+  height: 640
+  framerate: 60
+
+weights_holoviz:
+  window_title: "Artekmed Deptimage Weights"
   width: 800
   height: 640
   framerate: 60
