@@ -20,5 +20,6 @@
 add_holohub_application(tcn_shm_receiver DEPENDS OPERATORS
                           tcn_depthimage_backprojection
                           tcn_depthimage_temporal_filter
+                          tcn_depthimage_weights
                           #slang_shader
                           )

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "datatypes.hpp"
+#include "cuda_util_math.h"
 
 // Transform a 3D point by a 4x4 matrix (column-major struct)
 __host__ __device__ inline void transform_point_matrix(float3& out_point,
@@ -59,4 +60,80 @@ __host__ __device__ inline void project_point_to_image_plane_distorted(
   const float yp_d_cy = yp_d + cody;
   uv.x = xp_d_cx * fx + cx;
   uv.y = yp_d_cy * fy + cy;
+}
+
+__device__ __forceinline__
+bool isValidDepth(float depthValue) {
+	return !isnan(depthValue) && depthValue >= 0.00001f && !isinf(depthValue);
+}
+
+__device__ __forceinline__
+float cameraQualityWeight(const float3& samplePos, const int2& samplePixelPos, const float sampleDepth,
+                const float3 &sampleNormal, const int cameraImgWidth, const int cameraImgHeight,
+                const float3& cameraPosition, const CameraQualityWeightParams& params) {
+
+  const auto cameraDirection = normalize(samplePos - cameraPosition);
+  const auto viewingAngle = asin(abs(dot(cameraDirection, sampleNormal)));
+
+  float q_angle = max(min((viewingAngle - params.angleRejectLimit) *
+                      params.angleRejectEnvelope / (1.f - params.angleRejectLimit), 1.f), 0.f);
+
+  float2 ndc{ ((float)samplePixelPos.x - (float)cameraImgWidth / 2.f) / (float)cameraImgWidth,
+                          ((float)samplePixelPos.y - (float)cameraImgHeight / 2.f) / (float)cameraImgHeight };
+
+  float q_offset = max(min(exp(-dot(ndc,ndc) / (2 * params.offsetEnvelope * params.offsetEnvelope)), 1.f), 0.f);
+
+
+  float q_dist = 0.f;
+  const float diff = params.depthFarLimit - params.depthNearLimit;
+  if (sampleDepth > params.depthNearLimit && sampleDepth < params.depthFarLimit) {
+    q_dist = 1 - (float)sampleDepth / diff;
+  }
+  /*if (q_angle == 0 || q_offset == 0 || q_dist == 0) {
+          return 0;
+  }
+  else*/
+  {
+    return cbrtf(q_angle * q_offset * q_dist);
+    //return (q_angle + q_offset + q_dist) / 3;
+  }
+}
+
+
+/**
+ * Aligns a normal, such that it points outwards of a body. With our depth, cameras this outside position is the camera position itself
+ * @param normalToAlign
+ * @param vertexPos
+ * @param outsidePos
+ */
+__host__ __device__ inline void align_normal(
+    float3& normalToAlign, const float3& vertexPos,
+    const float3& outsidePos) {
+  if (dot(vertexPos - outsidePos, normalToAlign) < 0) {
+    normalToAlign *= -1;
+  }
+}
+
+__host__ __device__ inline void align_normal(
+    Eigen::Vector3f& normalToAlign,
+    const Eigen::Vector3f& vertexPos,
+    const Eigen::Vector3f& outsidePos) {
+  if ((vertexPos - outsidePos).dot(normalToAlign) > 0) {
+    normalToAlign *= -1;
+  }
+}
+
+__host__ __device__ inline void align_normal(
+    float3& normal, const float3& correctlyOrientedNormal) {
+  if (dot(normal, correctlyOrientedNormal) < 0) {
+    normal *= -1;
+  }
+}
+
+__host__ __device__ inline void align_normal(
+    Eigen::Vector3f& normal,
+    const Eigen::Vector3f& correctlyOrientedNormal) {
+  if (normal.dot(correctlyOrientedNormal) < 0) {
+    normal *= -1;
+  }
 }
