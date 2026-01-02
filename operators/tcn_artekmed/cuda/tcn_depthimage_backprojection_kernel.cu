@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <cmath>
 #include "tcn_depthimage_backprojection_kernel.cuh"
+#include "detail/processing_algorithms.cuh"
 
 __global__ void backprojection_u16_kernel(BackProjectionParams bp) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;

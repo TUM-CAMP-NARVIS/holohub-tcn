@@ -8,7 +8,7 @@ camera_stream_processing:
   device_id: 0
   buffer_size: 8
   enable_temporal_filter: true
-  enable_background_substract: true
+  enable_background_substract: false
   enable_compute_weights: true
 
 depthimage_temporal_filter:
@@ -20,7 +20,7 @@ depthimage_fgbg_mask:
   sensitivity: 1.5
 
 depthimage_apply_mask:
-  invert_mask: True
+  invert_mask: False
 
 depthimage_backprojection:
   depth_units_per_meter: 1000.0
@@ -45,7 +45,7 @@ shared_memory:
 rmm_allocator:
 
 debug_output:
-  enable_colorimage: False
+  enable_colorimage: True
   enable_depthimage: False
   enable_weights: False
   enable_pointcloud: True
@@ -80,7 +80,6 @@ weights_holoviz:
   width: 800
   height: 640
   framerate: 60
-
 
 pose_tree_config:
   number_frames: 1024                # default: 1024

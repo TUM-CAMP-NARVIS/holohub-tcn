@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <cmath>
 #include "tcn_depthimage_temporal_filter_kernel.cuh"
+#include "detail/processing_algorithms.cuh"
 
 __global__ void temporal_filtering_u16_kernel(TemporalFilterParams bp) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;

@@ -1,7 +1,7 @@
+#include "../cuda/tcn_depthimage_backprojection_kernel.cuh"
 #include "gxf/multimedia/camera.hpp"
 #include "holoscan/utils/cuda_macros.hpp"
 #include "tcn_depthimage_backprojection.cuh"
-#include "tcn_depthimage_backprojection_kernel.cuh"
 
 #include <cuda_runtime.h>
 #include "../common/datatypes.hpp"

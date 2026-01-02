@@ -1,7 +1,7 @@
 #pragma once
 
-#include "datatypes.hpp"
-#include "cuda_util_math.h"
+#include "../../common/datatypes.hpp"
+#include "../cuda/detail/cuda_util_math.h"
 
 // Transform a 3D point by a 4x4 matrix (column-major struct)
 __host__ __device__ inline void transform_point_matrix(float3& out_point,

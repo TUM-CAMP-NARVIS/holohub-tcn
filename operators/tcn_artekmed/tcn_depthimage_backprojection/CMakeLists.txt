@@ -23,7 +23,7 @@ find_package(Eigen3 REQUIRED NO_MODULE)
 # Decoder Operator
 add_library(tcn_depthimage_backprojection SHARED
         tcn_depthimage_backprojection.cu
-        tcn_depthimage_backprojection_kernel.cu
+        ../cuda/tcn_depthimage_backprojection_kernel.cu
 )
 add_library(holoscan::ops::tcn_depthimage_backprojection ALIAS tcn_depthimage_backprojection)
 

@@ -1,9 +1,9 @@
 // WeightsKernel.cu
 #include <cuda_runtime.h>
 #include <cmath>
+#include "detail/cuda_util_math.h"
+#include "detail/processing_algorithms.cuh"
 #include "tcn_depthimage_weights_kernel.cuh"
-#include "../common/cuda_util_math.h"
-#include "../common/processing_algorithms.cuh"
 
 __global__ void compute_weights_u16_kernel(WeightsParams bp) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;

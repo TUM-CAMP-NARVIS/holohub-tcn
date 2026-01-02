@@ -2,9 +2,9 @@
 #include <cuda_runtime.h>
 #include "../common/utils.h"
 
+#include "../cuda/tcn_depthimage_temporal_filter_kernel.cuh"
 #include "holoscan/utils/cuda_macros.hpp"
 #include "tcn_depthimage_temporal_filter.cuh"
-#include "tcn_depthimage_temporal_filter_kernel.cuh"
 
 #include "../common/datatypes.hpp"
 

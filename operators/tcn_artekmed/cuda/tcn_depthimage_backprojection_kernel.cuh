@@ -2,7 +2,6 @@
 #pragma once
 
 #include "../common/datatypes.hpp"
-#include "../common/processing_algorithms.cuh"
 
 struct BackProjectionParams {
   const uint16_t* depth;    // [H*W]

@@ -23,7 +23,7 @@ find_package(Eigen3 REQUIRED NO_MODULE)
 # Decoder Operator
 add_library(tcn_depthimage_temporal_filter SHARED
         tcn_depthimage_temporal_filter.cu
-        tcn_depthimage_temporal_filter_kernel.cu
+        ../cuda/tcn_depthimage_temporal_filter_kernel.cu
 )
 add_library(holoscan::ops::tcn_depthimage_temporal_filter ALIAS tcn_depthimage_temporal_filter)
 
