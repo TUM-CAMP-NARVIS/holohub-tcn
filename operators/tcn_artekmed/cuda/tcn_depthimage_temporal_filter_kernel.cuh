@@ -2,7 +2,6 @@
 #pragma once
 
 #include "../common/datatypes.hpp"
-#include "../common/processing_algorithms.cuh"
 
 static constexpr size_t PERSISTENCE_MAP_SIZE = 256;
 
