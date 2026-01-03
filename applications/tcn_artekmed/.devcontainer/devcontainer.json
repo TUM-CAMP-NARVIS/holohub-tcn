@@ -56,12 +56,48 @@
     // Configure tool-specific properties.
     "customizations": {
         // Configure properties specific to VS Code.
+        // Configure properties specific to VS Code.
+        "vscode": {
+            // Set *default* container specific settings.json values on container create.
+            "settings": {
+                "terminal.integrated.defaultProfile.linux": "zsh",
+                "terminal.integrated.profiles.linux": {
+                    "fish": {
+                        "path": "/usr/bin/zsh"
+                    }
+                }
+            },
+            // Add the IDs of extensions you want installed when the container is created.
+            "extensions": [
+                "akiramiyakoda.cppincludeguard",
+                "benjamin-simmonds.pythoncpp-debug", // Python/C++ debugging
+                "charliermarsh.ruff",
+                "matepek.vscode-catch2-test-adapter",
+                "mine.cpplint",
+                "ms-azuretools.vscode-docker",
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "ms-vscode.cpptools-extension-pack",
+                "redhat.vscode-yaml",
+                "rioj7.command-variable",
+                "shardulm94.trailing-spaces",
+                "shd101wyy.markdown-preview-enhanced",
+                "stkb.rewrap"
+            ]
+        },
+        // and jetbrains ide
         "jetbrains": {
             "plugins": [
+                "com.jetbrains.ai.assistant",
                 "slanglsp",
-                "com.redhat.devtools.lsp4ij"
+                "com.redhat.devtools.lsp4ij",
+                "dev.slint.ideaplugin"
             ]
         }
+    },
+    "remoteEnv": {
+        "PYTHONPATH": "/opt/nvidia/holoscan/python/lib:${containerEnv:PYTHONPATH}",
+        "HOLOHUB_DATA_DIR": "${containerWorkspaceFolder}/data"
     },
     // "initializeCommand": "${localWorkspaceFolder}/applications/tcn_artekmed/thirdparty/magicleap.sh",
     // Use 'forwardPorts' to make a list of ports inside the container available locally.

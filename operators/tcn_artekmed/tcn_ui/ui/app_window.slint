@@ -1,0 +1,82 @@
+// import "./assets/fonts/Inter-Italic-VariableFont_opsz,wght.ttf";
+// import "./assets/fonts/Inter-VariableFont_opsz,wght.ttf";
+
+// Using static fonts while waiting for slint-ui/#9777 to be fixed.
+// https://github.com/slint-ui/slint/issues/9777
+//import "@sleekui/assets/fonts/static/Inter-Black.otf";
+//import "@sleekui/assets/fonts/static/Inter-Bold.otf";
+//import "@sleekui/assets/fonts/static/Inter-ExtraBold.otf";
+//import "@sleekui/assets/fonts/static/Inter-ExtraLight.otf";
+//import "@sleekui/assets/fonts/static/Inter-Light.otf";
+//import "@sleekui/assets/fonts/static/Inter-Medium.otf";
+//import "@sleekui/assets/fonts/static/Inter-Regular.otf";
+//import "@sleekui/assets/fonts/static/Inter-SemiBold.otf";
+//import "@sleekui/assets/fonts/static/Inter-Thin.otf";
+
+import { UAppTheme } from "@sleek-ui/app-theme.slint";
+import { UModal, UText } from "@sleek-ui/widgets.slint";
+import { Sidebar, SidebarLogic } from "components/sidebar.slint";
+import { About } from "pages/about.slint";
+import { OptionsBar, OptionsBarLogic } from "components/options-bar.slint";
+
+
+export { UAppTheme, OptionsBarLogic }
+
+export component AppWindow inherits Window {
+    title: "Artekmed Controller";
+    default-font-family: "Inter";
+    default-font-size: 14px;
+    min-width: 800px * UAppTheme.scale-factor;
+    min-height: 840px * UAppTheme.scale-factor;
+    background: UAppTheme.bg-container;
+    FocusScope {
+        capture-key-pressed(event) => {
+            reject
+        }
+    }
+
+    VerticalLayout {
+        OptionsBar { }
+
+        HorizontalLayout {
+            vertical-stretch: 1;
+            Sidebar {
+                height: 100%;
+            }
+
+//            if SidebarLogic.current-page == "Controls": Controls {
+//                horizontal-stretch: 1;
+//            }
+//            if SidebarLogic.current-page == "Data display": DataDisplay {
+//                horizontal-stretch: 1;
+//            }
+//            if SidebarLogic.current-page == "Feedback": Feedback {
+//                horizontal-stretch: 1;
+//                open-modal => {
+//                    modal.show();
+//                }
+//            }
+//            if SidebarLogic.current-page == "Navigation": Navigation {
+//                horizontal-stretch: 1;
+//            }
+            if SidebarLogic.current-page == "About": About {
+                horizontal-stretch: 1;
+            }
+        }
+    }
+
+    modal := UModal {
+        title: "Modal example";
+        modal-min-width: 400px * UAppTheme.scale-factor;
+        modal-max-width: 400px * UAppTheme.scale-factor;
+        modal-min-height: 200px * UAppTheme.scale-factor;
+        modal-max-height: 400px * UAppTheme.scale-factor;
+        VerticalLayout {
+            alignment: start;
+            UText {
+                text: "A Model Dialog ...";
+                wrap: word-wrap;
+            }
+        }
+    }
+}
