@@ -4,6 +4,11 @@ application:
   inputFormats: []
   outputFormats: ["screen"]
 
+shared_memory:
+  stream_name: "camera_streams"
+  parameter_rpc_name: "tcn_shm_receiver"
+  cycle_time_ms: 1
+
 camera_stream_processing:
   device_id: 0
   buffer_size: 8
@@ -36,11 +41,6 @@ depthimage_weights:
   offset_envelope: 1.0
   depth_near_limit: 0.1
   depth_far_limit: 8.0
-
-
-shared_memory:
-  stream_name: "camera_streams"
-  cycle_time_ms: 1
 
 rmm_allocator:
 

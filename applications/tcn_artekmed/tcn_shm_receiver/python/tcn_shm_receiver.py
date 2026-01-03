@@ -4,6 +4,7 @@
 import logging
 import os
 from argparse import ArgumentParser
+import threading
 import iceoryx2 as iox2
 
 import numpy as np
@@ -13,7 +14,8 @@ from holohub.tcn_depthimage_temporal_filter import TcnDepthImageTemporalFilterOp
 from holohub.tcn_depthimage_weights import TcnDepthImageWeightsOp
 from holohub.tcn_depthimage_backprojection._tcn_depthimage_backprojection import CameraModel, DistortionType, \
     RigidTransform, CameraParameters, make_rigid_transform
-from operators.tcn_artekmed.tcn_shm_io import ShmSubscriberOp, DeviceContextService, XYLookupTableSourceOp, create_shm_subscriber
+from operators.tcn_artekmed.tcn_shm_io import (ShmSubscriberOp, DeviceContextService, XYLookupTableSourceOp,
+                                               create_shm_subscriber, ParameterRpcServer)
 from operators.tcn_artekmed.tcn_util import (StreamSplitterOp, StreamMergerOp,
                                              DepthImageMaxDistanceOp, DepthImageForegroundBackgroundMaskOp, DepthImageApplyMaskOp )
 
@@ -439,7 +441,15 @@ class App(hs.core.Application):
             self.add_flow(subscriber_op, depth_visualizer, {("depth_output_specs", "input_specs")})
 
 
+        rpc_service_name = shm_config.get("parameter_rpc_name", "holohub")
+        self.rpc_server_ = ParameterRpcServer(node, f"{rpc_service_name}/PARAMETER_RPC/Components", self)
+        self.rpc_server_.update_schema_from_fragment()
+        self.rpc_server_thread_ = threading.Thread(target=self.rpc_server_.serve_blocking)
+        self.rpc_server_thread_.start()
+
+
 def main(config_file=None):
+    global CTRL_UI_INSTANCE
     # make configurable or use holoscan debug level here too
     configure_debug = False
 
@@ -471,6 +481,10 @@ def main(config_file=None):
             pass
         tracker.print()
 
+    if hasattr(app, "rpc_server_"):
+        app.rpc_server_.shutdown()
+        app.rpc_server_thread_.join()
+
 
 if __name__ == "__main__":
 
@@ -486,7 +500,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.config == "none":
-        config_file = config_file = os.path.join(os.path.dirname(__file__), "tcn_zhm_receiver.yaml")
+        config_file = config_file = os.path.join(os.path.dirname(__file__), "tcn_shm_receiver.yaml")
     else:
         config_file = args.config
 

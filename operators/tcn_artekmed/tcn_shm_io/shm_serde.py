@@ -5,6 +5,7 @@ from typing import Union
 
 SCHEMA_PATH = (Path(__file__).parent / Path("schema/shm_synchronized_transport.capnp")).resolve()
 ENUM_SCHEMA_PATH = (Path(__file__).parent / Path("schema/enumerations.capnp")).resolve()
+RPC_SCHEMA_PATH = (Path(__file__).parent / Path("schema/shm_parameter_rpc.capnp")).resolve()
 PACKAGES_PATH = Path(capnp.__file__).resolve().parent.parent
 CANDIDATE_INCLUDE_ROOTS = [
     str(SCHEMA_PATH.parent),
@@ -14,6 +15,7 @@ IMPORTS = [p for p in CANDIDATE_INCLUDE_ROOTS if os.path.isdir(p)]
 
 shm_transport_schema = capnp.load(str(SCHEMA_PATH), imports=IMPORTS)
 shm_transport_enum = capnp.load(str(ENUM_SCHEMA_PATH), imports=IMPORTS)
+shm_parameter_rpc = capnp.load(str(RPC_SCHEMA_PATH), imports=IMPORTS)
 
 def decode_buffer_descriptor(buf: Union[bytes, bytearray, memoryview]):
     """
@@ -59,3 +61,5 @@ def decode_shm_device_context(buf: Union[bytes, bytearray, memoryview]):
     except Exception:
         # Packed encoding fallback (only if your sender used packed serialization)
         return shm_transport_schema.ShmDeviceContext.from_bytes_packed(b)
+
+

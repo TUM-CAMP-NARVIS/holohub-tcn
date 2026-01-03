@@ -1,0 +1,134 @@
+// parameter_editor.slint
+
+export { UAppTheme, OptionsBarLogic }
+import { UText, UButton } from "@sleek-ui/widgets.slint";
+
+import { 
+    StandardTableView, 
+    SpinBox, 
+    CheckBox, 
+    LineEdit, 
+    VerticalBox, 
+    HorizontalBox,
+    ListView
+} from "std-widgets.slint";
+
+// A single parameter row in the model
+export struct Parameter {
+    name: string,
+    type: string,          // "int", "float", "bool", "string"
+    int_value: int,
+    float_value: float,
+    bool_value: bool,
+    string_value: string,
+}
+
+export component ParameterEditor inherits Window {
+    preferred-width: 800px;
+    min-width: 400px;
+    title: "Dynamic Parameter Editor";
+
+    // Editable parameter model exposed to Python
+    in-out property<[Parameter]> parameters;
+
+    // Simple text for validation errors
+    in-out property<string> validation_error;
+
+    // Notify the host (Python) when the user changes a parameter
+    callback parameter-changed(
+        index: int,
+        name: string,
+        type: string,
+        int_value: int,
+        float_value: float,
+        bool_value: bool,
+        string_value: string
+    );
+
+    VerticalBox {
+        padding: 8px;
+        spacing: 8px;
+
+        // Validation error line
+        UText {
+            text: root.validation_error;
+            color: #c62828;
+        }
+
+        UText {
+            text: "Edit parameters";
+            font-weight: 600;
+        }
+
+        // Actual editors: one row per parameter, with type-specific widget
+        ListView {
+            for p[i] in parameters : HorizontalBox {
+                spacing: 8px;
+                width: parent.width;
+
+                UText {
+                    width: 160px;
+                    text: p.name;
+                }
+
+                // Integer: SpinBox
+                if (p.type == "int") : SpinBox {
+                    width: 120px;
+                    minimum: -100000;
+                    maximum: 100000;
+                    value: p.int_value;
+
+                    edited(new_val) => {
+                        p.int_value = new_val;
+                        root.parameter-changed(
+                            i, p.name, p.type,
+                            new_val, p.float_value, p.bool_value, p.string_value
+                        );
+                    }
+                }
+
+                // Boolean: CheckBox
+                if (p.type == "bool") : CheckBox {
+                    text: "";
+                    checked: p.bool_value;
+
+                    toggled => {
+                        p.bool_value = self.checked;
+                        root.parameter-changed(
+                            i, p.name, p.type,
+                            p.int_value, p.float_value, self.checked, p.string_value
+                        );
+                    }
+                }
+
+                // Float: LineEdit, value as text (validated on Python side)
+                if (p.type == "float") : LineEdit {
+                    width: 120px;
+                    text: p.string_value;
+
+                    edited(new_text) => {
+                        p.string_value = new_text;
+                        root.parameter-changed(
+                            i, p.name, p.type,
+                            p.int_value, p.float_value, p.bool_value, new_text
+                        );
+                    }
+                }
+
+                // String: LineEdit
+                if (p.type == "string") : LineEdit {
+                    width: 240px;
+                    text: p.string_value;
+
+                    edited(new_text) => {
+                        p.string_value = new_text;
+                        root.parameter-changed(
+                            i, p.name, p.type,
+                            p.int_value, p.float_value, p.bool_value, new_text
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

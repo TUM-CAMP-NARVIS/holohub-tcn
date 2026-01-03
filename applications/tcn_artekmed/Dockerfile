@@ -60,6 +60,16 @@ RUN apt-get update \
     && apt-get install -y \
       libavformat-dev gdb rustc cargo \
       libeigen3-dev \
+      libxkbcommon-x11-0 \
+      libx11-6 \
+      libxcb1 \
+      libxrender1 \
+      libxkbcommon0 \
+      libglu1-mesa \
+      libgtk-3-0 \
+      libwayland-client0 \
+      libwayland-cursor0 \
+      libwayland-egl1 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /tmp/dependencies
