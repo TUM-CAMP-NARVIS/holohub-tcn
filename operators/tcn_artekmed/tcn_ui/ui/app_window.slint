@@ -1,28 +1,21 @@
 // import "./assets/fonts/Inter-Italic-VariableFont_opsz,wght.ttf";
 // import "./assets/fonts/Inter-VariableFont_opsz,wght.ttf";
 
-// Using static fonts while waiting for slint-ui/#9777 to be fixed.
-// https://github.com/slint-ui/slint/issues/9777
-//import "@sleekui/assets/fonts/static/Inter-Black.otf";
-//import "@sleekui/assets/fonts/static/Inter-Bold.otf";
-//import "@sleekui/assets/fonts/static/Inter-ExtraBold.otf";
-//import "@sleekui/assets/fonts/static/Inter-ExtraLight.otf";
-//import "@sleekui/assets/fonts/static/Inter-Light.otf";
-//import "@sleekui/assets/fonts/static/Inter-Medium.otf";
-//import "@sleekui/assets/fonts/static/Inter-Regular.otf";
-//import "@sleekui/assets/fonts/static/Inter-SemiBold.otf";
-//import "@sleekui/assets/fonts/static/Inter-Thin.otf";
-
 import { UAppTheme } from "@sleek-ui/app-theme.slint";
-import { UModal, UText } from "@sleek-ui/widgets.slint";
+import { UText } from "@sleek-ui/widgets.slint";
 import { Sidebar, SidebarLogic } from "components/sidebar.slint";
 import { About } from "pages/about.slint";
 import { OptionsBar, OptionsBarLogic } from "components/options-bar.slint";
 
+import { RpcClient, Parameter, ParameterSchema } from "components/rpc-client.slint";
+import { ParameterEditor } from "pages/parameter-editor.slint";
 
-export { UAppTheme, OptionsBarLogic }
+export { UAppTheme, OptionsBarLogic, RpcClient }
 
 export component AppWindow inherits Window {
+
+    in-out property<[string]> sidebar-pages <=> sidebar.pages;
+
     title: "Artekmed Controller";
     default-font-family: "Inter";
     default-font-size: 14px;
@@ -40,7 +33,7 @@ export component AppWindow inherits Window {
 
         HorizontalLayout {
             vertical-stretch: 1;
-            Sidebar {
+            sidebar := Sidebar {
                 height: 100%;
             }
 
@@ -59,23 +52,8 @@ export component AppWindow inherits Window {
 //            if SidebarLogic.current-page == "Navigation": Navigation {
 //                horizontal-stretch: 1;
 //            }
-            if SidebarLogic.current-page == "About": About {
-                horizontal-stretch: 1;
-            }
-        }
-    }
-
-    modal := UModal {
-        title: "Modal example";
-        modal-min-width: 400px * UAppTheme.scale-factor;
-        modal-max-width: 400px * UAppTheme.scale-factor;
-        modal-min-height: 200px * UAppTheme.scale-factor;
-        modal-max-height: 400px * UAppTheme.scale-factor;
-        VerticalLayout {
-            alignment: start;
-            UText {
-                text: "A Model Dialog ...";
-                wrap: word-wrap;
+            ParameterEditor {
+                component-name: SidebarLogic.current-page;
             }
         }
     }

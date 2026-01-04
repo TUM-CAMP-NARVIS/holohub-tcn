@@ -3,7 +3,7 @@ import ctypes
 import logging
 import time
 import iceoryx2 as iox2
-from typing import Any, Callable
+from typing import Any, Callable, List
 import numpy as np
 
 from .shm_serde import shm_parameter_rpc as rpc_types
@@ -30,6 +30,38 @@ def read_payload(payload):
     return dst_array
 
 
+def string_to_parameter_value_type(type_str: str):
+    if type_str == "int":
+        return rpc_types.ParameterValueType.pvtInt32
+    elif type_str == "int64":
+        return rpc_types.ParameterValueType.pvtInt64
+    elif type_str == "float":
+        return rpc_types.ParameterValueType.pvtFloat
+    elif type_str == "double":
+        return rpc_types.ParameterValueType.pvtDouble
+    elif type_str == "bool":
+        return rpc_types.ParameterValueType.pvtBool
+    elif type_str == "string":
+        return rpc_types.ParameterValueType.pvtString
+    else:
+        log.warning(f"Unsupported parameter type: {type_str}")
+        return None
+
+def make_parameter_value(parameter_type: rpc_types.ParameterValueType, value: Any):
+    if parameter_type == rpc_types.ParameterValueType.pvtInt32:
+        return rpc_types.ParameterValue.new_message(int32Value=np.int32(value))
+    elif parameter_type == rpc_types.ParameterValueType.pvtInt64:
+        return rpc_types.ParameterValue.new_message(int64Value=np.int64(value))
+    elif parameter_type == rpc_types.ParameterValueType.pvtFloat:
+        return rpc_types.ParameterValue.new_message(floatValue=np.float32(value))
+    elif parameter_type == rpc_types.ParameterValueType.pvtDouble:
+        return rpc_types.ParameterValue.new_message(doubleValue=np.float64(value))
+    elif parameter_type == rpc_types.ParameterValueType.pvtBool:
+        return rpc_types.ParameterValue.new_message(boolValue=np.bool(value))
+    else:
+        log.warning(f"Unsupported parameter type: {parameter_type}")
+        return None
+
 class ParameterRpcServer:
 
     def __init__(self, node: Any, rpc_service_name: str, fragment: Any):
@@ -37,6 +69,7 @@ class ParameterRpcServer:
         self.node_ = node
         self.fragment_ = fragment
         self.node_schema = {}
+        self.components_map = {}
         self.rpc_service_name_ = rpc_service_name
         self.service_ = (
             node.service_builder(iox2.ServiceName.new(rpc_service_name))
@@ -90,6 +123,7 @@ class ParameterRpcServer:
                             value_type = self.make_custom_value_type(node.name, type(node).__name__, arg.name, type_str)
 
                         if value_type is None:
+                            log.info(f"Skipping argument '{arg.name}' with unknown type '{type_str}' for node '{node.name}'")
                             continue
 
                         parameters.append({
@@ -101,12 +135,43 @@ class ParameterRpcServer:
                         continue
 
                     self.node_schema[node.name] = parameters
+                    self.components_map[node.name] = node
 
     def list_nodes(self):
         return list(sorted(self.node_schema.keys()))
 
     def get_parameter_schema(self, entity_name: str):
         return self.node_schema.get(entity_name, [])
+
+    def get_parameter_values(self, entity_name: str):
+        result = []
+        component = self.components_map.get(entity_name)
+        if component is None:
+            log.error(f"Missing component for entity: {entity_name}")
+            return result
+        for param in self.get_parameter_schema(entity_name):
+            param_name = param["key"]
+            param_value = getattr(component, param_name, None)
+            if param_value is not None:
+                result.append({"key": param_name, "value": param_value})
+            else:
+                log.warning(f"Parameter for {param_name} is None")
+        return result
+
+
+    def set_parameter_values(self, entity_name: str, values: List[Any]):
+        # result = []
+        # component = self.components_map.get(entity_name)
+        # if component is None:
+        #     return result
+        # for param in self.get_parameter_schema(entity_name):
+        #     param_name = param["key"]
+        #     param_value = getattr(component, param_name, None)
+        #     if param_value is not None:
+        #         result.append({"key": param_name, "value": param_value})
+        # return result
+        return True
+
 
     def handle_request(self, request):
         if request.commandType == rpc_types.RPCCommandType.rpcCommandListEntities:
@@ -126,6 +191,32 @@ class ParameterRpcServer:
                 commandType=request.commandType,
                 responseType=rpc_types.RPCResponseStatus.rpcStatusSuccess,
                 parameterSchema=parameter_schema
+            )
+            return response_message
+        elif request.commandType == rpc_types.RPCCommandType.rpcCommandGetParameterValues:
+            parameters = []
+            for item in self.get_parameter_values(request.entityName):
+                parameters.append(rpc_types.Parameter.new_message(**item))
+            parameter_values = rpc_types.ParameterList.new_message(parameters=parameters)
+
+            response_message = rpc_types.ParameterRpcResponse.new_message(
+                commandType=request.commandType,
+                responseType=rpc_types.RPCResponseStatus.rpcStatusSuccess,
+                parameterValues=parameter_values
+            )
+            return response_message
+        elif request.commandType == rpc_types.RPCCommandType.rpcCommandSetParameterValues:
+
+            # parameters = []
+            # for item in self.get_parameter_schema(request.entityName):
+            #     parameters.append(rpc_types.ParameterSchema.new_message(**item))
+            # parameter_schema = rpc_types.ParameterListSchema.new_message(parameters=parameters)
+
+            log.info(f"Unimplemented: set parameter value: {request}")
+
+            response_message = rpc_types.ParameterRpcResponse.new_message(
+                commandType=request.commandType,
+                responseType=rpc_types.RPCResponseStatus.rpcStatusSuccess
             )
             return response_message
 
@@ -233,6 +324,7 @@ class ParameterRpcClient:
     def list_components(self):
         request = rpc_types.ParameterRpcRequest.new_message(commandType=rpc_types.RPCCommandType.rpcCommandListEntities)
         def response_handler(response):
+            assert(response.responseType == request.commandType)
             assert(response.commandType == request.commandType)
             assert(response.which()=="entitiesList")
             return [v for v in response.entitiesList]
@@ -249,5 +341,43 @@ class ParameterRpcClient:
             return [v.to_dict() for v in response.parameterSchema.parameters]
         return self._call_remote(request, response_handler)
 
+    def get_parameter_values(self, entity_name: str):
+        request = rpc_types.ParameterRpcRequest.new_message(
+            commandType=rpc_types.RPCCommandType.rpcCommandGetParameterValues,
+            entityName=entity_name
+        )
+        def response_handler(response):
+            assert(response.commandType == request.commandType)
+            assert(response.which()=="parameterValues")
+            return [v.to_dict() for v in response.parameterValues.parameters]
+        return self._call_remote(request, response_handler)
+
+    def set_parameter_parameter(self, entity_name: str, values: List[Any]):
+        parameter_values = []
+        for v in values:
+            pt = string_to_parameter_value_type(v["type"])
+            pv = None
+            if v["type"] == "int":
+                pv = v["int_value"]
+            elif v["type"] == "float":
+                pv = v["float_value"]
+            elif v["type"] == "bool":
+                pv = v["bool_value"]
+            elif v["type"] == "string":
+                pv = v["string_value"]
+            else:
+                log.warning(f"Unhandled type: {pt}")
+            item = {"key": v["name"], "value": make_parameter_value(pt, pv)}
+            parameter_values.append(rpc_types.Parameter.new_message(**item))
+
+        request = rpc_types.ParameterRpcRequest.new_message(
+            commandType=rpc_types.RPCCommandType.rpcCommandSetParameterValues,
+            entityName=entity_name,
+            payload=parameter_values
+        )
+        def response_handler(response):
+            assert(response.commandType == request.commandType)
+            return True
+        return self._call_remote(request, response_handler)
 
 

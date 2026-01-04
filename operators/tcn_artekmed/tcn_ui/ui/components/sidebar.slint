@@ -1,12 +1,16 @@
 import { UAppTheme } from "@sleek-ui/app-theme.slint";
 import { UDivider, UText, UTitle } from "@sleek-ui/widgets.slint";
+import { RpcClient, Parameter, ParameterSchema } from "../components/rpc-client.slint";
 
 
 export global SidebarLogic {
-    in-out property <string> current-page: "Controls";
+    in-out property <string> current-page: "About";
 }
 
 export component Sidebar inherits Rectangle {
+
+    in-out property<[string]> pages: ["About"];
+
     width: 200px * UAppTheme.scale-factor;
     HorizontalLayout {
         VerticalLayout {
@@ -28,7 +32,7 @@ export component Sidebar inherits Rectangle {
                 height: 40px;
             }
 
-            for link in ["About"]: HorizontalLayout {
+            for link in root.pages: HorizontalLayout {
                 padding: UAppTheme.padding-small;
                 Rectangle {
                     border-radius: UAppTheme.radius-base;
