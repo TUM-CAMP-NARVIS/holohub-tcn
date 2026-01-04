@@ -1,49 +1,32 @@
 // parameter_editor.slint
 
-export { UAppTheme, OptionsBarLogic }
 import { UText, UButton } from "@sleek-ui/widgets.slint";
+import { Page } from "../components/page.slint";
+import { RpcClient, ParameterSchema, Parameter } from "../components/rpc-client.slint";
 
-import { 
-    StandardTableView, 
-    SpinBox, 
-    CheckBox, 
-    LineEdit, 
-    VerticalBox, 
+import {
+    StandardTableView,
+    SpinBox,
+    CheckBox,
+    LineEdit,
+    VerticalBox,
     HorizontalBox,
     ListView
 } from "std-widgets.slint";
 
 // A single parameter row in the model
-export struct Parameter {
-    name: string,
-    type: string,          // "int", "float", "bool", "string"
-    int_value: int,
-    float_value: float,
-    bool_value: bool,
-    string_value: string,
-}
 
-export component ParameterEditor inherits Window {
-    preferred-width: 800px;
-    min-width: 400px;
-    title: "Parameter Editor";
+
+export component ParameterEditor inherits Page {
+
+    in-out property<string> component-name: "";
 
     // Editable parameter model exposed to Python
-    in-out property<[Parameter]> parameters;
+    in-out property<[ParameterSchema]> parameter-schema: RpcClient.get-parameter-schema(root.component-name);
+    in-out property<[Parameter]> parameter-values: RpcClient.get-parameter-values(root.component-name);
 
     // Simple text for validation errors
     in-out property<string> validation_error;
-
-    // Notify the host (Python) when the user changes a parameter
-    callback parameter-changed(
-        index: int,
-        name: string,
-        type: string,
-        int_value: int,
-        float_value: float,
-        bool_value: bool,
-        string_value: string
-    );
 
     VerticalBox {
         padding: 8px;
@@ -62,7 +45,7 @@ export component ParameterEditor inherits Window {
 
         // Actual editors: one row per parameter, with type-specific widget
         ListView {
-            for p[i] in parameters : HorizontalBox {
+            for p[i] in parameter-values : HorizontalBox {
                 spacing: 8px;
                 width: parent.width;
 
@@ -80,9 +63,11 @@ export component ParameterEditor inherits Window {
 
                     edited(new_val) => {
                         p.int_value = new_val;
-                        root.parameter-changed(
-                            i, p.name, p.type,
-                            new_val, p.float_value, p.bool_value, p.string_value
+                        RpcClient.set-parameter-values(
+                            root.component-name,
+                            [{name: p.name, type: p.type,
+                            int_value: new_val, float_value: p.float_value,
+                            bool_value: p.bool_value, string_value: p.string_value}]
                         );
                     }
                 }
@@ -94,9 +79,11 @@ export component ParameterEditor inherits Window {
 
                     toggled => {
                         p.bool_value = self.checked;
-                        root.parameter-changed(
-                            i, p.name, p.type,
-                            p.int_value, p.float_value, self.checked, p.string_value
+                        RpcClient.set-parameter-values(
+                            root.component-name,
+                            [{name: p.name, type: p.type,
+                            int_value: p.int_value, float_value: p.float_value,
+                            bool_value: self.checked, string_value: p.string_value}]
                         );
                     }
                 }
@@ -108,9 +95,11 @@ export component ParameterEditor inherits Window {
 
                     edited(new_text) => {
                         p.string_value = new_text;
-                        root.parameter-changed(
-                            i, p.name, p.type,
-                            p.int_value, p.float_value, p.bool_value, new_text
+                        RpcClient.set-parameter-values(
+                            root.component-name,
+                            [{name: p.name, type: p.type,
+                            int_value: p.int_value, float_value: p.float_value,
+                            bool_value: p.bool_value, string_value: new_text}]
                         );
                     }
                 }
@@ -122,9 +111,11 @@ export component ParameterEditor inherits Window {
 
                     edited(new_text) => {
                         p.string_value = new_text;
-                        root.parameter-changed(
-                            i, p.name, p.type,
-                            p.int_value, p.float_value, p.bool_value, new_text
+                        RpcClient.set-parameter-values(
+                            root.component-name,
+                            [{name: p.name, type: p.type,
+                            int_value: p.int_value, float_value: p.float_value,
+                            bool_value: p.bool_value, string_value: new_text}]
                         );
                     }
                 }

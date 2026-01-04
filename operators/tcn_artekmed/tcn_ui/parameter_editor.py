@@ -61,7 +61,8 @@ class ParameterBackend:
 # 2. Slint-based parameter editor
 # ---------------------------------------------------------------------------
 
-class ParameterEditorApp(slint.load_file(os.path.join(UI_BASE_PATH, "parameter_editor.slint"), library_paths=SLINT_LIBRARY_PATHS).ParameterEditor):
+class ParameterEditorApp(slint.load_file(os.path.join(UI_BASE_PATH, "parameter_editor.slint"),
+                                         library_paths=SLINT_LIBRARY_PATHS).ParameterEditor):
     def __init__(self, backend: ParameterBackend):
         super().__init__()
 
