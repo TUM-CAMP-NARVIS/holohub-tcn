@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 Ulrich Eck
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,14 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-#add_holohub_application(tcn_zenoh_receiver DEPENDS OPERATORS
-#                          nv_video_decoder
-#                          )
+include(pybind11_add_holohub_module)
 
-add_holohub_application(tcn_shm_receiver DEPENDS OPERATORS
-                          tcn_depthimage_backprojection
-                          tcn_depthimage_temporal_filter
-                          tcn_depthimage_weights
-                          tcn_texture_sampler
-                          #slang_shader
-                          )
+pybind11_add_holohub_module(
+    CPP_CMAKE_TARGET tcn_texture_sampler
+    CLASS_NAME "TcnTextureSamplerOp"
+    SOURCES tcn_texture_sampler.cpp
+)
