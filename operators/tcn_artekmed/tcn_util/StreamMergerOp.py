@@ -63,6 +63,7 @@ class StreamMergerOp(Operator):
                 fused_buffer = cp.concatenate((m[1] for m in all_messages), axis=1)
             log.debug("Fused buffer to {}".format(fused_buffer.shape))
             di_tensor = hs.as_tensor(fused_buffer)
+            op_output.set_cuda_stream(output_stream, "output")
             op_output.emit({self.output_message_name: di_tensor}, "output")
         else:
             out_message = dict()
@@ -72,5 +73,6 @@ class StreamMergerOp(Operator):
                     message_name = f"{camera_name}_{self.output_message_name}"
                     di_tensor = hs.as_tensor(buffer)
                     out_message[message_name] = di_tensor
+            op_output.set_cuda_stream(output_stream, "output")
             op_output.emit(out_message, "output")
 

@@ -3,6 +3,7 @@ from .StreamSplitterOp import StreamSplitterOp
 from .DepthImageMaxDistanceOp import DepthImageMaxDistanceOp
 from .DepthImageForegroundBackgroundMaskOp import DepthImageForegroundBackgroundMaskOp
 from .DepthImageApplyMaskOp import DepthImageApplyMaskOp
-__all__ = ["StreamMergerOp", "StreamSplitterOp",
+from .FlattenTensorOp import FlattenTensorOp
+__all__ = ["StreamMergerOp", "StreamSplitterOp", "FlattenTensorOp",
            "DepthImageMaxDistanceOp", "DepthImageForegroundBackgroundMaskOp",
            "DepthImageApplyMaskOp", ]

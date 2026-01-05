@@ -38,4 +38,5 @@
 add_holohub_operator(tcn_depthimage_backprojection)
 add_holohub_operator(tcn_depthimage_temporal_filter)
 add_holohub_operator(tcn_depthimage_weights)
+add_holohub_operator(tcn_texture_sampler)
 #add_holohub_operator(tcn_stream_synchronizer)
