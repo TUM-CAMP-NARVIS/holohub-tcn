@@ -50,16 +50,11 @@ ARG CMAKE_BUILD_TYPE=Release
 # tcn_artekmed specific dependencies
 #
 
-# Copy over app-specific requirements
-COPY applications/tcn_artekmed/requirements.txt /tmp/requirements.txt
-
-# Install Python dependencies
-RUN python3 -m pip install --no-cache-dir -r /tmp/requirements.txt
-
 RUN apt-get update \
     && apt-get install -y \
       libavformat-dev gdb rustc cargo \
       libeigen3-dev \
+      libglfw3-dev \
       libxkbcommon-x11-0 \
       libx11-6 \
       libxcb1 \
@@ -70,8 +65,31 @@ RUN apt-get update \
       libwayland-client0 \
       libwayland-cursor0 \
       libwayland-egl1 \
+      build-essential \
+      ccache \
+      gdb \
+      git-lfs \
+      wget \
+      unzip \
+      cmake \
+      libvulkan-dev \
+      libxinerama-dev \
+      libxcursor-dev \
+      xorg-dev \
+      libglu1-mesa-dev \
+      pkg-config \
+      ninja-build \
+    && apt-get autoremove -y \
+    && apt-get clean -y \
     && rm -rf /var/lib/apt/lists/*
 
+# Copy over app-specific requirements
+COPY applications/tcn_artekmed/requirements.txt /tmp/requirements.txt
+
+# Install Python dependencies
+RUN python3 -m pip install --no-cache-dir -r /tmp/requirements.txt
+
+# custom external libraries
 RUN mkdir -p /tmp/dependencies
 
 WORKDIR /tmp/dependencies
@@ -96,27 +114,6 @@ RUN rm -Rf /tmp/dependencies/xylt && \
     cmake --install . --prefix=/usr && \
     cp /tmp/dependencies/xylt/build/pyxylt.cpython*.so /usr/local/lib/python3.12/dist-packages/
 
-
-# Install additional packages
-RUN apt-get update \
-    && export DEBIAN_FRONTEND=noninteractive \
-    && apt-get -y install --no-install-recommends  \
-        build-essential \
-        ccache \
-        gdb \
-        git-lfs \
-    && apt-get autoremove -y \
-    && apt-get clean -y \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install dependencies for Slang (CMake, Vulkan, etc.)
-RUN apt-get update && apt-get install -y \
-    wget \
-    unzip \
-    cmake \
-    libvulkan-dev \
-    && rm -rf /var/lib/apt/lists/*
-
 # Download and install latest Slang release (adjust version as needed)
 WORKDIR /tmp/dependencies/slang
 ARG SLANG_VERSION=2025.24.2  # Check https://github.com/shader-slang/slang/releases
@@ -126,9 +123,8 @@ RUN wget https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSIO
     && ln -s /tmp/dependencies/slang/bin/slangc /usr/local/bin/slangc \
     && ln -s /tmp/dependencies/slang/bin/slangd /usr/local/bin/slangd
 
-
 # Set PATH and verify
-ENV PATH="/tmp/dependencies/slang/bin:${PATH}"
+ENV PATH="/usr/local/bin:${PATH}"
 
 WORKDIR /
 
