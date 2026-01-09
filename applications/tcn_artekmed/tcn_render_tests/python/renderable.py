@@ -1,0 +1,97 @@
+from abc import ABC, abstractmethod
+from typing import Optional
+import numpy as np
+import slangpy as spy
+
+
+class Renderable(ABC):
+    """
+    Abstract base class for all renderable objects in the scene.
+
+    Provides common interface for managing:
+    - 6D pose (4x4 transformation matrix)
+    - Visibility state
+    - GPU buffer synchronization
+    - Data updates (thread-safe)
+    """
+
+    def __init__(self, device: spy.Device):
+        self.device = device
+        self._pose = np.eye(4, dtype=np.float32)
+        self._visible = True
+
+    @property
+    def pose(self) -> np.ndarray:
+        """Get the 4x4 transformation matrix for this object."""
+        return self._pose
+
+    @pose.setter
+    def pose(self, value):
+        """Set the 4x4 transformation matrix for this object."""
+        # Handle glm.mat4x4 objects
+        if hasattr(value, 'to_list'):
+            # Convert glm matrix to numpy array
+            matrix_list = value.to_list()
+            # glm uses column-major order, convert to row-major for numpy
+            self._pose = np.array(matrix_list, dtype=np.float32).T
+        elif isinstance(value, np.ndarray):
+            if value.shape != (4, 4):
+                raise ValueError("Pose must be a 4x4 matrix")
+            self._pose = value.astype(np.float32)
+        else:
+            # Try to convert to numpy array
+            arr = np.array(value, dtype=np.float32)
+            if arr.shape != (4, 4):
+                raise ValueError("Pose must be a 4x4 matrix")
+            self._pose = arr
+
+    @property
+    def visible(self) -> bool:
+        """Get visibility state."""
+        return self._visible
+
+    @visible.setter
+    def visible(self, value: bool):
+        """Set visibility state."""
+        self._visible = value
+
+    @abstractmethod
+    def update(self, **kwargs):
+        """
+        Thread-safe method to stage data updates.
+        Called from any thread (e.g., Holoscan operator).
+        """
+        pass
+
+    @abstractmethod
+    def sync_gpu(self):
+        """
+        Synchronize staged data to GPU buffers.
+        Must be called from the rendering thread before drawing.
+        """
+        pass
+
+    @abstractmethod
+    def render(self, command_encoder: spy.CommandEncoder,
+               window_size: tuple[int, int],
+               output_texture: spy.Texture,
+               depth_texture: spy.Texture,
+               view_matrix: np.ndarray,
+               proj_matrix: np.ndarray,
+               camera_pos: list = None,
+               clear_color: list = None):
+        """
+        Render this object.
+        Called from the rendering thread during the render loop.
+
+        Args:
+            command_encoder: Slang command encoder for GPU commands
+            window_size: (width, height) of the render target
+            output_texture: Target texture to render into
+            depth_texture: Depth buffer for depth testing
+            view_matrix: Camera view matrix (4x4)
+            proj_matrix: Camera projection matrix (4x4)
+            camera_pos: Camera position [x, y, z]
+            clear_color: RGBA clear color, or None to skip clearing
+        """
+        pass

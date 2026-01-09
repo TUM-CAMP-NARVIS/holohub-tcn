@@ -24,11 +24,14 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <variant>
 
 #include "gxf/multimedia/camera.hpp"
 #include "holoscan/core/fragment.hpp"
+#include "holoscan/core/subgraph.hpp"
 #include "holoscan/core/operator.hpp"
 #include "holoscan/core/operator_spec.hpp"
+#include "holoscan/python/core/component_util.hpp"
 
 #include <holoscan/python/core/emitter_receiver_registry.hpp>
 
@@ -63,7 +66,8 @@ class PyTcnDepthImageTemporalFilterOp : public TcnDepthImageTemporalFilterOp {
   using TcnDepthImageTemporalFilterOp::TcnDepthImageTemporalFilterOp;
 
   // Define a constructor that fully initializes the object.
-  PyTcnDepthImageTemporalFilterOp(holoscan::Fragment* fragment, const py::args& args,
+  PyTcnDepthImageTemporalFilterOp(const std::variant<holoscan::Fragment*, holoscan::Subgraph*>& fragment_or_subgraph,
+                                  const py::args& args,
                                   std::shared_ptr<holoscan::Allocator> allocator,
                                   int cuda_device_ordinal=0,
                                   uint8_t persistence=3,
@@ -83,10 +87,7 @@ class PyTcnDepthImageTemporalFilterOp : public TcnDepthImageTemporalFilterOp {
 
             }) {
     add_positional_condition_and_resource_args(this, args);
-    name_ = name;
-    fragment_ = fragment;
-    spec_ = std::make_shared<holoscan::OperatorSpec>(fragment);
-    setup(*spec_.get());
+    init_operator_base(this, fragment_or_subgraph, name);
   }
 };
 
@@ -114,7 +115,7 @@ PYBIND11_MODULE(_tcn_depthimage_temporal_filter, m) {
       m,
       "TcnDepthImageTemporalFilterOp",
       doc::TcnDepthImageTemporalFilterOp::doc_TcnDepthImageTemporalFilterOp)
-      .def(py::init<holoscan::Fragment*,
+      .def(py::init<std::variant<holoscan::Fragment*, holoscan::Subgraph*>,
                     const py::args&,
                     std::shared_ptr<holoscan::Allocator>,
                     int,

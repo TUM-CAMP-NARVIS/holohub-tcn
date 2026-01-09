@@ -24,11 +24,14 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <variant>
 
 #include "gxf/multimedia/camera.hpp"
 #include "holoscan/core/fragment.hpp"
+#include "holoscan/core/subgraph.hpp"
 #include "holoscan/core/operator.hpp"
 #include "holoscan/core/operator_spec.hpp"
+#include "holoscan/python/core/component_util.hpp"
 
 #include <holoscan/python/core/emitter_receiver_registry.hpp>
 
@@ -63,7 +66,8 @@ class PyTcnDepthImageBackprojectionOp : public TcnDepthImageBackprojectionOp {
   using TcnDepthImageBackprojectionOp::TcnDepthImageBackprojectionOp;
 
   // Define a constructor that fully initializes the object.
-  PyTcnDepthImageBackprojectionOp(holoscan::Fragment* fragment, const py::args& args,
+  PyTcnDepthImageBackprojectionOp(const std::variant<holoscan::Fragment*, holoscan::Subgraph*>& fragment_or_subgraph,
+                                  const py::args& args,
                                   std::shared_ptr<holoscan::Allocator> allocator,
                                   float depth_units_per_meter=1000.f,
                                   float near_limit_m=0.01f,
@@ -98,10 +102,7 @@ class PyTcnDepthImageBackprojectionOp : public TcnDepthImageBackprojectionOp {
                               holoscan::Arg{"cuda_device_ordinal", cuda_device_ordinal}
             }) {
     add_positional_condition_and_resource_args(this, args);
-    name_ = name;
-    fragment_ = fragment;
-    spec_ = std::make_shared<holoscan::OperatorSpec>(fragment);
-    setup(*spec_.get());
+    init_operator_base(this, fragment_or_subgraph, name);
   }
 };
 
@@ -192,7 +193,7 @@ PYBIND11_MODULE(_tcn_depthimage_backprojection, m) {
       m,
       "TcnDepthImageBackprojectionOp",
       doc::TcnDepthImageBackprojectionOp::doc_TcnDepthImageBackprojectionOp)
-      .def(py::init<holoscan::Fragment*,
+      .def(py::init<std::variant<holoscan::Fragment*, holoscan::Subgraph*>,
                     const py::args&,
                     std::shared_ptr<holoscan::Allocator>,
                     float,

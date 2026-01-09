@@ -1,12 +1,12 @@
 import slangpy as spy
 import numpy as np
-import time
 from pyglm import glm
 
 from pointcloud_data import Pointcloud
 
 class PointcloudRenderer:
     def __init__(self, device: spy.Device, output_format: spy.Format):
+        self.device = device
         self.program = device.load_program(
             "pointcloud.slang",
             ["vertex_main", "fragment_main"],
@@ -14,7 +14,6 @@ class PointcloudRenderer:
         )
 
         self.sampler = device.create_sampler()
-        self.timer = time.perf_counter()
 
         self.pipeline = device.create_render_pipeline(
             program=self.program,
@@ -48,46 +47,66 @@ class PointcloudRenderer:
         window_size: tuple[int, int],
         output_texture: spy.Texture,
         depth_texture: spy.Texture,
+        view_matrix: np.ndarray,
+        proj_matrix: np.ndarray,
+        model_matrix: np.ndarray,
+        camera_pos: list = None,
+        clear_color: list = None,
     ):
+        """
+        Render a pointcloud with the given transformation matrices.
+
+        Args:
+            command_encoder: Slang command encoder
+            pointcloud: Pointcloud object to render
+            window_size: (width, height) tuple
+            output_texture: Target texture
+            depth_texture: Depth buffer
+            view_matrix: Camera view matrix (4x4)
+            proj_matrix: Camera projection matrix (4x4)
+            model_matrix: Object pose/model matrix (4x4)
+            camera_pos: Camera position [x, y, z], defaults to [0, 0, 0]
+            clear_color: RGBA clear color, or None to skip clearing
+        """
+        if camera_pos is None:
+            camera_pos = [0, 0, 0]
+
+        # Skip rendering if essential data is missing
+        if not (pointcloud.has_vertices and pointcloud.has_texcoords and pointcloud.has_texture):
+            return
+
         with command_encoder.begin_render_pass(
             {
                 "color_attachments": [
                     {
                         "view": output_texture.create_view(),
-                        "clear_value": [0.1, 0.2, 0.3, 1.0],
+                        "clear_value": clear_color if clear_color else [0.1, 0.2, 0.3, 1.0],
+                        "load_op": spy.LoadOp.clear if clear_color else spy.LoadOp.load,
                     }
                 ],
                 "depth_stencil_attachment": {
                     "view": depth_texture.create_view(),
+                    "depth_load_op": spy.LoadOp.clear if clear_color else spy.LoadOp.load,
                 },
             }
         ) as pass_encoder:
-            if pointcloud.is_dirty:
-                pointcloud.sync_gpu()
+            shader_object = pass_encoder.bind_pipeline(self.pipeline)
+            cursor = spy.ShaderCursor(shader_object)
+            cursor.sampler = self.sampler
+            cursor.texture = pointcloud.texture
+            cursor.proj = proj_matrix
+            cursor.view = view_matrix
+            cursor.model = model_matrix
+            cursor.cameraPos = camera_pos
 
-            if pointcloud.has_vertices and pointcloud.has_texcoords and pointcloud.has_texture:
-                shader_object = pass_encoder.bind_pipeline(self.pipeline)
-                cursor = spy.ShaderCursor(shader_object)
-                cursor.sampler = self.sampler
-                cursor.texture = pointcloud.texture
-                aspect = float(window_size[0]) / float(window_size[1])
-                camera_pos = [3, 3, 3]
-                cursor.proj = glm.perspective(glm.radians(60), aspect, 0.1, 10)
-                cursor.view = glm.lookAt(camera_pos, [0, 0, 0], [0, 1, 0])
-                t = time.perf_counter() - self.timer
-                offset = 0.2 * np.sin(2 * t)
-                cursor.model = glm.translate([0, offset, 0]) * glm.rotate(t, [0, 1, 0])
-                cursor.cameraPos = camera_pos
-
-                pass_encoder.set_render_state(
-                    {
-                        "viewports": [spy.Viewport.from_size(*window_size)],
-                        "scissor_rects": [spy.ScissorRect.from_size(*window_size)],
-                        "vertex_buffers": [
-                            pointcloud.position_buffer,
-                            #pointcloud.normal_buffer,
-                            pointcloud.uv_buffer,
-                        ],
-                    }
-                )
-                pass_encoder.draw_indexed({"vertex_count": pointcloud.vertices.size})
+            pass_encoder.set_render_state(
+                {
+                    "viewports": [spy.Viewport.from_size(*window_size)],
+                    "scissor_rects": [spy.ScissorRect.from_size(*window_size)],
+                    "vertex_buffers": [
+                        pointcloud.position_buffer,
+                        pointcloud.uv_buffer,
+                    ],
+                }
+            )
+            pass_encoder.draw_indexed({"vertex_count": pointcloud.vertices.size})

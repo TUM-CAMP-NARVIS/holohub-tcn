@@ -1,12 +1,12 @@
 import slangpy as spy
 import numpy as np
-import time
 from pyglm import glm
 
 from mesh_data import Mesh
 
 class MeshRenderer:
     def __init__(self, device: spy.Device, output_format: spy.Format):
+        self.device = device
         self.program = device.load_program(
             "phong.slang",
             ["vertex_main", "fragment_main"],
@@ -14,7 +14,6 @@ class MeshRenderer:
         )
 
         self.sampler = device.create_sampler()
-        self.timer = time.perf_counter()
 
         self.pipeline = device.create_render_pipeline(
             program=self.program,
@@ -53,17 +52,42 @@ class MeshRenderer:
         window_size: tuple[int, int],
         output_texture: spy.Texture,
         depth_texture: spy.Texture,
+        view_matrix: np.ndarray,
+        proj_matrix: np.ndarray,
+        model_matrix: np.ndarray,
+        camera_pos: list = None,
+        clear_color: list = None,
     ):
+        """
+        Render a mesh with the given transformation matrices.
+
+        Args:
+            command_encoder: Slang command encoder
+            mesh: Mesh object to render
+            window_size: (width, height) tuple
+            output_texture: Target texture
+            depth_texture: Depth buffer
+            view_matrix: Camera view matrix (4x4)
+            proj_matrix: Camera projection matrix (4x4)
+            model_matrix: Object pose/model matrix (4x4)
+            camera_pos: Camera position [x, y, z], defaults to [0, 0, 0]
+            clear_color: RGBA clear color, or None to skip clearing
+        """
+        if camera_pos is None:
+            camera_pos = [0, 0, 0]
+
         with command_encoder.begin_render_pass(
             {
                 "color_attachments": [
                     {
                         "view": output_texture.create_view(),
-                        "clear_value": [0.1, 0.2, 0.3, 1.0],
+                        "clear_value": clear_color if clear_color else [0.1, 0.2, 0.3, 1.0],
+                        "load_op": spy.LoadOp.clear if clear_color else spy.LoadOp.load,
                     }
                 ],
                 "depth_stencil_attachment": {
                     "view": depth_texture.create_view(),
+                    "depth_load_op": spy.LoadOp.clear if clear_color else spy.LoadOp.load,
                 },
             }
         ) as pass_encoder:
@@ -71,13 +95,9 @@ class MeshRenderer:
             cursor = spy.ShaderCursor(shader_object)
             cursor.sampler = self.sampler
             cursor.texture = mesh.texture
-            aspect = float(window_size[0]) / float(window_size[1])
-            camera_pos = [3, 3, 3]
-            cursor.proj = glm.perspective(glm.radians(60), aspect, 0.1, 10)
-            cursor.view = glm.lookAt(camera_pos, [0, 0, 0], [0, 1, 0])
-            t = time.perf_counter() - self.timer
-            offset = 0.2 * np.sin(2 * t)
-            cursor.model = glm.translate([0, offset, 0]) * glm.rotate(t, [0, 1, 0])
+            cursor.proj = proj_matrix
+            cursor.view = view_matrix
+            cursor.model = model_matrix
             cursor.cameraPos = camera_pos
 
             pass_encoder.set_render_state(
