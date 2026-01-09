@@ -4,7 +4,9 @@ import trimesh
 from PIL.Image import Image
 import threading
 
-class Pointcloud:
+from renderable import Renderable
+
+class Pointcloud(Renderable):
     """
     Pointcloud data representation for rendering.
     """
@@ -44,8 +46,10 @@ class Pointcloud:
                  image: np.ndarray=None,
                  sync_gpu: bool=False):
 
-        self.device = device
+        super().__init__(device)
         self.buffer_lock = threading.Lock()
+        self.renderer = None  # Will be set by PointcloudRenderer
+        self.vertices = positions  # Store for vertex count
 
         # Pending updates storage
         self._pending_data = {
@@ -95,10 +99,14 @@ class Pointcloud:
         Thread-safe: Call this from any thread to stage data for the next frame.
         """
         with self.buffer_lock:
-            self._pending_data['positions'] = positions
-            self._pending_data['normals'] = normals
-            self._pending_data['texcoords'] = texcoords
-            self._pending_data['image'] = image
+            if positions is not None:
+                self._pending_data['positions'] = positions
+            if normals is not None:
+                self._pending_data['normals'] = normals
+            if texcoords is not None:
+                self._pending_data['texcoords'] = texcoords
+            if image is not None:
+                self._pending_data['image'] = image
             self._is_dirty = True
 
 
@@ -111,6 +119,7 @@ class Pointcloud:
             # Re-use your existing logic but applied to the staged data
             if self._pending_data['positions'] is not None:
                 data = self._pending_data['positions']
+                self.vertices = data  # Update vertex count reference
                 if self.position_buffer is not None and self.position_buffer.size == data.nbytes:
                     self.position_buffer.copy_from_numpy(data)
                 else:
@@ -146,12 +155,36 @@ class Pointcloud:
                 self._pending_data['texcoords'] = None
 
             if self._pending_data['image'] is not None:
-                data = self._pending_data['image']
-                if self.texture is not None and self.texture.size == data.nbytes:
-                    self.texture.copy_from_numpy(data)
-                else:
-                    loader = spy.TextureLoader(self.device)
-                    self.texture = loader.load_texture(spy.Bitmap(self._pending_data['image']))
+                loader = spy.TextureLoader(self.device)
+                self.texture = loader.load_texture(spy.Bitmap(self._pending_data['image']))
                 self._pending_data['image'] = None
 
             self._is_dirty = False
+
+    def render(self, command_encoder: spy.CommandEncoder,
+               window_size: tuple[int, int],
+               output_texture: spy.Texture,
+               depth_texture: spy.Texture,
+               view_matrix: np.ndarray,
+               proj_matrix: np.ndarray,
+               camera_pos: list = None,
+               clear_color: list = None):
+        """
+        Render this pointcloud using its associated renderer.
+        """
+        if self.is_dirty:
+            self.sync_gpu()
+
+        if self.renderer is not None:
+            self.renderer.render(
+                command_encoder,
+                self,
+                window_size,
+                output_texture,
+                depth_texture,
+                view_matrix,
+                proj_matrix,
+                self.pose,
+                camera_pos,
+                clear_color
+            )

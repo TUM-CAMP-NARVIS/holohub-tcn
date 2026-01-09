@@ -69,6 +69,7 @@ class StreamMergerOp(Operator):
             out_message = dict()
             with cp.cuda.ExternalStream(output_stream):
                 for name, buffer in all_messages:
+                    # @todo: shouldn't name be sufficient in this case (instead of composing message_name)??
                     camera_name = self.ctx_service.get_camera_name_from_port_name(name)
                     message_name = f"{camera_name}_{self.output_message_name}"
                     di_tensor = hs.as_tensor(buffer)
