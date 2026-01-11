@@ -2,6 +2,8 @@ from abc import ABC, abstractmethod
 from typing import Optional
 import numpy as np
 import slangpy as spy
+from holoscan.pose_tree import Pose3
+from operators.tcn_artekmed.tcn_util.helpers import pose3_to_matrix4x4
 
 
 class Renderable(ABC):
@@ -29,7 +31,9 @@ class Renderable(ABC):
     def pose(self, value):
         """Set the 4x4 transformation matrix for this object."""
         # Handle glm.mat4x4 objects
-        if hasattr(value, 'to_list'):
+        if isinstance(value, Pose3):
+            self._pose = pose3_to_matrix4x4(value)
+        elif hasattr(value, 'to_list'):
             # Convert glm matrix to numpy array
             matrix_list = value.to_list()
             # glm uses column-major order, convert to row-major for numpy
@@ -78,8 +82,9 @@ class Renderable(ABC):
                depth_texture: spy.Texture,
                view_matrix: np.ndarray,
                proj_matrix: np.ndarray,
-               camera_pos: list = None,
-               clear_color: list = None):
+               clear_color: list = None,
+               extra_args: dict = None,
+               ):
         """
         Render this object.
         Called from the rendering thread during the render loop.
@@ -91,7 +96,7 @@ class Renderable(ABC):
             depth_texture: Depth buffer for depth testing
             view_matrix: Camera view matrix (4x4)
             proj_matrix: Camera projection matrix (4x4)
-            camera_pos: Camera position [x, y, z]
             clear_color: RGBA clear color, or None to skip clearing
+            extra_args: Optional: Additional arguments for rendering customization
         """
         pass

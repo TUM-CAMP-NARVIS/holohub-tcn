@@ -31,7 +31,7 @@ __global__ void backprojection_u16_kernel(BackProjectionParams bp) {
 
       if (bp.texcoords_enabled && bp.texcoords) {
         // transform to color camera space and project
-        float3 p_color; transform_point_matrix(p_color, p, bp.color_to_depth);
+        float3 p_color; transform_point_matrix(p_color, p, bp.depth_to_color);
         if (bp.color_params.is_distorted)
           project_point_to_image_plane_distorted(out_uv, p_color, bp.color_params);
         else
@@ -50,8 +50,8 @@ __global__ void backprojection_u16_kernel(BackProjectionParams bp) {
     bp.positions[3 * idx + 2] = out_pos.z;
 
     if (bp.texcoords_enabled && bp.texcoords) {
-      bp.texcoords[2 * idx + 0] = out_uv.x;
-      bp.texcoords[2 * idx + 1] = out_uv.y;
+      bp.texcoords[2 * idx + 0] = out_uv.x / bp.color_width;
+      bp.texcoords[2 * idx + 1] = out_uv.y / bp.color_height;
     }
   }
 

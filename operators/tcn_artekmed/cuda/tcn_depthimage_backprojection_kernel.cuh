@@ -11,11 +11,13 @@ struct BackProjectionParams {
   float* depth_float;         // [H*W]
   int width;
   int height;
+  int color_width;
+  int color_height;
   float depth_units_per_meter;
   float near_limit_m;
   float far_limit_m;
   CameraParameters color_params;
-  float4x4 color_to_depth;   // maps depth->color space
+  float4x4 depth_to_color;   // maps depth->color space
   float4x4 depth_extrinsics; // maps depth->world (or desired output space)
   bool positions_enabled;
   bool texcoords_enabled;

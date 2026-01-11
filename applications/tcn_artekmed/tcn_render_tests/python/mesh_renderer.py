@@ -55,8 +55,8 @@ class MeshRenderer:
         view_matrix: np.ndarray,
         proj_matrix: np.ndarray,
         model_matrix: np.ndarray,
-        camera_pos: list = None,
         clear_color: list = None,
+        extra_args: dict = None,
     ):
         """
         Render a mesh with the given transformation matrices.
@@ -70,18 +70,16 @@ class MeshRenderer:
             view_matrix: Camera view matrix (4x4)
             proj_matrix: Camera projection matrix (4x4)
             model_matrix: Object pose/model matrix (4x4)
-            camera_pos: Camera position [x, y, z], defaults to [0, 0, 0]
             clear_color: RGBA clear color, or None to skip clearing
+            extra_args: Optional: Additional arguments for rendering customization
         """
-        if camera_pos is None:
-            camera_pos = [0, 0, 0]
 
         with command_encoder.begin_render_pass(
             {
                 "color_attachments": [
                     {
                         "view": output_texture.create_view(),
-                        "clear_value": clear_color if clear_color else [0.1, 0.2, 0.3, 1.0],
+                        "clear_value": clear_color if clear_color else [0.3, 0.0, 0.0, 1.0],
                         "load_op": spy.LoadOp.clear if clear_color else spy.LoadOp.load,
                     }
                 ],
@@ -98,7 +96,9 @@ class MeshRenderer:
             cursor.proj = proj_matrix
             cursor.view = view_matrix
             cursor.model = model_matrix
-            cursor.cameraPos = camera_pos
+            for k, v in extra_args.items():
+                if hasattr(cursor, k):
+                    setattr(cursor, k, v)
 
             pass_encoder.set_render_state(
                 {

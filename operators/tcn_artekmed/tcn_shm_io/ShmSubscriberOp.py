@@ -32,6 +32,9 @@ from holoscan.core import Operator, OperatorSpec
 from holoscan.operators import HolovizOp
 from holoscan.operators import holoviz
 
+from tcnart.core.semantic_type import SemanticType
+from tcnart.core.semantic_type.model import ImageFormatTypes
+
 
 class ShmSubscriberOp(Operator):
     """Simple zenoh subscriber.
@@ -66,6 +69,11 @@ class ShmSubscriberOp(Operator):
         self.future_ = None  # will be set during start()
         self.async_cond_ = AsynchronousCondition(fragment, name="async_cond")
         self.buffer = queue.Queue()
+
+        self.channel_semantic_types = {
+            v['name']: SemanticType(v['status']['bufferInfo']['semanticType']) for v in channel_config['ports']
+        }
+        log.info(f"Channel semantic types: {self.channel_semantic_types}")
 
         # Need to call the base class constructor last
         super().__init__(fragment, cuda_stream_pool, self.async_cond_, *args, **kwargs)
@@ -172,8 +180,13 @@ class ShmSubscriberOp(Operator):
             view.height = tile_size
             views.append(view)
             spec.views = views
-            # hardcoded ..
-            spec.image_format = holoviz._holoviz_str_to_image_format["b8g8r8a8_unorm"]
+            st = self.channel_semantic_types[port_name]
+            if st.content_type.get_format_type() == ImageFormatTypes.Rgba:
+                spec.image_format = holoviz._holoviz_str_to_image_format["r8g8b8a8_unorm"]
+            elif st.content_type.get_format_type() == ImageFormatTypes.Bgra:
+                spec.image_format = holoviz._holoviz_str_to_image_format["b8g8r8a8_unorm"]
+            else:
+                log.warning(f"Unsupported format type: {st.content_type.get_format_type()}")
             color_output_specs.append(spec)
 
         op_output.emit(color_output_specs, "color_output_specs", acq_timestamp=ts)

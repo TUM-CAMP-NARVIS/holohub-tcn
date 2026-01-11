@@ -42,6 +42,8 @@ class ShmSimpleBackprojectionSubgraph(Subgraph):
         log.info("Compose subgraph: ShmSimpleBackprojection")
         app = self.fragment.application
 
+        # @todo: do not use app.kwargs directly, but pass the relevant dictionary or subtree to the subgraph explicitly
+
         # read configuration
         camera_streams_config = app.kwargs("camera_stream_processing")
         cuda_device_id = camera_streams_config.get("device_id", 0)
@@ -144,7 +146,6 @@ class ShmSimpleBackprojectionSubgraph(Subgraph):
         self.add_flow(subscriber_op, split_op, {("depth_outputs", "receivers")})
 
         log.info("define per depthimage processing pipeline")
-        sink_ops = []
 
         position_merge_connections = []
         texcoord_merge_connections = []
@@ -166,7 +167,6 @@ class ShmSimpleBackprojectionSubgraph(Subgraph):
                     name=f"{camera_name}_temporal_filter",
                     **app.kwargs("depthimage_temporal_filter"),
                 )
-                sink_ops.append(ditf_op)
                 self.add_flow(split_op, ditf_op, {
                     (channel_name, "input"),
                 })
@@ -179,7 +179,6 @@ class ShmSimpleBackprojectionSubgraph(Subgraph):
                                             name=f"xylt_loader_{camera_name}",
                                             camera_name=camera_name,
                                             )
-            sink_ops.append(xylt_op)
 
             log.info(f"create backprojection: {camera_name}")
             bp_op = TcnDepthImageBackprojectionOp(
@@ -188,20 +187,18 @@ class ShmSimpleBackprojectionSubgraph(Subgraph):
                 allocator=device_memory_pool,
                 color_image_width=color_params.dimensions.x,
                 color_image_height=color_params.dimensions.y,
-                color_params=ctx_service.get_depth_camera_model(camera_name),
+                color_params=ctx_service.get_color_camera_model(camera_name),
                 depth_extrinsics=ctx_service.get_depth_extrinsics(camera_name),
-                color_to_depth=ctx_service.get_color_to_depth(camera_name),
-                # out_tensor_name=camera_name,
+                depth_to_color=ctx_service.get_color_to_depth_inv(camera_name),
                 in_tensor_name="",
                 out_tensor_name="output",
                 enable_positions=True,
-                enable_texcoords=camera_streams_config.get("enable_warp_colorimage", False),
+                enable_texcoords=True,
                 enable_depth_float=False,
                 cuda_device_ordinal=cuda_device_id,
                 name=f"{camera_name}_backprojection",
                 **app.kwargs("depthimage_backprojection")
                 )
-            sink_ops.append(bp_op)
 
             self.add_flow(prev_op, bp_op, {
                 (prev_output, "depth_image"),
