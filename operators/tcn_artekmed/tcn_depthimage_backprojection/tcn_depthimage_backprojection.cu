@@ -44,10 +44,10 @@ void TcnDepthImageBackprojectionOp::setup(holoscan::OperatorSpec& spec) {
              "depth_extrinsics",
              "Depth Camera Extrinsics",
              "Camera Pose of the Depth Sensor.");
-  spec.param(color_to_depth_,
-              "color_to_depth",
-              "Color to Depth Sensor Transform",
-              "Tranform from Camera to Depth Sensor");
+  spec.param(depth_to_color_,
+              "depth_to_color",
+              "Depth to Color Sensor Transform",
+              "Tranform from Depth to Color Sensor");
   spec.param(color_params_,
              "color_params",
              "Color Camera Parameters",
@@ -130,7 +130,7 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
   }
 
   auto& cp_t = color_params_.get();
-  auto& c2d_t = color_to_depth_.get();
+  auto& d2c_t = depth_to_color_.get();
   auto& de_t = depth_extrinsics_.get();
 
   const auto& depth_shape = depth_t->shape();  // [H,W]
@@ -145,8 +145,8 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
   auto* depth_ptr = static_cast<uint16_t*>(depth_t->data());
   auto* xy_ptr = static_cast<float*>(xylookup_table_tensor_->data());
 
-  Eigen::Matrix4f color_to_depth;
-  c2d_t.toMatrix4f(color_to_depth);
+  Eigen::Matrix4f depth_to_color;
+  d2c_t.toMatrix4f(depth_to_color);
 
   Eigen::Matrix4f depth_extrinsics;
   de_t.toMatrix4f(depth_extrinsics);
@@ -168,9 +168,7 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
   color_params.k6 = cp_t.distortion_coefficients[7];
   color_params.codx = 0;
   color_params.cody = 0;
-  color_params.is_distorted = true;
-
-  // Matrices (float32[4,4])
+  color_params.is_distorted = false;
 
   // Allocate Holoscan outputs (device)
   auto gxf_context = context.context();
@@ -270,11 +268,13 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
   params.depth_float = dmf_ptr;
   params.width = W;
   params.height = H;
+  params.color_width = cp_t.dimensions.x;
+  params.color_height = cp_t.dimensions.y;
   params.depth_units_per_meter = depth_units_per_meter_;
   params.near_limit_m = near_limit_m_;
   params.far_limit_m = far_limit_m_;
   params.color_params = color_params;
-  params.color_to_depth = float4x4Cast(color_to_depth);
+  params.depth_to_color = float4x4Cast(depth_to_color);
   params.depth_extrinsics = float4x4Cast(depth_extrinsics);
   params.positions_enabled = positions_output_enabled_;
   params.texcoords_enabled = texcoords_output_enabled_;

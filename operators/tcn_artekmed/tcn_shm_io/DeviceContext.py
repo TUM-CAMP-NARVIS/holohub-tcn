@@ -148,6 +148,15 @@ class DeviceContextService(DefaultFragmentService):
         params = calib["color2depthTransform"]
         return self._pose3d_from_dict(params)
 
+    def get_color_to_depth_inv(self, camera_name: str) -> Optional[RigidTransform]:
+        calib = self.get_device_calibration(camera_name)
+        if calib is None:
+            return None
+        if "color2depthTransform" not in calib:
+            log.error(f"no color2depthTransform found for camera_name: {camera_name}")
+            return None
+        params = calib["color2depthTransform"]
+        return self._pose3d_inverse_from_dict(params)
 
     def _pose3d_from_dict(self, params) -> Optional[RigidTransform]:
         return make_rigid_transform(
@@ -164,3 +173,17 @@ class DeviceContextService(DefaultFragmentService):
             ])
         )
 
+    def _pose3d_inverse_from_dict(self, params) -> Optional[RigidTransform]:
+        return make_rigid_transform(
+            np.asarray([
+                -params["translation"]["x"],
+                -params["translation"]["y"],
+                -params["translation"]["z"],
+            ]),
+            np.asarray([
+                -params["rotation"]["x"],
+                -params["rotation"]["y"],
+                -params["rotation"]["z"],
+                params["rotation"]["w"],
+            ])
+        )

@@ -33,7 +33,7 @@ class TcnDepthImageBackprojectionOp : public holoscan::Operator {
   holoscan::Parameter<int> color_image_height_;
   holoscan::Parameter<nvidia::gxf::CameraModel> color_params_;
   holoscan::Parameter<RigidTransform> depth_extrinsics_;
-  holoscan::Parameter<RigidTransform> color_to_depth_;
+  holoscan::Parameter<RigidTransform> depth_to_color_;
   holoscan::Parameter<std::string> in_tensor_name_;
   holoscan::Parameter<std::string> out_tensor_name_;
   holoscan::Parameter<bool> enable_positions_;

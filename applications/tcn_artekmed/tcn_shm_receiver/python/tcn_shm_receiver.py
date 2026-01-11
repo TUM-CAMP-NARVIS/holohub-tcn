@@ -35,6 +35,9 @@ from holoscan.schedulers import EventBasedScheduler, GreedyScheduler
 
 from holoscan.pose_tree import PoseTreeManager, SO3
 
+from tcnart.core.semantic_type import SemanticType
+from tcnart.core.semantic_type.model import ImageFormatTypes
+
 log = logging.getLogger(__name__)
 
 def to_holoviz_pose(pose : Pose3) -> holoviz.Pose3D:
@@ -137,6 +140,9 @@ class App(hs.core.Application):
 
         log.info(f"Retrieve channel config for stream: {shm_stream_name}")
         channels_config = shm_receiver.retrieve_channel_config(shm_stream_name)
+        channel_semantic_types = {
+            v['name']: SemanticType(v['status']['bufferInfo']['semanticType']) for v in channels_config['ports']
+        }
 
         depth_streams_config = []
         color_streams_config = []
@@ -274,7 +280,13 @@ class App(hs.core.Application):
                 view.height = warped_color_tile_size
                 views.append(view)
                 spec.views = views
-                spec.image_format = holoviz._holoviz_str_to_image_format["b8g8r8a8_unorm"]
+                st = channel_semantic_types[f"{camera_name}_colorimage"]
+                if st.content_type.get_format_type() == ImageFormatTypes.Rgba:
+                    spec.image_format = holoviz._holoviz_str_to_image_format["r8g8b8a8_unorm"]
+                elif st.content_type.get_format_type() == ImageFormatTypes.Bgra:
+                    spec.image_format = holoviz._holoviz_str_to_image_format["b8g8r8a8_unorm"]
+                else:
+                    log.warning(f"Unsupported format type: {st.content_type.get_format_type()}")
                 warped_color_output_specs.append(spec)
 
             warped_color_visualizer = HolovizOp(
@@ -377,9 +389,9 @@ class App(hs.core.Application):
                 allocator=device_memory_pool,
                 color_image_width=color_params.dimensions.x,
                 color_image_height=color_params.dimensions.y,
-                color_params=ctx_service.get_depth_camera_model(camera_name),
+                color_params=ctx_service.get_color_camera_model(camera_name),
                 depth_extrinsics=ctx_service.get_depth_extrinsics(camera_name),
-                color_to_depth=ctx_service.get_color_to_depth(camera_name),
+                depth_to_color=ctx_service.get_color_to_depth_inv(camera_name),
                 # out_tensor_name=camera_name,
                 in_tensor_name="",
                 out_tensor_name="output",
