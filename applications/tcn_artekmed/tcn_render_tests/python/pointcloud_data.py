@@ -213,6 +213,9 @@ class Pointcloud(Renderable):
             if self.is_dirty:
                 self.sync_gpu(command_encoder)
 
+            extra_args["depthWidth"] = self.vertices.shape[1]
+            extra_args["depthHeight"] = self.vertices.shape[0]
+
             if self.renderer is not None:
                 self.renderer.render(
                     command_encoder,
