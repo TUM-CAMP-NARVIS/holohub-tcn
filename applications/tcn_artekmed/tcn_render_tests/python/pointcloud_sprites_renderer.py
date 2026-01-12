@@ -103,7 +103,9 @@ class PointcloudSpritesRenderer:
                 ],
                 "depth_stencil_attachment": {
                     "view": depth_texture.create_view(),
+                    "depth_clear_value": 1.0,
                     "depth_load_op": spy.LoadOp.clear if clear_color else spy.LoadOp.load,
+                    "depth_store_op": spy.StoreOp.store,
                 },
             }
         ) as pass_encoder:
@@ -155,8 +157,8 @@ class PointcloudSpritesRenderer:
             cursor.activateAdditionalBox = extra_args.get('activateAdditionalBox', False)
 
             # TODO: Get from pointcloud source
-            # cursor.depthWidth = extra_args.get('depthWidth', ???)
-            # cursor.depthHeight = extra_args.get('depthHeight', ???)
+            cursor.depthWidth = extra_args.get('depthWidth', 0)
+            cursor.depthHeight = extra_args.get('depthHeight', 0)
 
             # Note: This shader doesn't use vertex buffers in the traditional sense
             # The geometry shader reads from a StructuredBuffer instead
