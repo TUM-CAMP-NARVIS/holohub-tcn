@@ -25,5 +25,8 @@ target_link_libraries(tcn_render_tests INTERFACE
     holoscan::core
     holoscan::ops::format_converter
     holoscan::ops::holoviz
+    holoscan::ops::tcn_depthimage_backprojection
+    holoscan::ops::tcn_depthimage_temporal_filter
+    holoscan::ops::tcn_texture_sampler
     #holoscan::ops::slang_shader
 )
