@@ -11,7 +11,6 @@ from holoscan.resources import BlockMemoryPool, MemoryStorageType
 
 from holohub.tcn_depthimage_backprojection import TcnDepthImageBackprojectionOp
 from holohub.tcn_depthimage_temporal_filter import TcnDepthImageTemporalFilterOp
-from holohub.tcn_depthimage_weights import TcnDepthImageWeightsOp
 from holohub.tcn_texture_sampler import TcnTextureSamplerOp
 from holohub.tcn_depthimage_backprojection._tcn_depthimage_backprojection import CameraModel, DistortionType, \
     RigidTransform, CameraParameters, make_rigid_transform

@@ -26,6 +26,9 @@ add_holohub_application(tcn_shm_receiver DEPENDS OPERATORS
                           )
 
 add_holohub_application(tcn_render_tests DEPENDS OPERATORS
-        tcn_slang_renderer
+        #tcn_slang_renderer
+        tcn_depthimage_backprojection
+        tcn_depthimage_temporal_filter
+        tcn_texture_sampler
         #slang_shader
 )

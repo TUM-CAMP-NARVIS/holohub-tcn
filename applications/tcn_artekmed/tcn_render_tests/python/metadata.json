@@ -43,7 +43,7 @@
 				"requirements": [],
 				"run": {
 					"command":
-            "python3 <holohub_app_source>/tcn_shm_receiver.py"
+            "python3 <holohub_app_source>/tcn_render_tests.py"
           ,
 					"workdir": "holohub_bin"
 				}

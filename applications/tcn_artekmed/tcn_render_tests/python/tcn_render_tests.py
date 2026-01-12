@@ -32,6 +32,7 @@ from operators.tcn_artekmed.tcn_processing import ShmSimpleBackprojectionSubgrap
 from operators.tcn_artekmed.tcn_util.helpers import pose3_to_matrix4x4
 
 from pointcloud_renderer import PointcloudRenderer, Pointcloud
+from pointcloud_sprites_renderer import PointcloudSpritesRenderer
 from colored_mesh_renderer import ColoredMeshRenderer, ColoredMesh
 from mesh_renderer import MeshRenderer, Mesh
 
@@ -61,7 +62,10 @@ class SlangWindow:
             enable_debug_layers=True,
             enable_cuda_interop=True,
             existing_device_handles=device_handle,
-            compiler_options={"include_paths": [str(asset_root_dir / "shaders")]},
+            compiler_options={"include_paths": [
+                str(asset_root_dir / "shaders"),
+                os.path.join(os.path.dirname(spy.__file__), "slang"),
+            ]},
         )
 
         self.surface = self.device.create_surface(self.window)
@@ -70,6 +74,7 @@ class SlangWindow:
         # Create renderers (stateless, shared by all renderables)
         self.mesh_renderer = MeshRenderer(self.device, self.surface.config.format)
         self.pointcloud_renderer = PointcloudRenderer(self.device, self.surface.config.format)
+        self.pointcloud_sprites_renderer = PointcloudSpritesRenderer(self.device, self.surface.config.format)
         self.colored_mesh_renderer = ColoredMeshRenderer(self.device, self.surface.config.format)
 
         # Scene management
@@ -153,7 +158,8 @@ class SlangWindow:
         if isinstance(renderable, Mesh):
             renderable.renderer = self.mesh_renderer
         elif isinstance(renderable, Pointcloud):
-            renderable.renderer = self.pointcloud_renderer
+            # renderable.renderer = self.pointcloud_renderer
+            renderable.renderer = self.pointcloud_sprites_renderer
         elif isinstance(renderable, ColoredMesh):
             renderable.renderer = self.colored_mesh_renderer
 
@@ -320,7 +326,7 @@ class SlangWindow:
                     continue
 
                 # Clear on first render only
-                clear_color = [0.2, 0.2, 0.2, 1.0] if first_render else None
+                clear_color = [0., 0., 0., 1.0] if first_render else None
 
                 # Use the render method from the renderable (which delegates to its renderer)
                 renderable.render(
