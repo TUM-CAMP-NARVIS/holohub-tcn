@@ -45,30 +45,25 @@ class PointcloudRenderer:
 
     def render(
         self,
-        command_encoder: spy.CommandEncoder,
+        pass_encoder: spy.RenderPassEncoder,
         pointcloud: Pointcloud,
         window_size: tuple[int, int],
-        output_texture: spy.Texture,
-        depth_texture: spy.Texture,
         view_matrix: np.ndarray,
         proj_matrix: np.ndarray,
-               model_matrix: np.ndarray,
-        clear_color: list = None,
+        model_matrix: np.ndarray,
         extra_args: dict = None,
     ):
         """
         Render a pointcloud with the given transformation matrices.
+        Note: This method expects to be called within an active render pass.
 
         Args:
-            command_encoder: Slang command encoder
+            pass_encoder: Active render pass encoder
             pointcloud: Pointcloud object to render
             window_size: (width, height) tuple
-            output_texture: Target texture
-            depth_texture: Depth buffer
             view_matrix: Camera view matrix (4x4)
             proj_matrix: Camera projection matrix (4x4)
             model_matrix: Object pose/model matrix (4x4)
-            clear_color: RGBA clear color, or None to skip clearing
             extra_args: Optional: Additional arguments for rendering customization
         """
 
@@ -77,40 +72,27 @@ class PointcloudRenderer:
             log.debug(f"Pointcloud is incomplete..")
             return
 
-        with command_encoder.begin_render_pass(
-            {
-                "color_attachments": [
-                    {
-                        "view": output_texture.create_view(),
-                        "clear_value": clear_color if clear_color else [0.2, 0.2, 0.2, 1.0],
-                        "load_op": spy.LoadOp.clear if clear_color else spy.LoadOp.load,
-                    }
-                ],
-                "depth_stencil_attachment": {
-                    "view": depth_texture.create_view(),
-                    "depth_load_op": spy.LoadOp.clear if clear_color else spy.LoadOp.load,
-                },
-            }
-        ) as pass_encoder:
-            shader_object = pass_encoder.bind_pipeline(self.pipeline)
-            cursor = spy.ShaderCursor(shader_object)
-            cursor.sampler = self.sampler
-            cursor.texture = pointcloud.texture
-            cursor.proj = proj_matrix
-            cursor.view = view_matrix
-            cursor.model = model_matrix
+        shader_object = pass_encoder.bind_pipeline(self.pipeline)
+        cursor = spy.ShaderCursor(shader_object)
+        cursor.sampler = self.sampler
+        cursor.texture = pointcloud.texture
+        cursor.proj = proj_matrix
+        cursor.view = view_matrix
+        cursor.model = model_matrix
+
+        if extra_args:
             for k, v in extra_args.items():
-                if hasattr(cursor, k):
+                if cursor.has_field(k):
                     setattr(cursor, k, v)
 
-            pass_encoder.set_render_state(
-                {
-                    "viewports": [spy.Viewport.from_size(*window_size)],
-                    "scissor_rects": [spy.ScissorRect.from_size(*window_size)],
-                    "vertex_buffers": [
-                        pointcloud.position_buffer,
-                        pointcloud.uv_buffer,
-                    ],
-                }
-            )
-            pass_encoder.draw({"vertex_count": pointcloud.vertices.size})
+        pass_encoder.set_render_state(
+            {
+                "viewports": [spy.Viewport.from_size(*window_size)],
+                "scissor_rects": [spy.ScissorRect.from_size(*window_size)],
+                "vertex_buffers": [
+                    pointcloud.position_buffer,
+                    pointcloud.uv_buffer,
+                ],
+            }
+        )
+        pass_encoder.draw({"vertex_count": pointcloud.vertices.size})

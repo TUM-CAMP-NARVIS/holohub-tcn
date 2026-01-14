@@ -2,6 +2,7 @@ import os
 import pathlib
 from typing import Any, List
 import logging
+import numpy as np
 
 from holoscan.core import Subgraph
 from holoscan.conditions import CountCondition
@@ -33,8 +34,9 @@ def convert_rigid_transform_to_pose3(input: RigidTransform) -> Pose3:
 class ShmSimpleBackprojectionSubgraph(Subgraph):
     """Subgraph containing the shm-receiver and backprojection pipeline."""
 
-    def __init__(self, fragment, name, fuse_buffers=False):
+    def __init__(self, fragment, name, fuse_buffers=False, use_extrinsics=True):
         self.fuse_buffers = fuse_buffers
+        self.use_extrinsics = use_extrinsics
         super().__init__(fragment, name)
 
     def compose(self):
@@ -187,7 +189,7 @@ class ShmSimpleBackprojectionSubgraph(Subgraph):
                 color_image_width=color_params.dimensions.x,
                 color_image_height=color_params.dimensions.y,
                 color_params=ctx_service.get_color_camera_model(camera_name),
-                depth_extrinsics=ctx_service.get_depth_extrinsics(camera_name),
+                depth_extrinsics=self.use_extrinsics and ctx_service.get_depth_extrinsics(camera_name) or make_rigid_transform(np.zeros(3), np.asarray([0., 0., 0., 1.])),
                 depth_to_color=ctx_service.get_color_to_depth_inv(camera_name),
                 in_tensor_name="",
                 out_tensor_name="output",
