@@ -326,6 +326,13 @@ void geometry_main(
 
 [shader("fragment")]
 float4 fragment_main(GeometryToFragment input) : SV_Target {
+
+    // discard the points that have no texture..
+    if (input.uv.x <= 0. || input.uv.x > 1. || input.uv.y <= 0. || input.uv.y > 1.0) {
+        //return float4(0., 0., 1., 0.);
+        discard;
+    }
+
     if (enableClipping > 0.5f) {
         float3 pos = vertices[input.vid];
         float4 origin = mul(transform, float4(pos, 1.0));

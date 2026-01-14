@@ -40,14 +40,14 @@ float4 fragment_main(VertexOutput input) : SV_Target {
 
     // discard the points that have no texture..
     if (input.uv.x <= 0. || input.uv.x > 1. || input.uv.y <= 0. || input.uv.y > 1.0) {
-        //return float4(0., 0., 1., 1.);
-        discard;
+        return float4(0., 0., 1., 0.);
+        //discard;
     }
 
     if (renderStaticColor) {
         return float4(0.8, 0., 0., 1.);
     } else {
         float4 texColor = texture.Sample(sampler, input.uv);
-        return float4(texColor.rgb, texColor.a);
+        return float4(texColor.rgb, 1.0);
     }
 }

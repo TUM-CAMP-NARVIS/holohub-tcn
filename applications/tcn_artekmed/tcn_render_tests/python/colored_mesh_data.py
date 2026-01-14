@@ -183,47 +183,49 @@ class ColoredMesh(Renderable):
         Call this once per frame from the main rendering thread
         before dispatching shaders.
         """
-        if self._pending_data['positions'] is not None:
-            data = self._pending_data['positions']
-            if self.position_buffer is not None and self.position_buffer.size == data.nbytes:
-                self.position_buffer.copy_from_numpy(data)
-            else:
-                self.position_buffer = self.device.create_buffer(
-                    size=data.nbytes,
-                    usage=spy.BufferUsage.vertex_buffer | spy.BufferUsage.shader_resource,
-                    data=data
-                )
-            self._pending_data['positions'] = None
+        with self.buffer_lock:
+            if self.is_dirty:
+                if self._pending_data['positions'] is not None:
+                    data = self._pending_data['positions']
+                    if self.position_buffer is not None and self.position_buffer.size == data.nbytes:
+                        self.position_buffer.copy_from_numpy(data)
+                    else:
+                        self.position_buffer = self.device.create_buffer(
+                            size=data.nbytes,
+                            usage=spy.BufferUsage.vertex_buffer | spy.BufferUsage.shader_resource,
+                            data=data
+                        )
+                    self._pending_data['positions'] = None
 
-        if self._pending_data['colors'] is not None:
-            data = self._pending_data['colors']
-            if self.color_buffer is not None and self.color_buffer.size == data.nbytes:
-                self.color_buffer.copy_from_numpy(data)
-            else:
-                self.color_buffer = self.device.create_buffer(
-                    size=data.nbytes,
-                    usage=spy.BufferUsage.vertex_buffer | spy.BufferUsage.shader_resource,
-                    data=data
-                )
-            self._pending_data['colors'] = None
+                if self._pending_data['colors'] is not None:
+                    data = self._pending_data['colors']
+                    if self.color_buffer is not None and self.color_buffer.size == data.nbytes:
+                        self.color_buffer.copy_from_numpy(data)
+                    else:
+                        self.color_buffer = self.device.create_buffer(
+                            size=data.nbytes,
+                            usage=spy.BufferUsage.vertex_buffer | spy.BufferUsage.shader_resource,
+                            data=data
+                        )
+                    self._pending_data['colors'] = None
 
-        if self._pending_data['indices'] is not None:
-            data = self._pending_data['indices']
-            self.index_count = data.size
-            if self.index_buffer is not None and self.index_buffer.size == data.nbytes:
-                self.index_buffer.copy_from_numpy(data)
-            else:
-                self.index_buffer = self.device.create_buffer(
-                    size=data.nbytes,
-                    usage=spy.BufferUsage.index_buffer | spy.BufferUsage.shader_resource,
-                    data=data
-                )
-            self._pending_data['indices'] = None
+                if self._pending_data['indices'] is not None:
+                    data = self._pending_data['indices']
+                    self.index_count = data.size
+                    if self.index_buffer is not None and self.index_buffer.size == data.nbytes:
+                        self.index_buffer.copy_from_numpy(data)
+                    else:
+                        self.index_buffer = self.device.create_buffer(
+                            size=data.nbytes,
+                            usage=spy.BufferUsage.index_buffer | spy.BufferUsage.shader_resource,
+                            data=data
+                        )
+                    self._pending_data['indices'] = None
 
-        self._is_dirty = False
+                self._is_dirty = False
 
     def render(self,
-               command_encoder: spy.CommandEncoder,
+               pass_encoder: spy.RenderPassEncoder,
                window_size: tuple[int, int],
                output_texture: spy.Texture,
                depth_texture: spy.Texture,
@@ -235,20 +237,16 @@ class ColoredMesh(Renderable):
         """
         Render this reference frame using its associated renderer.
         """
-        with self.buffer_lock:
-            if self.is_dirty:
-                self.sync_gpu()
-
-            if self.renderer is not None:
-                self.renderer.render(
-                    command_encoder,
-                    self,
-                    window_size,
-                    output_texture,
-                    depth_texture,
-                    view_matrix,
-                    proj_matrix,
-                    self.pose,
-                    clear_color,
-                    extra_args,
-                )
+        if self.renderer is not None:
+            self.renderer.render(
+                pass_encoder,
+                self,
+                window_size,
+                output_texture,
+                depth_texture,
+                view_matrix,
+                proj_matrix,
+                self.pose,
+                clear_color,
+                extra_args,
+            )

@@ -52,7 +52,7 @@ class Mesh(Renderable):
 
         # derive from indices.dtype?
         self.index_format = spy.IndexFormat.uint16
-        self.vertex_count = indices.size if indices is not None else 0
+        self.vertex_count = positions.size if positions is not None else 0
 
         self.position_buffer = None
         self.index_buffer = None
@@ -136,88 +136,81 @@ class Mesh(Renderable):
         Call this once per frame from the main rendering thread
         before dispatching shaders.
         """
-        if self._pending_data['positions'] is not None:
-            data = self._pending_data['positions']
-            if self.position_buffer is not None and self.position_buffer.size == data.nbytes:
-                self.position_buffer.copy_from_numpy(data)
-            else:
-                self.position_buffer = self.device.create_buffer(
-                    size=data.nbytes,
-                    usage=spy.BufferUsage.vertex_buffer | spy.BufferUsage.shader_resource,
-                    data=data
-                )
-            self._pending_data['positions'] = None
+        with self.buffer_lock:
+            if self.is_dirty:
+                if self._pending_data['positions'] is not None:
+                    data = self._pending_data['positions']
+                    if self.position_buffer is not None and self.position_buffer.size == data.nbytes:
+                        self.position_buffer.copy_from_numpy(data)
+                    else:
+                        self.position_buffer = self.device.create_buffer(
+                            size=data.nbytes,
+                            usage=spy.BufferUsage.vertex_buffer | spy.BufferUsage.shader_resource,
+                            data=data
+                        )
+                    self._pending_data['positions'] = None
 
-        if self._pending_data['indices'] is not None:
-            data = self._pending_data['indices']
-            self.vertex_count = data.size
-            if self.index_buffer is not None and self.index_buffer.size == data.nbytes:
-                self.index_buffer.copy_from_numpy(data)
-            else:
-                self.index_buffer = self.device.create_buffer(
-                    size=data.nbytes,
-                    usage=spy.BufferUsage.index_buffer | spy.BufferUsage.shader_resource,
-                    data=data
-                )
-            self._pending_data['indices'] = None
+                if self._pending_data['indices'] is not None:
+                    data = self._pending_data['indices']
+                    self.vertex_count = data.size
+                    if self.index_buffer is not None and self.index_buffer.size == data.nbytes:
+                        self.index_buffer.copy_from_numpy(data)
+                    else:
+                        self.index_buffer = self.device.create_buffer(
+                            size=data.nbytes,
+                            usage=spy.BufferUsage.index_buffer | spy.BufferUsage.shader_resource,
+                            data=data
+                        )
+                    self._pending_data['indices'] = None
 
-        if self._pending_data['normals'] is not None:
-            data = self._pending_data['normals']
-            if self.normal_buffer is not None and self.normal_buffer.size == data.nbytes:
-                self.normal_buffer.copy_from_numpy(data)
-            else:
-                self.normal_buffer = self.device.create_buffer(
-                    size=data.nbytes,
-                    usage=spy.BufferUsage.vertex_buffer | spy.BufferUsage.shader_resource,
-                    data=data
-                )
-            self._pending_data['normals'] = None
+                if self._pending_data['normals'] is not None:
+                    data = self._pending_data['normals']
+                    if self.normal_buffer is not None and self.normal_buffer.size == data.nbytes:
+                        self.normal_buffer.copy_from_numpy(data)
+                    else:
+                        self.normal_buffer = self.device.create_buffer(
+                            size=data.nbytes,
+                            usage=spy.BufferUsage.vertex_buffer | spy.BufferUsage.shader_resource,
+                            data=data
+                        )
+                    self._pending_data['normals'] = None
 
-        if self._pending_data['texcoords'] is not None:
-            data = self._pending_data['texcoords']
-            if self.uv_buffer is not None and self.uv_buffer.size == data.nbytes:
-                self.uv_buffer.copy_from_numpy(data)
-            else:
-                self.uv_buffer = self.device.create_buffer(
-                    size=data.nbytes,
-                    usage=spy.BufferUsage.vertex_buffer | spy.BufferUsage.shader_resource,
-                    data=data
-                )
-            self._pending_data['texcoords'] = None
+                if self._pending_data['texcoords'] is not None:
+                    data = self._pending_data['texcoords']
+                    if self.uv_buffer is not None and self.uv_buffer.size == data.nbytes:
+                        self.uv_buffer.copy_from_numpy(data)
+                    else:
+                        self.uv_buffer = self.device.create_buffer(
+                            size=data.nbytes,
+                            usage=spy.BufferUsage.vertex_buffer | spy.BufferUsage.shader_resource,
+                            data=data
+                        )
+                    self._pending_data['texcoords'] = None
 
-        if self._pending_data['image'] is not None:
-            loader = spy.TextureLoader(self.device)
-            self.texture = loader.load_texture(spy.Bitmap(self._pending_data['image']))
-            self._pending_data['image'] = None
+                if self._pending_data['image'] is not None:
+                    loader = spy.TextureLoader(self.device)
+                    self.texture = loader.load_texture(spy.Bitmap(self._pending_data['image']))
+                    self._pending_data['image'] = None
 
-        self._is_dirty = False
+                self._is_dirty = False
 
-    def render(self, command_encoder: spy.CommandEncoder,
+    def render(self,
+               pass_encoder: spy.RenderPassEncoder,
                window_size: tuple[int, int],
-               output_texture: spy.Texture,
-               depth_texture: spy.Texture,
                view_matrix: np.ndarray,
                proj_matrix: np.ndarray,
-               clear_color: list = None,
                extra_args: dict = None,
                ):
         """
         Render this mesh using its associated renderer.
         """
-        with self.buffer_lock:
-            if self.is_dirty:
-                self.sync_gpu()
-
-            if self.renderer is not None:
-                self.renderer.render(
-                    command_encoder,
-                    self,
-                    window_size,
-                    output_texture,
-                    depth_texture,
-                    view_matrix,
-                    proj_matrix,
-                    self.pose,
-                    clear_color,
-                    extra_args,
-                )
+        if self.renderer is not None:
+            self.renderer.render(
+                pass_encoder,
+                self,
+                window_size,
+                view_matrix,
+                proj_matrix,
+                self.pose,
+                extra_args,
+            )

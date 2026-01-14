@@ -76,27 +76,21 @@ class Renderable(ABC):
         pass
 
     @abstractmethod
-    def render(self, command_encoder: spy.CommandEncoder,
+    def render(self, pass_encoder: spy.RenderPassEncoder,
                window_size: tuple[int, int],
-               output_texture: spy.Texture,
-               depth_texture: spy.Texture,
                view_matrix: np.ndarray,
                proj_matrix: np.ndarray,
-               clear_color: list = None,
                extra_args: dict = None,
                ):
         """
-        Render this object.
+        Render this object within an active render pass.
         Called from the rendering thread during the render loop.
 
         Args:
-            command_encoder: Slang command encoder for GPU commands
+            pass_encoder: Active render pass encoder
             window_size: (width, height) of the render target
-            output_texture: Target texture to render into
-            depth_texture: Depth buffer for depth testing
             view_matrix: Camera view matrix (4x4)
             proj_matrix: Camera projection matrix (4x4)
-            clear_color: RGBA clear color, or None to skip clearing
             extra_args: Optional: Additional arguments for rendering customization
         """
         pass
