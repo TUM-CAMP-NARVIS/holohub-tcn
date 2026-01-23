@@ -543,12 +543,12 @@ class App(hs.core.Application):
 
 def main(config_file=None):
     # make configurable or use holoscan debug level here too
-    configure_debug = False
+    configure_debug = True
 
     if configure_debug:
         logging.basicConfig(level=logging.DEBUG)
         set_log_level(LogLevel.DEBUG)
-        iox2.set_log_level(iox2.LogLevel.Warn)
+        iox2.set_log_level(iox2.LogLevel.Trace)
     else:
         logging.basicConfig(level=logging.INFO)
         set_log_level(LogLevel.INFO)

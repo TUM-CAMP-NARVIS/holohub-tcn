@@ -58,6 +58,7 @@ RUN apt-get update \
       libxkbcommon-x11-0 \
       libx11-6 \
       libxcb1 \
+      libxcb-dri2-0 \
       libxrender1 \
       libxkbcommon0 \
       libglu1-mesa \
@@ -79,6 +80,30 @@ RUN apt-get update \
       libglu1-mesa-dev \
       pkg-config \
       ninja-build \
+      libfontconfig1-dev \
+      libfreetype-dev \
+      libx11-dev \
+      libx11-xcb-dev \
+      libxcb-cursor-dev \
+      libxcb-glx0-dev \
+      libxcb-icccm4-dev \
+      libxcb-image0-dev \
+      libxcb-keysyms1-dev \
+      libxcb-randr0-dev \
+      libxcb-render-util0-dev \
+      libxcb-shape0-dev \
+      libxcb-shm0-dev \
+      libxcb-sync-dev \
+      libxcb-util-dev \
+      libxcb-xfixes0-dev \
+      libxcb-xkb-dev \
+      libxcb1-dev \
+      libxext-dev \
+      libxfixes-dev \
+      libxi-dev \
+      libxkbcommon-dev \
+      libxkbcommon-x11-dev \
+      libxrender-dev \
     && apt-get autoremove -y \
     && apt-get clean -y \
     && rm -rf /var/lib/apt/lists/*
@@ -91,6 +116,12 @@ RUN python3 -m pip install --no-cache-dir -r /tmp/requirements.txt
 
 # custom external libraries
 RUN mkdir -p /tmp/dependencies
+
+WORKDIR /tmp/dependencies
+RUN wget https://developer.nvidia.com/downloads/assets/tools/secure/nsight-graphics/2025_5_0/linux/NVIDIA_Nsight_Graphics_2025.5.0.25335.run && \
+    chmod +x NVIDIA_Nsight_Graphics_2025.5.0.25335.run && \
+    sh ./NVIDIA_Nsight_Graphics_2025.5.0.25335.run --accept --quiet && \
+    rm NVIDIA_Nsight_Graphics_2025.5.0.25335.run
 
 WORKDIR /tmp/dependencies
 RUN rm -Rf /tmp/depencencies/pybind11 && \

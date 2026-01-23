@@ -15,17 +15,17 @@ typing_extensions>=4.10.0
 
 eclipse-zenoh == 1.3.4
 pycapnp >=2.2.0
-iceoryx2 >= 0.8.0
+iceoryx2 == 0.8.1
 pycdr2 >= 1.0.0
 git+https://github.com/TUM-CAMP-NARVIS/artekmed_zenoh_python_client.git@master
 
-slint >= 1.14.1b1
+#slint >= 1.14.1b1
 slangpy >= 0.38.1
 
 pyglm >= 2.8.3
 trimesh >= 4.10.1
-scipy >= 1.16.3
-networkx >= 3.6.1
-matplotlib >= 3.10.8
+scipy
+networkx
+matplotlib
 
 torch == 2.9.1

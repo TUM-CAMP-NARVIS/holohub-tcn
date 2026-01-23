@@ -11,6 +11,9 @@ from typing import Callable, Optional, Union
 import slangpy as spy
 from pathlib import Path
 
+import iceoryx2 as iox2
+
+from pyglm import glm
 
 import numpy as np
 import cupy as cp
@@ -37,11 +40,87 @@ from mesh_renderer import MeshRenderer, Mesh
 
 from renderable import Renderable
 from arcball_controller import ArcBall
+from fpv_controller import FirstPersonView
 #from graph_visualizer import visualize_holoscan_graph
 import time
+from dataclasses import dataclass
 
 
 log = logging.getLogger(__name__)
+
+CORRECTION_VK = np.array([
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, -1.0, 0.0, 0.0],
+    [0.0, 0.0, -1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+], dtype=np.float64)
+
+# testing different method to compute projection matrix:
+@dataclass
+class AsymmetricPerspectiveOptions:
+    left: float = -1.0
+    right: float = 1.0
+    bottom: float = -1.0
+    top: float = 1.0
+    nearPlane: float = 0.1
+    farPlane: float = 100.0
+    applyPostViewCorrection: bool = True
+
+
+def get_frustum_extents_from_fov(fov_deg: float, aspect: float, near: float):
+    """
+    Computes left, right, bottom, top extents at the near plane
+    based on vertical FOV and aspect ratio.
+    """
+    top = near * np.tan(np.radians(fov_deg) / 2.0)
+    bottom = -top
+    right = top * aspect
+    left = -right
+    return left, right, bottom, top
+
+
+def perspective_asymmetric(options: AsymmetricPerspectiveOptions) -> glm.mat4:
+    """
+    Translated from C++. Computes a Vulkan-compatible projection matrix.
+    Note: pyglm matrix constructor is column-major.
+    """
+    two_near = 2.0 * options.nearPlane
+    right_minus_left = options.right - options.left
+    far_minus_near = options.farPlane - options.nearPlane
+
+    if not options.applyPostViewCorrection:
+        bottom_minus_top = options.bottom - options.top
+
+        # Column-major construction
+        m = glm.mat4(
+            two_near / right_minus_left, 0.0, 0.0, 0.0,  # Col 0
+            0.0, two_near / bottom_minus_top, 0.0, 0.0,  # Col 1
+            -(options.right + options.left) / right_minus_left,  # Col 2
+            -(options.bottom + options.top) / bottom_minus_top,
+            options.farPlane / far_minus_near,
+            1.0,
+            0.0, 0.0, -options.nearPlane * options.farPlane / far_minus_near, 0.0  # Col 3
+        )
+        return m
+    else:
+        # Flip signs for top/bottom to account for 180 deg X-axis rotation
+        bottom = -options.bottom
+        top = -options.top
+        bottom_minus_top = bottom - top
+
+        # Column-major construction with negated Y and Z axes
+        m = glm.mat4(
+            two_near / right_minus_left, 0.0, 0.0, 0.0,  # Col 0
+            0.0, -two_near / bottom_minus_top, 0.0, 0.0,  # Col 1
+            (options.right + options.left) / right_minus_left,  # Col 2
+            (bottom + top) / bottom_minus_top,
+            -options.farPlane / far_minus_near,
+            -1.0,
+            0.0, 0.0, -options.nearPlane * options.farPlane / far_minus_near, 0.0  # Col 3
+        )
+        return m
+
+
 
 
 
@@ -86,11 +165,14 @@ class SlangWindow:
         self.camera_up = np.asarray([0, 1, 0], dtype=np.float32)
         self.fov = 60.0
 
+        self.model_pose = spy.math.float3(0., 0., 0.)
+
         self.near_plane = 0.1
         self.far_plane = 10.0
         self.timer = time.perf_counter()
 
-        self.arc_ball = ArcBall(self.camera_pos, self.camera_target, self.camera_up, self.fov, (width, height))
+        # self.arc_ball = ArcBall(self.camera_pos, self.camera_target, self.camera_up, self.fov, (width, height))
+        self.arc_ball = FirstPersonView(self.camera_pos, self.camera_target, self.camera_up, self.fov, (width, height))
         self.current_mouse_button_down = None
         self.arc_ball_needs_init = False
 
@@ -120,10 +202,20 @@ class SlangWindow:
         self.on_mouse_event: Optional[Callable[[spy.MouseEvent], None]] = None
 
         # Load a default mesh for testing (can be removed later)
-        model_path = asset_root_dir / "models" / "monkey.obj"
-        default_mesh = Mesh.from_obj(self.device, str(model_path))
-        # default_mesh.pose = Pose3.from_translation(np.asarray([0, 0, 0.5], dtype=np.float32))
-        self.add_renderable("default_mesh", default_mesh)
+        # model_path = asset_root_dir / "models" / "monkey.obj"
+        # default_mesh = Mesh.from_obj(self.device, str(model_path))
+        # # default_mesh.pose = Pose3.from_translation(np.asarray([0, 0, 0.5], dtype=np.float32))
+        # self.add_renderable("default_mesh", default_mesh)
+
+    # helper
+    def set_model_pose(self, pose: spy.math.float3):
+        self.model_pose = pose
+        transform = np.eye(4, dtype=np.float32)
+        transform[0, 3] = pose[0]
+        transform[1, 3] = pose[1]
+        transform[2, 3] = pose[2]
+        for renderable in self._renderables.values():
+            renderable.pose = transform
 
     def setup_ui(self):
         self.ui = spy.ui.Context(self.device)
@@ -133,6 +225,7 @@ class SlangWindow:
         )
 
         spy.ui.CheckBox(window, "Render Static Color", self._render_static_colors, lambda v: setattr(self, "_render_static_colors", v))
+        spy.ui.InputFloat3(window, "Model Pose", self.model_pose, self.set_model_pose)
 
 
     def add_renderable(self, name: str, renderable: Renderable, pose: np.ndarray = None) -> str:
@@ -158,8 +251,8 @@ class SlangWindow:
         if isinstance(renderable, Mesh):
             renderable.renderer = self.mesh_renderer
         elif isinstance(renderable, Pointcloud):
-            # renderable.renderer = self.pointcloud_renderer
-            renderable.renderer = self.pointcloud_sprites_renderer
+            renderable.renderer = self.pointcloud_renderer
+            # renderable.renderer = self.pointcloud_sprites_renderer
         elif isinstance(renderable, ColoredMesh):
             renderable.renderer = self.colored_mesh_renderer
 
@@ -190,15 +283,27 @@ class SlangWindow:
 
     def get_view_matrix(self) -> np.ndarray:
         """Compute the current view matrix from camera parameters."""
-        return  self.arc_ball.view_matrix()
+        return self.arc_ball.view_matrix()
         # return glm.lookAt(self.camera_pos.tolist(), self.camera_target.tolist(), self.camera_up.tolist())
 
     def get_projection_matrix(self) -> np.ndarray:
         """Compute the current projection matrix from camera parameters."""
         # aspect = float(self.window.width) / float(self.window.height)
         # return glm.perspective(glm.radians(self.fov), aspect, self.near_plane, self.far_plane)
+
         aspect = float(self.window.width) / float(self.window.height)
-        return self.perspective_vulkan(self.fov, aspect, self.near_plane, self.far_plane)
+        proj_matrix = glm.perspectiveRH_ZO(glm.radians(self.fov), aspect, self.near_plane, self.far_plane)
+        return proj_matrix # @ CORRECTION_VK
+
+        # aspect = float(self.window.width) / float(self.window.height)
+        # return self.perspective_vulkan(self.fov, aspect, self.near_plane, self.far_plane)
+
+        # aspect = float(self.window.width) / float(self.window.height)
+        # l, r, b, t = get_frustum_extents_from_fov(self.fov, aspect, self.near_plane)
+        # opts = AsymmetricPerspectiveOptions(left=l, right=r, bottom=b, top=t, nearPlane=self.near_plane, farPlane=self.far_plane)
+        # opts.applyPostViewCorrection = False
+        # proj_matrix = perspective_asymmetric(opts)
+        # return proj_matrix
 
     @staticmethod
     def perspective_vulkan(fov_deg, aspect, near, far):
@@ -362,7 +467,7 @@ class SlangWindow:
                 continue
 
             command_encoder = self.device.create_command_encoder()
-            self.ui.begin_frame(*window_size)
+            # self.ui.begin_frame(*window_size)
 
             # Compute camera matrices once per frame
             view_matrix = self.get_view_matrix()
@@ -385,7 +490,7 @@ class SlangWindow:
                     ],
                     "depth_stencil_attachment": {
                         "view": self.depth_texture.create_view(),
-                        "depth_clear_value": 1.0,
+                        # "depth_clear_value": 1.0,
                         "depth_load_op": spy.LoadOp.clear,
                         "depth_store_op": spy.StoreOp.store,
                     },
@@ -405,7 +510,7 @@ class SlangWindow:
                         extra_args={"renderStaticColor": self._render_static_colors}
                     )
 
-            self.ui.end_frame(self.surface_texture, command_encoder)
+            # self.ui.end_frame(self.surface_texture, command_encoder)
 
             self.device.submit_command_buffer(command_encoder.finish())
             self.surface.present()
@@ -510,18 +615,18 @@ class App(hs.core.Application):
 
         # @todo: create renderables config interface once stabilized
         renderables = {
-            # "camera01_pointcloud": {
-            #     "entity_type": "pointcloud",
-            #     "entity_args": None,
-            #     "renderer": "colored_pointcloud",
-            #     "priority": 0,
-            #     "pose": None,
-            #     "input_mappings": [
-            #         ("camera01_colorimage", "image"),
-            #         ("camera01_positions", "positions"),
-            #         ("camera01_texcoords", "texcoords"),
-            #     ]
-            # },
+            "camera01_pointcloud": {
+                "entity_type": "pointcloud",
+                "entity_args": None,
+                "renderer": "colored_pointcloud",
+                "priority": 0,
+                "pose": None,
+                "input_mappings": [
+                    ("camera01_colorimage", "image"),
+                    ("camera01_positions", "positions"),
+                    ("camera01_texcoords", "texcoords"),
+                ]
+            },
             # "camera02_pointcloud": {
             #     "entity_type": "pointcloud",
             #     "entity_args": None,
@@ -558,7 +663,7 @@ class App(hs.core.Application):
             #         ("camera04_texcoords", "texcoords"),
             #     ]
             # },
-            # "camera04_colorimage_origin": {
+            # # "camera04_colorimage_origin": {
             #     "entity_type": "colored_mesh",
             #     "entity_args": ["axis3d",],
             #     "renderer": "colored_mesh",
@@ -591,6 +696,7 @@ def main(config_file=None):
     if configure_debug:
         logging.basicConfig(level=logging.INFO)
         set_log_level(LogLevel.INFO)
+        iox2.set_log_level(iox2.LogLevel.Info)
     else:
         logging.basicConfig(level=logging.INFO)
         set_log_level(LogLevel.INFO)

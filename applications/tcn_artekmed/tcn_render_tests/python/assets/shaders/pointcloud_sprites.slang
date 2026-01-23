@@ -55,6 +55,7 @@ struct GeometryToFragment {
     float2 uv : TEXCOORD0;
     float4 pos : SV_Position;
     uint vid : VERTEXID;
+    //float depth;
 };
 
 [shader("vertex")]
@@ -68,6 +69,11 @@ float4 objectToClipPos(float4 objectPos) {
     float4 worldPos = mul(model, objectPos);
     float4 viewPos = mul(view, worldPos);
     return mul(proj, viewPos);
+}
+
+// convert to view-direction z+
+inline float3 get_pos(uint idx) {
+    return vertices[idx];
 }
 
 [shader("geometry")]
@@ -91,11 +97,13 @@ void geometry_main(
 
     GeometryToFragment output;
     output.vid = input[0].vid;
+    //output.depth = 0.f;
 
     if (drawUnconnected) {
         // Unconnected point cloud rendering (billboard sprites)
         uint idx = input[0].vid;
-        float3 pos = vertices[idx];
+        float3 pos = get_pos(idx);
+        //output.depth = sqrt(pos.x * pos.x + pos.y * pos.y + pos.z * pos.z);
         float2 uv = uvCoords[idx];
 
         float4 origin = float4(pos, 1.0);
@@ -140,17 +148,17 @@ void geometry_main(
             return;
 
         // Load 3x3 neighborhood positions
-        float3 v00_pos = vertices[index - depthWidth - 1];
-        float3 v01_pos = vertices[index - depthWidth];
-        float3 v02_pos = vertices[index - depthWidth + 1];
+        float3 v00_pos = get_pos(index - depthWidth - 1);
+        float3 v01_pos = get_pos(index - depthWidth);
+        float3 v02_pos = get_pos(index - depthWidth + 1);
 
-        float3 v10_pos = vertices[index - 1];
-        float3 v11_pos = vertices[index];
-        float3 v12_pos = vertices[index + 1];
+        float3 v10_pos = get_pos(index - 1);
+        float3 v11_pos = get_pos(index);
+        float3 v12_pos = get_pos(index + 1);
 
-        float3 v20_pos = vertices[index + depthWidth - 1];
-        float3 v21_pos = vertices[index + depthWidth];
-        float3 v22_pos = vertices[index + depthWidth + 1];
+        float3 v20_pos = get_pos(index + depthWidth - 1);
+        float3 v21_pos = get_pos(index + depthWidth);
+        float3 v22_pos = get_pos(index + depthWidth + 1);
 
         // Load 3x3 neighborhood UV coordinates
         float2 v00_uv = uvCoords[index - depthWidth - 1];
@@ -349,6 +357,7 @@ float4 fragment_main(GeometryToFragment input) : SV_Target {
     } else {
         float4 c = colorTex.Sample(sampler_colorTex, input.uv);
         c.a = 1.0f;
+        //float4 c = float4(input.depth/30.f, 0.f, 0.f, 1.f);
         return c;
     }
 }
