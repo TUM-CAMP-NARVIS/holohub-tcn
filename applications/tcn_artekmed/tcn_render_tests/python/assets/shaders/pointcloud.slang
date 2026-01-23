@@ -25,6 +25,8 @@ VertexOutput vertex_main(VertexInput input) {
     float4 worldPos = mul(model, float4(input.pos, 1.0));
     float4 viewPos = mul(view, worldPos);
     out.pos = mul(proj, viewPos);
+    out.pos.z *= -1.0;
+
 
     //float3 worldNormal = normalize(mul((float3x3)model, in.norm));
     //out.normal = worldNormal;

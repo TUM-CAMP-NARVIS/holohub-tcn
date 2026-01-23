@@ -5,7 +5,7 @@ application:
   outputFormats: ["screen"]
 
 shared_memory:
-  stream_name: "camera_streams"
+  stream_name: "camera_streams_test"
   parameter_rpc_name: "tcn_shm_receiver"
   cycle_time_ms: 1
 

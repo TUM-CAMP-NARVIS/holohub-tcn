@@ -284,6 +284,7 @@ class ArcBall:
 
     def view_matrix(self) -> np.ndarray:
         """Get camera's view matrix (4x4)."""
+        # log.info(self._inverse_view)
         return pose3_to_matrix4x4(self._view)
 
     def inverse_view_matrix(self) -> np.ndarray:
