@@ -6,7 +6,7 @@ from PIL.Image import Image
 import threading
 
 from operators.tcn_artekmed.tcn_util.helpers import copy_cupy_array_into_slangpy_buffer
-from renderable import Renderable
+from .renderable import Renderable
 
 class Pointcloud(Renderable):
     """
