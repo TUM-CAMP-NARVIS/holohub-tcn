@@ -2,7 +2,7 @@ import slangpy as spy
 import numpy as np
 import threading
 
-from renderable import Renderable
+from .renderable import Renderable
 
 
 class ColoredMesh(Renderable):

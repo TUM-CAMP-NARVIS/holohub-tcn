@@ -2,7 +2,7 @@ import slangpy as spy
 import numpy as np
 import logging
 
-from pointcloud_data import Pointcloud
+from .pointcloud_data import Pointcloud
 
 log = logging.getLogger(__name__)
 

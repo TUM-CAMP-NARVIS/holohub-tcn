@@ -4,7 +4,7 @@ import trimesh
 from PIL.Image import Image
 import threading
 
-from renderable import Renderable
+from .renderable import Renderable
 
 class Mesh(Renderable):
 
