@@ -119,13 +119,18 @@ class SlangWindow:
             device_handle = spy.get_cuda_current_context_native_handles()
 
         self.device = spy.Device(
+            type=spy.DeviceType.vulkan,
             enable_debug_layers=True,
             enable_cuda_interop=True,
             existing_device_handles=device_handle,
-            compiler_options={"include_paths": [
-                str(asset_root_dir / "shaders"),
-                os.path.join(os.path.dirname(spy.__file__), "slang"),
-            ]},
+            compiler_options={
+                "include_paths": [
+                    str(asset_root_dir / "shaders"),
+                    os.path.join(os.path.dirname(spy.__file__), "slang"),
+                ],
+                "debug_info": spy.SlangDebugInfoLevel.maximal,
+                "optimization": spy.SlangOptimizationLevel.none,
+            },
         )
 
         self.surface = self.device.create_surface(self.window)
