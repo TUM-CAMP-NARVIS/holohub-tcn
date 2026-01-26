@@ -12,7 +12,7 @@ class PointcloudRenderer:
         self.program = device.load_program(
             "pointcloud.slang",
             ["vertex_main", "fragment_main"],
-            link_options={"debug_info": spy.SlangDebugInfoLevel.maximal},
+            link_options={"debug_info": spy.SlangDebugInfoLevel.maximal, 'optimization':spy.SlangOptimizationLevel.none},
         )
 
         self.sampler = device.create_sampler()
