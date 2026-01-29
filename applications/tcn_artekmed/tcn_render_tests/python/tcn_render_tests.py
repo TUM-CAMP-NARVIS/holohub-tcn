@@ -21,9 +21,10 @@ from holoscan.resources import CudaStreamPool, BlockMemoryPool, MemoryStorageTyp
 from holoscan.pose_tree import PoseTreeManager, SO3, Pose3
 
 from operators.tcn_artekmed.tcn_processing import ShmSimpleBackprojectionSubgraph
+from operators.tcn_artekmed.tcn_slang_renderer.pointcloud_data import Pointcloud
 
 from operators.tcn_artekmed.tcn_util.helpers import pose3_to_matrix4x4
-from operators.tcn_artekmed.tcn_slang_renderer import TcnSlangRenderOp
+from operators.tcn_artekmed.tcn_slang_renderer import TcnSlangRenderOp, SlangWindow
 
 #from graph_visualizer import visualize_holoscan_graph
 
@@ -202,6 +203,80 @@ class App(hs.core.Application):
 
 
 
+def slangwindow_debug(storage_directory):
+    logging.basicConfig(level=logging.DEBUG)
+    md_file = os.path.join(storage_directory, "metadata.json")
+    if not os.path.isfile(md_file):
+        log.error(f"No metadata file found at {md_file}")
+        return
+
+    with open(md_file, "r") as f:
+        metadata = json.load(f)
+
+    render_context = {}
+    for m in metadata:
+        tensor_name = m["name"]
+        tensor_shape = m["shape"]
+        tensor_file = os.path.join(storage_directory, f"{tensor_name}.npy")
+        tensor = np.load(tensor_file)
+        cu_tensor = cp.asarray(tensor)
+        render_context[tensor_name] = cu_tensor
+
+    renderables = {
+        # "camera01_pointcloud": {
+        #     "entity_type": "pointcloud",
+        #     "entity_args": None,
+        #     "renderer": "colored_pointcloud",
+        #     "priority": 0,
+        #     "pose": None,
+        #     "input_mappings": [
+        #         ("camera01_colorimage", "image"),
+        #         ("camera01_positions", "positions"),
+        #         ("camera01_texcoords", "texcoords"),
+        #     ]
+        # },
+    }
+    window = SlangWindow(1024, 768, "TCN RenderTest Debug")
+
+    def extract_inputs(ctx, mappings):
+        kwargs = {}
+        if mappings is None:
+            return kwargs
+
+        for port_name, buffer_name in mappings:
+            buffer = ctx.get(port_name)
+
+            # XXX why is this needed!
+            # first attempt to forward a cupy array and do the d2d copy in renderable-update
+            if getattr(buffer, "device", None) is not None:
+                # buffer = cp.asnumpy(buffer)
+                buffer = cp.asarray(buffer)
+
+            if buffer is not None:
+                # @FIXME: this downloads the buffer potentially being already on the device in cuda memory.
+                # a more sophisticated resource sharing cuda-vulkan interop should be used and is available in slang
+                kwargs[buffer_name] = buffer
+            else:
+                log.warning(f"TcnSlangRenderOp: missing input buffer for {port_name}")
+        return kwargs
+
+    for name, config in renderables.items():  # XX consider priorities here
+        renderable = window.get_renderable(name)
+        if renderable is None:
+            log.info(f"TcnSlangRenderOp: create renderable: {name}: {config}")
+            # XXX make renderer configurable
+            if config["entity_type"] == "pointcloud":
+                kwargs = extract_inputs(render_context, config["input_mappings"])
+                renderable = Pointcloud(device=window.get_device(), **kwargs)
+                window.add_renderable(name, renderable)
+            else:
+                log.warning(f"TcnSlangRenderOp: unsupported entity type: {config['entity_type']}")
+        else:
+            kwargs = extract_inputs(render_context, config["input_mappings"])
+            renderable.update(**kwargs)
+
+    window.run()
+
 
 def main():
 
@@ -273,4 +348,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    #main()
+    slangwindow_debug("/tmp/sgof_rec")

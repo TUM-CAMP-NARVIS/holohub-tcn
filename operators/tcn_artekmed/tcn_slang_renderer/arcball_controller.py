@@ -104,7 +104,7 @@ class ArcBall:
         x_axis = np.cross(z_axis, y_axis)
         x_axis = x_axis / np.linalg.norm(x_axis)
 
-        # Create rotation matrix (column vectors)
+        # Create rotation matrix (column vectors) Left-Handed CS
         rotation_matrix = np.column_stack([x_axis, y_axis, -z_axis])
 
         # Convert rotation matrix to quaternion using SO3
@@ -312,7 +312,7 @@ class ArcBall:
         # Compose: view = t_zoom * r_rotation * t_position
         self._view = t_zoom @ r_rotation @ t_position
         self._inverse_view = self._view.inverse()
-        log.debug(f"Updated view transformation: zoom={self._current_zooming}, rotation={self._current_rotation}, position={self._current_position}")
+        log.debug(f"Updated view transformation: {self._view}")
 
     def _screen_coord_to_ndc(self, mouse_pos: Tuple[int, int]) -> np.ndarray:
         """

@@ -80,10 +80,15 @@ class PointcloudRenderer:
         cursor.view = view_matrix
         cursor.model = model_matrix
 
+        # uniforms
+        cursor.renderStaticColor = extra_args.get('renderStaticColor', False)
+        cursor.pointSize = extra_args.get('pointSize', 1.0)
+
         if extra_args:
             for k, v in extra_args.items():
-                if cursor.has_field(k):
-                    setattr(cursor, k, v)
+                if k not in ['renderStaticColor', 'pointSize']:
+                    if cursor.has_field(k):
+                        setattr(cursor, k, v)
 
         pass_encoder.set_render_state(
             {

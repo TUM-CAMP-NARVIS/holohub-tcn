@@ -3,6 +3,7 @@ import os
 import threading
 import json
 import time
+import math
 from dataclasses import dataclass
 
 from typing import Callable, Optional, Union
@@ -32,78 +33,32 @@ log = logging.getLogger("TcnSlangRenderOp")
 
 CORRECTION_VK = np.array([
     [1.0, 0.0, 0.0, 0.0],
-    [0.0, -1.0, 0.0, 0.0],
-    [0.0, 0.0, -1.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
     [0.0, 0.0, 0.0, 1.0],
 ], dtype=np.float64)
 
-# testing different method to compute projection matrix:
-@dataclass
-class AsymmetricPerspectiveOptions:
-    left: float = -1.0
-    right: float = 1.0
-    bottom: float = -1.0
-    top: float = 1.0
-    nearPlane: float = 0.1
-    farPlane: float = 100.0
-    applyPostViewCorrection: bool = True
+def vulkan_rh_zo_perspective(fov_y_deg: float, aspect: float, near: float, far: float) -> np.ndarray:
+    '''
+    Canonical Vulkan-compatible perspective projection:
+    - Right-handed
+    - Camera looks down -Z in view space
+    - NDC depth range: 0..1 (Vulkan ZO)
+    Matrix is returned in ROW-MAJOR form.
+    '''
 
+    fovy = math.radians(fov_y_deg)
+    f = 1.0 / math.tan(0.5 * fovy)
+    A = far / (near - far)
+    B = (far * near) / (near - far)
 
-def get_frustum_extents_from_fov(fov_deg: float, aspect: float, near: float):
-    """
-    Computes left, right, bottom, top extents at the near plane
-    based on vertical FOV and aspect ratio.
-    """
-    top = near * np.tan(np.radians(fov_deg) / 2.0)
-    bottom = -top
-    right = top * aspect
-    left = -right
-    return left, right, bottom, top
-
-
-def perspective_asymmetric(options: AsymmetricPerspectiveOptions) -> glm.mat4:
-    """
-    Translated from C++. Computes a Vulkan-compatible projection matrix.
-    Note: pyglm matrix constructor is column-major.
-    """
-    two_near = 2.0 * options.nearPlane
-    right_minus_left = options.right - options.left
-    far_minus_near = options.farPlane - options.nearPlane
-
-    if not options.applyPostViewCorrection:
-        bottom_minus_top = options.bottom - options.top
-
-        # Column-major construction
-        m = glm.mat4(
-            two_near / right_minus_left, 0.0, 0.0, 0.0,  # Col 0
-            0.0, two_near / bottom_minus_top, 0.0, 0.0,  # Col 1
-            -(options.right + options.left) / right_minus_left,  # Col 2
-            -(options.bottom + options.top) / bottom_minus_top,
-            options.farPlane / far_minus_near,
-            1.0,
-            0.0, 0.0, -options.nearPlane * options.farPlane / far_minus_near, 0.0  # Col 3
-        )
-        return m
-    else:
-        # Flip signs for top/bottom to account for 180 deg X-axis rotation
-        bottom = -options.bottom
-        top = -options.top
-        bottom_minus_top = bottom - top
-
-        # Column-major construction with negated Y and Z axes
-        m = glm.mat4(
-            two_near / right_minus_left, 0.0, 0.0, 0.0,  # Col 0
-            0.0, -two_near / bottom_minus_top, 0.0, 0.0,  # Col 1
-            (options.right + options.left) / right_minus_left,  # Col 2
-            (bottom + top) / bottom_minus_top,
-            -options.farPlane / far_minus_near,
-            -1.0,
-            0.0, 0.0, -options.nearPlane * options.farPlane / far_minus_near, 0.0  # Col 3
-        )
-        return m
-
-
-
+    P = np.zeros((4, 4), dtype=np.float64)
+    P[0, 0] = f / aspect
+    P[1, 1] = f
+    P[2, 2] = A
+    P[2, 3] = B
+    P[3, 2] = -1.0
+    return P
 
 
 class SlangWindow:
@@ -154,7 +109,7 @@ class SlangWindow:
 
         self.model_pose = spy.math.float3(0., 0., 0.)
 
-        self.near_plane = 0.1
+        self.near_plane = 1.0
         self.far_plane = 10.0
         self.timer = time.perf_counter()
 
@@ -168,7 +123,8 @@ class SlangWindow:
         self.window.on_resize = self.handle_resize
 
         # ui variables
-        self._render_static_colors = False
+        self._render_static_colors = True
+        self._point_size = 3.0
 
 
         # create ui
@@ -189,10 +145,10 @@ class SlangWindow:
         self.on_mouse_event: Optional[Callable[[spy.MouseEvent], None]] = None
 
         # Load a default mesh for testing (can be removed later)
-        # model_path = asset_root_dir / "models" / "monkey.obj"
-        # default_mesh = Mesh.from_obj(self.device, str(model_path))
-        # # default_mesh.pose = Pose3.from_translation(np.asarray([0, 0, 0.5], dtype=np.float32))
-        # self.add_renderable("default_mesh", default_mesh)
+        model_path = asset_root_dir / "models" / "monkey.obj"
+        default_mesh = Mesh.from_obj(self.device, str(model_path))
+        # default_mesh.pose = Pose3.from_translation(np.asarray([0, 0, 0.5], dtype=np.float32))
+        self.add_renderable("default_mesh", default_mesh)
 
     # helper
     def set_model_pose(self, pose: spy.math.float3):
@@ -212,6 +168,7 @@ class SlangWindow:
         )
 
         spy.ui.CheckBox(window, "Render Static Color", self._render_static_colors, lambda v: setattr(self, "_render_static_colors", v))
+        spy.ui.InputFloat(window, "Point Size", self._point_size, lambda v: setattr(self, "_point_size", v))
         spy.ui.InputFloat3(window, "Model Pose", self.model_pose, self.set_model_pose)
 
 
@@ -270,67 +227,22 @@ class SlangWindow:
 
     def get_view_matrix(self) -> np.ndarray:
         """Compute the current view matrix from camera parameters."""
-        return self.arc_ball.view_matrix()
-        # return glm.lookAt(self.camera_pos.tolist(), self.camera_target.tolist(), self.camera_up.tolist())
+        view_pose = self.arc_ball.view_matrix()
+        return view_pose
 
     def get_projection_matrix(self) -> np.ndarray:
         """Compute the current projection matrix from camera parameters."""
         # aspect = float(self.window.width) / float(self.window.height)
         # return glm.perspective(glm.radians(self.fov), aspect, self.near_plane, self.far_plane)
 
+        # aspect = float(self.window.width) / float(self.window.height)
+        # proj_matrix = np.asarray(glm.perspectiveRH_ZO(glm.radians(self.fov), aspect, self.near_plane, self.far_plane))
+        # vk_proj_matrix = proj_matrix.T @ CORRECTION_VK
+        # return vk_proj_matrix
+
         aspect = float(self.window.width) / float(self.window.height)
-        proj_matrix = glm.perspectiveRH_ZO(glm.radians(self.fov), aspect, self.near_plane, self.far_plane)
-        return proj_matrix # @ CORRECTION_VK
-
-        # aspect = float(self.window.width) / float(self.window.height)
-        # return self.perspective_vulkan(self.fov, aspect, self.near_plane, self.far_plane)
-
-        # aspect = float(self.window.width) / float(self.window.height)
-        # l, r, b, t = get_frustum_extents_from_fov(self.fov, aspect, self.near_plane)
-        # opts = AsymmetricPerspectiveOptions(left=l, right=r, bottom=b, top=t, nearPlane=self.near_plane, farPlane=self.far_plane)
-        # opts.applyPostViewCorrection = False
-        # proj_matrix = perspective_asymmetric(opts)
-        # return proj_matrix
-
-    @staticmethod
-    def perspective_vulkan(fov_deg, aspect, near, far):
-        """
-        Computes a right-handed perspective projection matrix for Vulkan/Slang.
-        Depth range is [0, 1].
-        """
-        f = 1.0 / np.tan(np.radians(fov_deg) / 2.0)
-
-        # Note the standard Vulkan/D3D projection:
-        # m[0,0] = f / aspect
-        # m[1,1] = -f (to flip Y if screen space is top-down, but slangpy handles viewport usually)
-        # However, to match standard expected orientation:
-        res = np.zeros((4, 4), dtype=np.float32)
-        res[0, 0] = f / aspect
-        res[1, 1] = f
-        res[2, 2] = far / (near - far)
-        res[2, 3] = (near * far) / (near - far)
-        res[3, 2] = -1.0
-
-        return res
-
-    @staticmethod
-    def look_at(eye, target, up):
-        """Native numpy implementation of lookAt (Right-Handed)"""
-        zaxis = eye - target
-        zaxis /= np.linalg.norm(zaxis)
-        xaxis = np.cross(up, zaxis)
-        xaxis /= np.linalg.norm(xaxis)
-        yaxis = np.cross(zaxis, xaxis)
-
-        res = np.eye(4, dtype=np.float32)
-        res[0, 0:3] = xaxis
-        res[1, 0:3] = yaxis
-        res[2, 0:3] = zaxis
-        res[0, 3] = -np.dot(xaxis, eye)
-        res[1, 3] = -np.dot(yaxis, eye)
-        res[2, 3] = -np.dot(zaxis, eye)
-        return res
-
+        proj_matrix = vulkan_rh_zo_perspective(self.fov, aspect, self.near_plane, self.far_plane)
+        return proj_matrix
 
     def get_device(self):
         return self.device
@@ -383,8 +295,9 @@ class SlangWindow:
     def _on_window_mouse_event(self, event: spy.MouseEvent):
         if event.type == spy.MouseEventType.button_down:
             log.debug(f"Mouse button down {event.pos} {event.mods} {event.button}")
+            if self.current_mouse_button_down != event.button:
+                self.arc_ball_needs_init = True
             self.current_mouse_button_down = event.button
-            self.arc_ball_needs_init = True
         elif event.type == spy.MouseEventType.button_up:
             log.debug(f"Mouse button up {event.pos} {event.mods} {event.button}")
             self.current_mouse_button_down = None
@@ -392,8 +305,8 @@ class SlangWindow:
             pos = (int(event.pos.x), int(event.pos.y))
             if self.current_mouse_button_down == spy.MouseButton.left:
                 if self.arc_ball_needs_init:
-                    self.arc_ball.init_transformation(pos)
                     self.arc_ball_needs_init = False
+                    self.arc_ball.init_transformation(pos)
 
                 if event.mods == spy.KeyModifierFlags.shift:
                     self.arc_ball.translate(pos)
@@ -477,7 +390,7 @@ class SlangWindow:
                     ],
                     "depth_stencil_attachment": {
                         "view": self.depth_texture.create_view(),
-                        # "depth_clear_value": 1.0,
+                        "depth_clear_value": 1.0,
                         "depth_load_op": spy.LoadOp.clear,
                         "depth_store_op": spy.StoreOp.store,
                     },
@@ -494,7 +407,11 @@ class SlangWindow:
                         window_size,
                         view_matrix,
                         proj_matrix,
-                        extra_args={"renderStaticColor": self._render_static_colors}
+                        extra_args={
+                            "renderStaticColor": self._render_static_colors,
+                            "pointSize": self._point_size,
+                            # "drawUnconnected": False,
+                        }
                     )
 
             # self.ui.end_frame(self.surface_texture, command_encoder)
