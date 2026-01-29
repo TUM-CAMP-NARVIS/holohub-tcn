@@ -23,7 +23,7 @@ class PointcloudSpritesRenderer:
             program=self.program,
             input_layout=None,
             targets=[{"format": output_format}],
-            primitive_topology=spy.PrimitiveTopology.point_list,
+            primitive_topology=spy.PrimitiveTopology.triangle_strip,
             depth_stencil={
                 "depth_test_enable": True,
                 "depth_write_enable": True,

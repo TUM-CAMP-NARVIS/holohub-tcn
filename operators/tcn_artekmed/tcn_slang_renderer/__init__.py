@@ -1,2 +1,3 @@
-from .TcnSlangRenderOp import TcnSlangRenderOp
-__all__ = ["TcnSlangRenderOp", ]
+from .TcnSlangRenderOp import TcnSlangRenderOp, SlangWindow
+__all__ = ["TcnSlangRenderOp", "SlangWindow"]
+
