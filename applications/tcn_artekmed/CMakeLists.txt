@@ -32,3 +32,11 @@ add_holohub_application(tcn_render_tests DEPENDS OPERATORS
         tcn_texture_sampler
         #slang_shader
 )
+
+add_holohub_application(tcn_shm_vlm_inference DEPENDS OPERATORS
+        #tcn_slang_renderer
+        tcn_depthimage_backprojection
+        tcn_depthimage_temporal_filter
+        tcn_depthimage_weights
+        tcn_texture_sampler
+)
