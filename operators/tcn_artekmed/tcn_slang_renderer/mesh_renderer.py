@@ -17,7 +17,7 @@ class MeshRenderer:
 
         self.pipeline = device.create_render_pipeline(
             program=self.program,
-            targets=[{"format": output_format}],
+            targets=[{"format": output_format, "enable_blend": False}],
             input_layout=device.create_input_layout(
                 input_elements=[
                     {
@@ -38,6 +38,14 @@ class MeshRenderer:
                 ],
                 vertex_streams=[{"stride": 12}, {"stride": 12}, {"stride": 8}],
             ),
+            rasterizer={
+                "fill_mode": spy.FillMode.solid,
+                "cull_mode": spy.CullMode.none,
+                "front_face": spy.FrontFaceMode.counter_clockwise,
+                "depth_clip_enable": True,
+                "scissor_enable": False,
+                "multisample_enable": False,
+            },
             depth_stencil={
                 "depth_test_enable": True,
                 "depth_write_enable": True,
@@ -75,7 +83,16 @@ class MeshRenderer:
         cursor.texture = mesh.texture
         cursor.proj = proj_matrix
         cursor.view = view_matrix
+        cursor.inverseView = np.linalg.inv(view_matrix)
         cursor.model = model_matrix
+
+        cursor.renderStaticColor = extra_args.get('renderStaticColor', True)
+
+        if extra_args:
+            for k, v in extra_args.items():
+                if k not in ['renderStaticColor',]:
+                    if cursor.has_field(k):
+                        setattr(cursor, k, v)        
 
         if extra_args:
             for k, v in extra_args.items():

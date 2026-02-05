@@ -17,7 +17,7 @@ class Mesh(Renderable):
         indices = mesh.faces.astype("uint16")
 
         image : Image = mesh.visual.material.image  # type: ignore
-        image_shape = list(image.size) + [4]
+        image_shape = list(image.size) + [1]
 
         image_data = (
             np.frombuffer(image.tobytes(), dtype=np.uint8)

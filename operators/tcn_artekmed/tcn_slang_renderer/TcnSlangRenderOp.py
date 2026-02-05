@@ -145,7 +145,7 @@ class SlangWindow:
         self.on_mouse_event: Optional[Callable[[spy.MouseEvent], None]] = None
 
         # Load a default mesh for testing (can be removed later)
-        model_path = asset_root_dir / "models" / "monkey.obj"
+        model_path = asset_root_dir / "models" / "cube.obj"
         default_mesh = Mesh.from_obj(self.device, str(model_path))
         # default_mesh.pose = Pose3.from_translation(np.asarray([0, 0, 0.5], dtype=np.float32))
         self.add_renderable("default_mesh", default_mesh)
@@ -393,6 +393,7 @@ class SlangWindow:
                         "depth_clear_value": 1.0,
                         "depth_load_op": spy.LoadOp.clear,
                         "depth_store_op": spy.StoreOp.store,
+                        "depth_read_only": False,
                     },
                 }
             ) as pass_encoder:
