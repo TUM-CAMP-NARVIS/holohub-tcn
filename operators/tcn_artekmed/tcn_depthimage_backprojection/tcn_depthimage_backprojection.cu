@@ -195,7 +195,6 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
       throw std::runtime_error("Failed to allocate message for output positions tensor.");
     }
     positions_entity = std::move(maybe_positions_entity.value());
-
     if (!tcn::allocate_named_tensor<float>(allocator.value(),
                                            cuda_stream,
                                            positions_entity,

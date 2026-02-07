@@ -31,6 +31,7 @@ from holoscan.conditions import AsynchronousCondition, AsynchronousEventState
 from holoscan.core import Operator, OperatorSpec
 from holoscan.operators import HolovizOp
 from holoscan.operators import holoviz
+from holoscan.pose_tree import SO3, Pose3, PoseTreeManager
 
 from tcnart.core.semantic_type import SemanticType
 from tcnart.core.semantic_type.model import ImageFormatTypes
@@ -55,6 +56,7 @@ class ShmSubscriberOp(Operator):
             subscriber: Any,
             stream_name: str,
             channel_config: Any,
+            pose_tree_config: Any,
             cycle_time_ms: int,
             *args,
             **kwargs,
@@ -62,6 +64,7 @@ class ShmSubscriberOp(Operator):
         self.pool = pool
         self.subscriber = subscriber
         self.channel_config = channel_config
+        self.pose_tree_config = pose_tree_config
         self.stream_name = stream_name
         self.cycle_time_ms = cycle_time_ms
 
@@ -75,8 +78,27 @@ class ShmSubscriberOp(Operator):
         }
         log.info(f"Channel semantic types: {self.channel_semantic_types}")
 
+        self.pose_tree = None
+
         # Need to call the base class constructor last
         super().__init__(fragment, cuda_stream_pool, self.async_cond_, *args, **kwargs)
+
+    def initialize(self):
+        if self.pose_tree_config is not None:
+            pose_tree_manager = self.service(PoseTreeManager, "pose_tree_manager")
+            if not pose_tree_manager:
+                raise RuntimeError("PoseTreeManager not found")
+            self.pose_tree = pose_tree_manager.tree
+            if self.pose_tree is None:
+                raise RuntimeError("PoseTree is not initialized")
+
+            # # configure pose-tree
+            for frame in self.pose_tree_config.get("frames", []):
+                self.pose_tree.create_frame(frame)
+
+            for (from_node, to_node, transform) in self.pose_tree_config.get("edges", []):
+                self.pose_tree.create_edges(from_node, to_node)
+                self.pose_tree.set(from_node, to_node, 0, transform)
 
     def on_receive(self, user_header: Any, message: Any):
         """Function to be supplied as callback

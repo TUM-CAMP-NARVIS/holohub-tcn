@@ -5,17 +5,17 @@ application:
   outputFormats: ["screen"]
 
 shared_memory:
-  stream_name: "camera_streams_test"
+  stream_name: "camera_streams"
   parameter_rpc_name: "tcn_shm_receiver"
   cycle_time_ms: 1
 
 camera_stream_processing:
   device_id: 0
   buffer_size: 8
-  enable_temporal_filter: True
+  enable_temporal_filter: False
   enable_background_substract: False
-  enable_compute_weights: True
-  enable_warp_colorimage: True
+  enable_compute_weights: False
+  enable_warp_colorimage: False
 
 depthimage_temporal_filter:
   alpha: 0.15
@@ -49,8 +49,8 @@ debug_output:
   enable_colorimage: True
   enable_depthimage: False
   enable_weights: False
-  enable_pointcloud: True
-  enable_warped_color: True
+  enable_pointcloud: False
+  enable_warped_color: False
 
 resources:
   cpu: 24

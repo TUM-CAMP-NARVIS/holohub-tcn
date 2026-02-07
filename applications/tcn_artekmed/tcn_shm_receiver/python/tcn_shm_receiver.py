@@ -111,32 +111,27 @@ class App(hs.core.Application):
         self.register_service(ctx_service)
 
         # # create pose tree service for fragment
-        pose_tree_config = self.kwargs("pose_tree_config")  # see pose_tree_basic.yaml
+        # pts = PoseTreeManager(
+        #     self,
+        #     name="pose_tree_manager",
+        #     **self.kwargs("pose_tree_config"),
+        # )
+        # self.register_service(pts)
 
-        pts = PoseTreeManager(
-            self,
-            name="pose_tree_manager",
-            **pose_tree_config,
-        )
-        self.register_service(pts)
 
         # # configure pose-tree
-        pts.tree.create_frame("world_origin")
-        for name in camera_names:
-            log.info(f"Create Reference frames for camera {name}")
-            # the frames are intentionally called like the streams to simplify lookup
-            depth_channel_name = f"{name}_depthimage"
-            color_channel_name = f"{name}_colorimage"
-            pts.tree.create_frame(depth_channel_name)
-            pts.tree.create_frame(color_channel_name)
-            # connect the frames
-            pts.tree.create_edges("world_origin", depth_channel_name)
-            pts.tree.create_edges(depth_channel_name, color_channel_name)
-            # set transforms
-            pts.tree.set("world_origin", depth_channel_name, 0,
-                         convert_rigid_transform_to_pose3(ctx_service.get_depth_extrinsics(name)))
-            pts.tree.set(color_channel_name, depth_channel_name, 0,
-                         convert_rigid_transform_to_pose3(ctx_service.get_color_to_depth(name)))
+        pose_tree_config = None
+        # pose_tree_config = {"frames": [], "edges": []}
+        # pose_tree_config["frames"].append("world_origin")
+        # for name in camera_names:
+        #     log.info(f"Create Reference frames for camera {name}")
+        #     # the frames are intentionally called like the streams to simplify lookup
+        #     depth_channel_name = f"{name}_depthimage"
+        #     color_channel_name = f"{name}_colorimage"
+        #     pose_tree_config["frames"].append(depth_channel_name)
+        #     pose_tree_config["frames"].append(color_channel_name)
+        #     pose_tree_config["edges"].append(("world_origin", depth_channel_name, convert_rigid_transform_to_pose3(ctx_service.get_depth_extrinsics(name))))
+        #     pose_tree_config["edges"].append((color_channel_name, depth_channel_name, convert_rigid_transform_to_pose3(ctx_service.get_color_to_depth(name))))
 
         log.info(f"Retrieve channel config for stream: {shm_stream_name}")
         channels_config = shm_receiver.retrieve_channel_config(shm_stream_name)
@@ -178,10 +173,12 @@ class App(hs.core.Application):
         )
 
         log.info(f"create subscriber op {shm_stream_name}")
-        subscriber_op = ShmSubscriberOp(self, cuda_stream_pool, device_memory_pool, shm_receiver, shm_stream_name, channels_config, cycle_time_ms, name="shm_subscriber")
+        subscriber_op = ShmSubscriberOp(self, cuda_stream_pool, device_memory_pool, shm_receiver,
+                                        shm_stream_name, channels_config, pose_tree_config, 10, name="shm_subscriber")
 
         log.info("create stream_splitter op")
         split_op = StreamSplitterOp(self, cuda_stream_pool, [v["name"] for v in depth_streams_config], name="stream_splitter")
+        log.debug("Flow: subscriber_op -> split_op (depth_outputs -> receivers)")
         self.add_flow(subscriber_op, split_op, {("depth_outputs", "receivers")})
 
 
@@ -322,6 +319,7 @@ class App(hs.core.Application):
                     **self.kwargs("depthimage_temporal_filter"),
                 )
                 sink_ops.append(ditf_op)
+                log.debug(f"Flow: split_op -> ditf_op [{camera_name}_temporal_filter] ({channel_name} -> input)")
                 self.add_flow(split_op, ditf_op, {
                     (channel_name, "input"),
                 })
@@ -336,6 +334,7 @@ class App(hs.core.Application):
                     name=f"{camera_name}_max_distance",
                 )
                 sink_ops.append(dimd_op)
+                log.debug(f"Flow: {prev_op.name} -> dimd_op [{camera_name}_max_distance] ({prev_output} -> input)")
                 self.add_flow(prev_op, dimd_op, {
                     (prev_output, "input"),
                 })
@@ -349,9 +348,11 @@ class App(hs.core.Application):
                     **self.kwargs("depthimage_fgbg_mask")
                 )
                 sink_ops.append(difgbg_op)
+                log.debug(f"Flow: split_op -> difgbg_op [{camera_name}_fg_bg_mask] ({channel_name} -> depth_image)")
                 self.add_flow(split_op, difgbg_op, {
                     (channel_name, "depth_image"),
                 })
+                log.debug(f"Flow: dimd_op [{camera_name}_max_distance] -> difgbg_op [{camera_name}_fg_bg_mask] (output -> background_image)")
                 self.add_flow(dimd_op, difgbg_op, {
                     ("output", "background_image"),
                 })
@@ -363,9 +364,11 @@ class App(hs.core.Application):
                     **self.kwargs("depthimage_apply_mask")
                 )
                 sink_ops.append(diam_op)
+                log.debug(f"Flow: split_op -> diam_op [{camera_name}_apply_mask] ({channel_name} -> depth_image)")
                 self.add_flow(split_op, diam_op, {
                     (channel_name, "depth_image"),
                 })
+                log.debug(f"Flow: difgbg_op [{camera_name}_fg_bg_mask] -> diam_op [{camera_name}_apply_mask] (foreground_mask -> mask_image)")
                 self.add_flow(difgbg_op, diam_op, {
                     ("foreground_mask", "mask_image"),
                 })
@@ -404,9 +407,11 @@ class App(hs.core.Application):
                 )
             sink_ops.append(bp_op)
 
+            log.debug(f"Flow: {prev_op.name} -> bp_op [{camera_name}_backprojection] ({prev_output} -> depth_image)")
             self.add_flow(prev_op, bp_op, {
                 (prev_output, "depth_image"),
             })
+            log.debug(f"Flow: xylt_op [xylt_loader_{camera_name}] -> bp_op [{camera_name}_backprojection] (xy_table -> xy_table)")
             self.add_flow(xylt_op, bp_op, {
                 ("xy_table", "xy_table")
             })
@@ -429,17 +434,21 @@ class App(hs.core.Application):
                 )
                 sink_ops.append(cp_op)
 
+                log.debug(f"Flow: {prev_op.name} -> cp_op [{camera_name}_weights] ({prev_output} -> depth_image)")
                 self.add_flow(prev_op, cp_op, {
                     (prev_output, "depth_image"),
                 })
+                log.debug(f"Flow: xylt_op [xylt_loader_{camera_name}] -> cp_op [{camera_name}_weights] (xy_table -> xy_table)")
                 self.add_flow(xylt_op, cp_op, {
                     ("xy_table", "xy_table")
                 })
                 # debug view..
                 if weights_visualizer is not None:
+                    log.debug(f"Flow: cp_op [{camera_name}_weights] -> weights_visualizer (output -> receivers)")
                     self.add_flow(cp_op, weights_visualizer, {("output", "receivers")})
                 else:
                     sink_op = DummySinkOp(self, name=f"{camera_name}_sink")
+                    log.debug(f"Flow: cp_op [{camera_name}_weights] -> sink_op [{camera_name}_sink] (output -> input)")
                     self.add_flow(cp_op, sink_op, {
                         ("output", "input"),
                         })
@@ -457,17 +466,21 @@ class App(hs.core.Application):
                     name=f"{camera_name}_warp_colorimage",
                 )
                 sink_ops.append(wci_op)
+                log.debug(f"Flow: bp_op [{camera_name}_backprojection] -> wci_op [{camera_name}_warp_colorimage] (texcoords -> texcoords)")
                 self.add_flow(bp_op, wci_op, {
                     ("texcoords", "texcoords"),
                 })
+                log.debug(f"Flow: subscriber_op -> wci_op [{camera_name}_warp_colorimage] (color_outputs -> color_image)")
                 self.add_flow(subscriber_op, wci_op, {
                     ("color_outputs", "color_image"),
                 })
                 # debug view..
                 if warped_color_visualizer is not None:
+                    log.debug(f"Flow: wci_op [{camera_name}_warp_colorimage] -> warped_color_visualizer (output -> receivers)")
                     self.add_flow(wci_op, warped_color_visualizer, {("output", "receivers")})
                 else:
                     sink_op = DummySinkOp(self, name=f"{camera_name}_warped_color_sink")
+                    log.debug(f"Flow: wci_op [{camera_name}_warp_colorimage] -> sink_op [{camera_name}_warped_color_sink] (output -> input)")
                     self.add_flow(wci_op, sink_op, {
                         ("output", "input"),
                     })
@@ -479,6 +492,7 @@ class App(hs.core.Application):
         log.info(f"Merge Position Streams: {merge_inputs}")
         position_merge_op = StreamMergerOp(self, cuda_stream_pool, merge_inputs, "output", "positions", True, name="point_fusion")
         for op, conn in position_merge_connections:
+            log.debug(f"Flow: {op.name} -> position_merge_op [point_fusion] {conn}")
             self.add_flow(op, position_merge_op, conn)
 
         flt_op = FlattenTensorOp(
@@ -488,8 +502,17 @@ class App(hs.core.Application):
             allocator=device_memory_pool,
             name=f"flatten_pointcloud",
         )
+        log.debug("Flow: position_merge_op [point_fusion] -> flt_op [flatten_pointcloud] (output -> input)")
         self.add_flow(position_merge_op, flt_op, {("output", "input")})
-        self.add_flow(flt_op, points_visualizer, {("output", "receivers")})
+
+        if points_visualizer:
+            log.debug("Flow: flt_op [flatten_pointcloud] -> points_visualizer (output -> receivers)")
+            self.add_flow(flt_op, points_visualizer, {("output", "receivers")})
+        else:
+            # need a consumer for point_dloucs
+            pc_sink = DummySinkOp(self, name="point_cloud_sink")
+            log.debug("Flow: subscriber_op -> pc_sink [point_cloud_sink] (color_outputs -> input)")
+            self.add_flow(flt_op, pc_sink, {("output", "input")})
 
 
         # sink_op = SinkOp(self, name=f"{camera_name}_sink")
@@ -513,11 +536,14 @@ class App(hs.core.Application):
                 **self.kwargs("color_holoviz"),
             )
 
+            log.debug("Flow: subscriber_op -> color_visualizer (color_outputs -> receivers)")
             self.add_flow(subscriber_op, color_visualizer, {("color_outputs", "receivers")})
+            log.debug("Flow: subscriber_op -> color_visualizer (color_output_specs -> input_specs)")
             self.add_flow(subscriber_op, color_visualizer, {("color_output_specs", "input_specs")})
         else:
             # need a consumer for color_images
             ci_sink = DummySinkOp(self, name="color_image_sink")
+            log.debug("Flow: subscriber_op -> ci_sink [color_image_sink] (color_outputs -> input)")
             self.add_flow(subscriber_op, ci_sink, {("color_outputs", "input")})
 
         if debug_output_config.get("enable_depthimage", False):
@@ -530,7 +556,9 @@ class App(hs.core.Application):
                 **self.kwargs("depth_holoviz"),
             )
 
+            log.debug("Flow: subscriber_op -> depth_visualizer (depth_outputs -> receivers)")
             self.add_flow(subscriber_op, depth_visualizer, {("depth_outputs", "receivers")})
+            log.debug("Flow: subscriber_op -> depth_visualizer (depth_output_specs -> input_specs)")
             self.add_flow(subscriber_op, depth_visualizer, {("depth_output_specs", "input_specs")})
 
 
@@ -541,46 +569,72 @@ class App(hs.core.Application):
         # self.rpc_server_thread_.start()
 
 
-def main(config_file=None):
-    # make configurable or use holoscan debug level here too
-    configure_debug = True
+def main(config_file=None, scheduler_type="greedy", log_level="info", with_tracker=False):
 
-    if configure_debug:
+    # warn,info,debug,debug_holoscan,debug_iceoryx,debug_all,trace
+    if log_level == "trace":
+        logging.basicConfig(level=logging.DEBUG)
+        set_log_level(LogLevel.TRACE)
+        iox2.set_log_level(iox2.LogLevel.Trace)
+    elif log_level == "debug_all":
         logging.basicConfig(level=logging.DEBUG)
         set_log_level(LogLevel.DEBUG)
-        iox2.set_log_level(iox2.LogLevel.Trace)
-    else:
+        iox2.set_log_level(iox2.LogLevel.Debug)
+    elif log_level == "debug_iceoryx":
         logging.basicConfig(level=logging.INFO)
         set_log_level(LogLevel.INFO)
+        iox2.set_log_level(iox2.LogLevel.Debug)
+    elif log_level == "debug_holoscan":
+        logging.basicConfig(level=logging.INFO)
+        set_log_level(LogLevel.DEBUG)
+        iox2.set_log_level(iox2.LogLevel.Info)
+    elif log_level == "debug":
+        logging.basicConfig(level=logging.DEBUG)
+        set_log_level(LogLevel.INFO)
+        iox2.set_log_level(iox2.LogLevel.Info)
+    elif log_level == "info":
+        logging.basicConfig(level=logging.INFO)
+        set_log_level(LogLevel.INFO)
+        iox2.set_log_level(iox2.LogLevel.Info)
+    elif log_level == "warn":
+        logging.basicConfig(level=logging.WARN)
+        set_log_level(LogLevel.WARN)
         iox2.set_log_level(iox2.LogLevel.Warn)
+    else:
+        raise ValueError(f"Invalid log level: {log_level}")
 
     app = App()
     app.config(config_file)
 
-    if configure_debug:
+    scheduler = None
+    if scheduler_type == "greedy":
         scheduler = GreedyScheduler(app, name="gs", stop_on_deadlock=True)
-    else:
+    elif scheduler_type == "event_based":
         scheduler = EventBasedScheduler(app, worker_thread_number=24, name="ebs")
+    else:
+        raise ValueError(f"Invalid scheduler type: {scheduler_type}")
 
     app.scheduler(scheduler)
 
-    with Tracker(app,
-                 num_start_messages_to_skip=15,
-                 num_last_messages_to_discard=15) as tracker:
+    if not with_tracker:
         try:
             app.run()
         except KeyboardInterrupt:
             pass
-        tracker.print()
-
-    # if hasattr(app, "rpc_server_"):
-    #     app.rpc_server_.shutdown()
-    #     app.rpc_server_thread_.join()
+    else:
+        with Tracker(app,
+                     num_start_messages_to_skip=15,
+                     num_last_messages_to_discard=15) as tracker:
+            try:
+                app.run()
+            except KeyboardInterrupt:
+                pass
+            tracker.print()
 
 
 if __name__ == "__main__":
 
-    parser = ArgumentParser(description="ARTEKMED Holoscan SHM Client.")
+    parser = ArgumentParser(description="ARTEKMED Holoscan SHM Example Receiver.")
 
     parser.add_argument(
         "-c",
@@ -588,12 +642,25 @@ if __name__ == "__main__":
         default="none",
         help=("Set config path to override the default config file location"),
     )
+    parser.add_argument(
+        "-s",
+        "--scheduler",
+        default="greedy",
+        help=("Set scheduler type [greedy,event_based]"),
+    )
+    parser.add_argument(
+        "-l",
+        "--log-level",
+        default="info",
+        help=("Set the log level [warn,info,debug,debug_holoscan,debug_iceoryx,debug_all]"),
+    )
+    parser.add_argument('-t', '--tracking', action='store_true', help='Enable dataflow tracking')
 
     args = parser.parse_args()
 
     if args.config == "none":
-        config_file = config_file = os.path.join(os.path.dirname(__file__), "tcn_shm_receiver.yaml")
+        config_file = config_file = os.path.join(os.path.dirname(__file__), "tcn_shm_vlm_inference.yaml")
     else:
         config_file = args.config
 
-    main(config_file=config_file)
+    main(config_file=config_file, scheduler_type=args.scheduler, log_level=args.log_level, with_tracker=args.tracking)

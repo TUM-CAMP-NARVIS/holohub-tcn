@@ -69,6 +69,7 @@ RUN apt-get update \
       build-essential \
       ccache \
       gdb \
+      python3-dbg \
       git-lfs \
       wget \
       unzip \

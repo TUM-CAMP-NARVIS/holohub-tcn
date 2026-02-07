@@ -77,31 +77,42 @@ class ShmSimpleBackprojectionSubgraph(Subgraph):
 
         # # create pose tree service for fragment
         log.info("Register PoseTreeManager")
-        pose_tree_config = app.kwargs("pose_tree_config")  # see pose_tree_basic.yaml
         pts = PoseTreeManager(
             self,
             name="pose_tree_manager",
-            **pose_tree_config,
+            **app.kwargs("pose_tree_config"),
         )
         app.register_service(pts)
 
-        # # configure pose-tree
-        pts.tree.create_frame("world_origin")
+        pose_tree_config = {"frames": [], "edges": []}
+        pose_tree_config["frames"].append("world_origin")
         for name in camera_names:
             log.info(f"Create Reference frames for camera {name}")
             # the frames are intentionally called like the streams to simplify lookup
             depth_channel_name = f"{name}_depthimage"
             color_channel_name = f"{name}_colorimage"
-            pts.tree.create_frame(depth_channel_name)
-            pts.tree.create_frame(color_channel_name)
-            # connect the frames
-            pts.tree.create_edges("world_origin", depth_channel_name)
-            pts.tree.create_edges(depth_channel_name, color_channel_name)
-            # set transforms
-            pts.tree.set("world_origin", depth_channel_name, 0,
-                         convert_rigid_transform_to_pose3(ctx_service.get_depth_extrinsics(name)))
-            pts.tree.set(color_channel_name, depth_channel_name, 0,
-                         convert_rigid_transform_to_pose3(ctx_service.get_color_to_depth(name)))
+            pose_tree_config["frames"].append(depth_channel_name)
+            pose_tree_config["frames"].append(color_channel_name)
+            pose_tree_config["edges"].append(("world_origin", depth_channel_name, convert_rigid_transform_to_pose3(ctx_service.get_depth_extrinsics(name))))
+            pose_tree_config["edges"].append((color_channel_name, depth_channel_name, convert_rigid_transform_to_pose3(ctx_service.get_color_to_depth(name))))
+
+        # # # configure pose-tree
+        # pts.tree.create_frame("world_origin")
+        # for name in camera_names:
+        #     log.info(f"Create Reference frames for camera {name}")
+        #     # the frames are intentionally called like the streams to simplify lookup
+        #     depth_channel_name = f"{name}_depthimage"
+        #     color_channel_name = f"{name}_colorimage"
+        #     pts.tree.create_frame(depth_channel_name)
+        #     pts.tree.create_frame(color_channel_name)
+        #     # connect the frames
+        #     pts.tree.create_edges("world_origin", depth_channel_name)
+        #     pts.tree.create_edges(depth_channel_name, color_channel_name)
+        #     # set transforms
+        #     pts.tree.set("world_origin", depth_channel_name, 0,
+        #                  convert_rigid_transform_to_pose3(ctx_service.get_depth_extrinsics(name)))
+        #     pts.tree.set(color_channel_name, depth_channel_name, 0,
+        #                  convert_rigid_transform_to_pose3(ctx_service.get_color_to_depth(name)))
 
         log.info(f"Retrieve channel config for stream: {shm_stream_name}")
         channels_config = shm_receiver.retrieve_channel_config(shm_stream_name)
@@ -140,7 +151,8 @@ class ShmSimpleBackprojectionSubgraph(Subgraph):
         )
 
         log.info(f"create subscriber op {shm_stream_name}")
-        subscriber_op = ShmSubscriberOp(self, cuda_stream_pool, device_memory_pool, shm_receiver, shm_stream_name, channels_config, cycle_time_ms, name="shm_subscriber")
+        subscriber_op = ShmSubscriberOp(self, cuda_stream_pool, device_memory_pool, shm_receiver, shm_stream_name,
+                                        channels_config, pose_tree_config, cycle_time_ms, name="shm_subscriber")
 
         log.info("create stream_splitter op")
         split_op = StreamSplitterOp(self, cuda_stream_pool, [v["name"] for v in depth_streams_config], name="stream_splitter")
