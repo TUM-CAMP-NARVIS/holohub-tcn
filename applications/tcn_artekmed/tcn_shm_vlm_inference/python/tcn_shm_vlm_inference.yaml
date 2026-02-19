@@ -12,26 +12,12 @@ shared_memory:
 camera_stream_processing:
   device_id: 0
   buffer_size: 8
-  enable_temporal_filter: True
-  enable_background_substract: False
-  enable_compute_weights: True
-  enable_warp_colorimage: True
+  enable_da2: False
 
-depthimage_temporal_filter:
-  alpha: 0.15
-  delta: 30
-  persistence: 3
 
-depthimage_fgbg_mask:
-  sensitivity: 1.5
-
-depthimage_apply_mask:
-  invert_mask: False
-
-depthimage_backprojection:
-  depth_units_per_meter: 1000.0
-  near_limit_m: 0.01
-  far_limit_m: 10.0
+# Depth Anything V2 Example
+da2_inference_config:
+  model_path: "/srv/models/active/depth_anything_v2/depth_anything_v2_vits.onnx"
 
 da2_preprocessor:
   out_tensor_name: preprocessed
@@ -49,9 +35,6 @@ da2_inference:
     "depth": ["inference_output"]
   input_on_cuda: true
   is_engine_path: false
-
-
-rmm_allocator:
 
 debug_output:
   enable_colorimage: True

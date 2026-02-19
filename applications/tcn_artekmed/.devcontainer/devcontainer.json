@@ -45,6 +45,8 @@
         "__GL_SHADER_DISK_CACHE_PATH": "${containerWorkspaceFolder}/.cache/GLCache"
     },
     "mounts": [
+        // model repository
+        "source=/srv/models,target=/srv/models,type=bind",
         // icoryx2 support
         "source=/tmp/iceoryx2,target=/tmp/iceoryx2,type=bind",
         // Wayland support

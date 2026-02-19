@@ -195,4 +195,4 @@ RUN groupadd --gid $USER_GID $USERNAME \
 # (See https://code.visualstudio.com/remote/advancedcontainers/add-nonroot-user)
 USER $USERNAME
 
-ENV PYTHONPATH=/usr/local/lib/python3.10/dist-packages:$PYTHONPATH
+ENV PYTHONPATH=/usr/local/lib/python3.12/dist-packages:$PYTHONPATH
