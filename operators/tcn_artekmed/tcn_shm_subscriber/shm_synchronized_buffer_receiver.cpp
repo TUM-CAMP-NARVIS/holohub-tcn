@@ -350,6 +350,19 @@ bool ShmSynchronizedBufferReceiver::subscribe(const std::string& stream_name) {
                           service_name_str,
                           static_cast<void*>(sub_state_.get()),
                           static_cast<const void*>(&sub_state_->subscriber));
+
+        // Notify the publisher that we connected so it calls update_connections()
+        // and starts delivering frames to this subscriber.
+        auto sname = iox2::ServiceName::create(service_name_str.c_str()).value();
+        auto event_service = node_.service_builder(sname)
+            .event()
+            .open_or_create()
+            .value();
+        auto notifier = event_service.notifier_builder().create().value();
+        notifier.notify_with_custom_event_id(
+            iox2::EventId(static_cast<size_t>(PubSubEvent::SubscriberConnected)));
+        HOLOSCAN_LOG_INFO("Sent SubscriberConnected event for {}", service_name_str);
+
         return true;
     } catch (const std::exception& e) {
         HOLOSCAN_LOG_ERROR("Error subscribing to channel for {}: {}",
