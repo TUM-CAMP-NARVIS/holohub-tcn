@@ -20,9 +20,11 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <regex>
 #include <set>
 #include <stdexcept>
+#include <type_traits>
 
 #include <holoscan/logger/logger.hpp>
 
@@ -36,10 +38,12 @@ using SlicePayload = iox2::bb::Slice<uint8_t>;
 static const std::regex kDeviceContextPattern(R"(^(.+)/DEVICE_CONTEXT/SensorCalibration$)");
 
 // ---------------------------------------------------------------------------
-// SubscriberState: holds iceoryx2 service + subscriber for frame data
+// SubscriberState: holds iceoryx2 service + subscriber for frame data.
+// All iceoryx2 objects are constructed in-place on the heap to avoid
+// post-creation moves that may invalidate internal C FFI handles.
 // ---------------------------------------------------------------------------
 struct ShmSynchronizedBufferReceiver::SubscriberState {
-    using PubSubService = decltype(
+    using PubSubService = std::remove_reference_t<decltype(
         std::declval<iox2::Node<IpcServiceType>>()
             .service_builder(std::declval<iox2::ServiceName>())
             .publish_subscribe<SlicePayload>()
@@ -48,19 +52,48 @@ struct ShmSynchronizedBufferReceiver::SubscriberState {
             .history_size(1U)
             .subscriber_max_buffer_size(4U)
             .open()
-            .value());
+            .value())>;
 
-    using Subscriber = decltype(
+    using Subscriber = std::remove_reference_t<decltype(
         std::declval<PubSubService>()
             .subscriber_builder()
             .create()
-            .value());
+            .value())>;
 
     PubSubService service;
-    Subscriber subscriber;
+    std::optional<Subscriber> subscriber;  // constructed after service is stable
 
-    SubscriberState(PubSubService svc, Subscriber sub)
-        : service(std::move(svc)), subscriber(std::move(sub)) {}
+    // Factory: first allocate service on the heap, THEN create subscriber
+    // from the heap-resident service so the subscriber is never moved.
+    static std::unique_ptr<SubscriberState> create(
+        iox2::Node<IpcServiceType>& node,
+        const std::string& service_name_str) {
+        auto sname = iox2::ServiceName::create(service_name_str.c_str()).value();
+
+        auto service = node.service_builder(sname)
+            .publish_subscribe<SlicePayload>()
+            .user_header<ShmSerializedStreamHeader>()
+            .payload_alignment(8)
+            .history_size(1U)
+            .subscriber_max_buffer_size(4U)
+            .open()
+            .value();
+
+        // Allocate on heap with service moved in; subscriber not yet created
+        auto state = std::unique_ptr<SubscriberState>(
+            new SubscriberState(std::move(service)));
+
+        // Now create subscriber from the heap-resident service.
+        // The subscriber is constructed directly in the optional — no moves.
+        state->subscriber.emplace(
+            state->service.subscriber_builder().create().value());
+
+        return state;
+    }
+
+private:
+    explicit SubscriberState(PubSubService&& svc)
+        : service(std::move(svc)) {}
 };
 
 // ---------------------------------------------------------------------------
@@ -311,26 +344,12 @@ bool ShmSynchronizedBufferReceiver::subscribe(const std::string& stream_name) {
     auto service_name_str = stream_name + "/COMPOSITE_BUFFER/Frame";
 
     try {
-        auto sname = iox2::ServiceName::create(service_name_str.c_str()).value();
-
         HOLOSCAN_LOG_INFO("Opening pub/sub service: {}", service_name_str);
-        auto service = node_.service_builder(sname)
-            .publish_subscribe<SlicePayload>()
-            .user_header<ShmSerializedStreamHeader>()
-            .payload_alignment(8)
-            .history_size(1U)
-            .subscriber_max_buffer_size(4U)
-            .open()
-            .value();
-
-        HOLOSCAN_LOG_INFO("Creating subscriber for: {}", service_name_str);
-        auto subscriber = service.subscriber_builder().create().value();
-
-        sub_state_ = std::make_unique<SubscriberState>(
-            std::move(service), std::move(subscriber));
-
-        HOLOSCAN_LOG_INFO("Subscribed to {} (sub_state_={:p})",
-                          service_name_str, static_cast<void*>(sub_state_.get()));
+        sub_state_ = SubscriberState::create(node_, service_name_str);
+        HOLOSCAN_LOG_INFO("Subscribed to {} (sub_state_={:p}, subscriber={:p})",
+                          service_name_str,
+                          static_cast<void*>(sub_state_.get()),
+                          static_cast<const void*>(&sub_state_->subscriber));
         return true;
     } catch (const std::exception& e) {
         HOLOSCAN_LOG_ERROR("Error subscribing to channel for {}: {}",
@@ -344,16 +363,19 @@ bool ShmSynchronizedBufferReceiver::subscribe(const std::string& stream_name) {
 // ---------------------------------------------------------------------------
 bool ShmSynchronizedBufferReceiver::receive_frame(
     const FrameCallback& callback, int cycle_time_ms) {
-    if (!sub_state_) {
-        HOLOSCAN_LOG_ERROR("Missing subscriber (sub_state_ is null)");
+    if (!sub_state_ || !sub_state_->subscriber.has_value()) {
+        HOLOSCAN_LOG_ERROR("Missing subscriber (sub_state_ or subscriber is null)");
         return false;
     }
 
     auto cycle_time = iox2::bb::Duration::from_millis(static_cast<uint64_t>(cycle_time_ms));
 
     try {
+        HOLOSCAN_LOG_INFO("receive_frame: entering loop, sub_state_={:p}, subscriber={:p}",
+                          static_cast<void*>(sub_state_.get()),
+                          static_cast<const void*>(&(*sub_state_->subscriber)));
         while (true) {
-            auto maybe_sample = sub_state_->subscriber.receive().value();
+            auto maybe_sample = sub_state_->subscriber->receive().value();
             if (maybe_sample.has_value()) {
                 auto& sample = maybe_sample.value();
 
