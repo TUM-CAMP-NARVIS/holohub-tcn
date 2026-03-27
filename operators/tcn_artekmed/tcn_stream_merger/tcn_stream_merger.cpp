@@ -171,23 +171,23 @@ void TcnStreamMergerOp::compute(holoscan::InputContext& op_input,
     auto allocator_handle = nvidia::gxf::Handle<nvidia::gxf::Allocator>::Create(
         context.context(), allocator_->gxf_cid());
 
-    nvidia::gxf::Handle<nvidia::gxf::Tensor> out_tensor = nullptr;
-    if (!tcn::allocate_named_tensor<uint8_t>(
-            allocator_handle.value(),
-            output_stream,
-            out_gxf_entity,
-            out_shape,
-            nvidia::gxf::MemoryStorageType::kDevice,
-            out_msg_name,
-            out_tensor)) {
+    // Allocate output tensor with the same element type as the inputs
+    auto out_tensor_handle = out_gxf_entity.add<nvidia::gxf::Tensor>(out_msg_name.c_str());
+    if (!out_tensor_handle) {
+      throw std::runtime_error("TcnStreamMergerOp: failed to add fused output tensor.");
+    }
+    auto strides = nvidia::gxf::ComputeTrivialStrides(out_shape, elem_size);
+    auto reshape_result = out_tensor_handle.value()->reshapeCustom(
+        out_shape, elem_type, elem_size, strides,
+        nvidia::gxf::MemoryStorageType::kDevice, allocator_handle.value());
+    if (!reshape_result) {
       throw std::runtime_error("TcnStreamMergerOp: failed to allocate fused output tensor.");
     }
 
-    auto maybe_out_data = out_tensor->data<uint8_t>();
-    if (!maybe_out_data) {
+    auto* out_ptr = out_tensor_handle.value()->pointer();
+    if (!out_ptr) {
       throw std::runtime_error("TcnStreamMergerOp: failed to access fused output tensor data.");
     }
-    uint8_t* out_ptr = maybe_out_data.value();
 
     int64_t height = first_shape.dimension(0);
     int64_t depth = (ndim > 2) ? first_shape.dimension(2) : 1;
@@ -199,11 +199,10 @@ void TcnStreamMergerOp::compute(holoscan::InputContext& op_input,
       size_t src_row_bytes = src_width * depth * elem_size;
       size_t dst_row_bytes = total_width * depth * elem_size;
 
-      auto maybe_src_data = input.tensor->data<uint8_t>();
-      if (!maybe_src_data) {
+      auto* src_ptr = input.tensor->pointer();
+      if (!src_ptr) {
         throw std::runtime_error("TcnStreamMergerOp: failed to access input tensor data.");
       }
-      const uint8_t* src_ptr = maybe_src_data.value();
 
       for (int64_t row = 0; row < height; ++row) {
         size_t dst_offset = row * dst_row_bytes + row_elem_offset * depth * elem_size;
