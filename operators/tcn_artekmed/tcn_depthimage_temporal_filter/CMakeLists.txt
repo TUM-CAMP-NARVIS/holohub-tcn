@@ -41,4 +41,6 @@ target_include_directories(tcn_depthimage_temporal_filter PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
 )
 
-add_subdirectory(python)
+if(HOLOHUB_BUILD_PYTHON)
+  add_subdirectory(python)
+endif()
