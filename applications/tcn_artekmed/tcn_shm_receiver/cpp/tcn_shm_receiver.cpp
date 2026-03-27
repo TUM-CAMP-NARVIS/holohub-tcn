@@ -183,12 +183,16 @@ class TcnShmReceiverApp : public holoscan::Application {
             depth_channel_names.push_back(ch.name);
         }
 
+        // Construct the splitter manually so that set_channel_names_init()
+        // is called before the framework triggers setup() — dynamic output
+        // ports must be registered before any add_flow() references them.
         HOLOSCAN_LOG_INFO("Creating stream splitter for {} depth channels", depth_channel_names.size());
-        auto split_op = make_operator<tcn::ops::TcnStreamSplitterOp>(
-            "stream_splitter",
-            Arg("channel_names", depth_channel_names),
-            Arg("cuda_stream_pool", cuda_stream_pool));
+        auto split_op = std::make_shared<tcn::ops::TcnStreamSplitterOp>();
         split_op->set_channel_names_init(depth_channel_names);
+        split_op->name("stream_splitter");
+        split_op->fragment(this);
+        split_op->add_arg(Arg("channel_names", depth_channel_names));
+        split_op->add_arg(Arg("cuda_stream_pool", cuda_stream_pool));
         add_flow(subscriber_op, split_op, {{"depth_outputs", "receivers"}});
 
         // --- HolovizOp visualizers (configured before per-camera loop) ---
@@ -448,16 +452,18 @@ class TcnShmReceiverApp : public holoscan::Application {
             }
         }
 
+        // Construct the merger manually (same rationale as the splitter above).
         HOLOSCAN_LOG_INFO("Merging {} position streams", merge_input_names.size());
-        auto position_merge_op = make_operator<tcn::ops::TcnStreamMergerOp>(
-            "point_fusion",
-            Arg("input_port_names", merge_input_names),
-            Arg("output_message_name", std::string("positions")),
-            Arg("input_message_name", std::string("output")),
-            Arg("fuse_buffers", true),
-            Arg("allocator", device_memory_pool),
-            Arg("cuda_stream_pool", cuda_stream_pool));
+        auto position_merge_op = std::make_shared<tcn::ops::TcnStreamMergerOp>();
         position_merge_op->set_input_port_names_init(merge_input_names);
+        position_merge_op->name("point_fusion");
+        position_merge_op->fragment(this);
+        position_merge_op->add_arg(Arg("input_port_names", merge_input_names));
+        position_merge_op->add_arg(Arg("output_message_name", std::string("positions")));
+        position_merge_op->add_arg(Arg("input_message_name", std::string("output")));
+        position_merge_op->add_arg(Arg("fuse_buffers", true));
+        position_merge_op->add_arg(Arg("allocator", device_memory_pool));
+        position_merge_op->add_arg(Arg("cuda_stream_pool", cuda_stream_pool));
 
         for (auto& [op, conn] : position_merge_connections) {
             add_flow(op, position_merge_op, conn);
@@ -482,13 +488,37 @@ class TcnShmReceiverApp : public holoscan::Application {
         // Color image consumer
         if (enable_colorimage) {
             HOLOSCAN_LOG_INFO("Creating color visualizer");
+
+            // Pre-configure tiled grid layout for multi-camera color display
+            size_t num_colors = discovery_->color_channels.size();
+            int color_grid = num_colors > 0
+                ? static_cast<int>(std::ceil(std::sqrt(static_cast<double>(num_colors))))
+                : 1;
+            float color_tile = 1.0f / color_grid;
+
+            std::vector<ops::HolovizOp::InputSpec> color_specs;
+            for (size_t i = 0; i < num_colors; ++i) {
+                auto& ch = discovery_->color_channels[i];
+                int row = static_cast<int>(i) / color_grid;
+                int col = static_cast<int>(i) % color_grid;
+
+                ops::HolovizOp::InputSpec spec(ch.name, ops::HolovizOp::InputType::COLOR);
+                ops::HolovizOp::InputSpec::View view;
+                view.offset_x_ = col * color_tile;
+                view.offset_y_ = row * color_tile;
+                view.width_ = color_tile;
+                view.height_ = color_tile;
+                spec.views_ = {view};
+                color_specs.push_back(spec);
+            }
+
             auto color_viz = make_operator<ops::HolovizOp>(
                 "color_visualizer",
                 from_config("color_holoviz"),
+                Arg("tensors", color_specs),
                 Arg("allocator", device_memory_pool),
                 Arg("cuda_stream_pool", cuda_stream_pool));
             add_flow(subscriber_op, color_viz, {{"color_outputs", "receivers"}});
-            add_flow(subscriber_op, color_viz, {{"color_output_specs", "input_specs"}});
         } else {
             auto ci_sink = make_operator<DummySinkOp>("color_image_sink");
             add_flow(subscriber_op, ci_sink, {{"color_outputs", "input"}});
@@ -497,13 +527,37 @@ class TcnShmReceiverApp : public holoscan::Application {
         // Depth image visualizer
         if (enable_depthimage) {
             HOLOSCAN_LOG_INFO("Creating depth visualizer");
+
+            // Pre-configure tiled grid layout for multi-camera depth display
+            size_t num_depths = discovery_->depth_channels.size();
+            int depth_grid = num_depths > 0
+                ? static_cast<int>(std::ceil(std::sqrt(static_cast<double>(num_depths))))
+                : 1;
+            float depth_tile = 1.0f / depth_grid;
+
+            std::vector<ops::HolovizOp::InputSpec> depth_specs;
+            for (size_t i = 0; i < num_depths; ++i) {
+                auto& ch = discovery_->depth_channels[i];
+                int row = static_cast<int>(i) / depth_grid;
+                int col = static_cast<int>(i) % depth_grid;
+
+                ops::HolovizOp::InputSpec spec(ch.name, ops::HolovizOp::InputType::COLOR);
+                ops::HolovizOp::InputSpec::View view;
+                view.offset_x_ = col * depth_tile;
+                view.offset_y_ = row * depth_tile;
+                view.width_ = depth_tile;
+                view.height_ = depth_tile;
+                spec.views_ = {view};
+                depth_specs.push_back(spec);
+            }
+
             auto depth_viz = make_operator<ops::HolovizOp>(
                 "depth_visualizer",
                 from_config("depth_holoviz"),
+                Arg("tensors", depth_specs),
                 Arg("allocator", device_memory_pool),
                 Arg("cuda_stream_pool", cuda_stream_pool));
             add_flow(subscriber_op, depth_viz, {{"depth_outputs", "receivers"}});
-            add_flow(subscriber_op, depth_viz, {{"depth_output_specs", "input_specs"}});
         }
     }
 
