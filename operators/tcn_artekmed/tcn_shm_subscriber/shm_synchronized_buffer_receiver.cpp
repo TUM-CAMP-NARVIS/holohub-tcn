@@ -273,6 +273,7 @@ bool ShmSynchronizedBufferReceiver::subscribe(const std::string& stream_name) {
     try {
         auto sname = iox2::ServiceName::create(service_name_str.c_str()).value();
 
+        HOLOSCAN_LOG_INFO("Opening pub/sub service: {}", service_name_str);
         auto service = node_.service_builder(sname)
             .publish_subscribe<SlicePayload>()
             .user_header<ShmSerializedStreamHeader>()
@@ -282,11 +283,14 @@ bool ShmSynchronizedBufferReceiver::subscribe(const std::string& stream_name) {
             .open()
             .value();
 
+        HOLOSCAN_LOG_INFO("Creating subscriber for: {}", service_name_str);
         auto subscriber = service.subscriber_builder().create().value();
 
         sub_state_ = std::make_unique<SubscriberState>(
             std::move(service), std::move(subscriber));
 
+        HOLOSCAN_LOG_INFO("Subscribed to {} (sub_state_={:p})",
+                          service_name_str, static_cast<void*>(sub_state_.get()));
         return true;
     } catch (const std::exception& e) {
         HOLOSCAN_LOG_ERROR("Error subscribing to channel for {}: {}",
@@ -301,7 +305,7 @@ bool ShmSynchronizedBufferReceiver::subscribe(const std::string& stream_name) {
 bool ShmSynchronizedBufferReceiver::receive_frame(
     const FrameCallback& callback, int cycle_time_ms) {
     if (!sub_state_) {
-        HOLOSCAN_LOG_ERROR("Missing subscriber");
+        HOLOSCAN_LOG_ERROR("Missing subscriber (sub_state_ is null)");
         return false;
     }
 
