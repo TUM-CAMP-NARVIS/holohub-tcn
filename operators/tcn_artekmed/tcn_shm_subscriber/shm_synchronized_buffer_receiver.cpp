@@ -185,10 +185,7 @@ auto receive_and_transform(
             auto data = payload.payload_data();
             auto size = payload.payload_len();
 
-            HOLOSCAN_LOG_INFO("Received message from {} ({} bytes, data={:p}, aligned={})",
-                              service_name_str, size,
-                              static_cast<const void*>(data),
-                              (reinterpret_cast<uintptr_t>(data) % 8 == 0));
+            HOLOSCAN_LOG_DEBUG("Received message from {} ({} bytes)", service_name_str, size);
 
             if (size == 0) {
                 HOLOSCAN_LOG_ERROR("Empty payload from {} — skipping", service_name_str);
@@ -198,27 +195,6 @@ auto receive_and_transform(
                 HOLOSCAN_LOG_ERROR("Payload too small ({} bytes) from {} — need at least 8 for segment table",
                                    size, service_name_str);
                 continue;
-            }
-
-            // Log first 64 bytes as hex for diagnostics
-            {
-                std::string hex;
-                for (std::size_t i = 0; i < std::min(size, std::size_t(64)); ++i) {
-                    char buf[4];
-                    snprintf(buf, sizeof(buf), "%02x ", data[i]);
-                    hex += buf;
-                }
-                HOLOSCAN_LOG_INFO("  payload hex[0..{}]: {}", std::min(size, std::size_t(64)), hex);
-
-                // Parse segment table manually for diagnostics
-                uint32_t num_segments = *reinterpret_cast<const uint32_t*>(data) + 1;
-                HOLOSCAN_LOG_INFO("  capnp segment count: {}", num_segments);
-                if (num_segments > 0 && num_segments < 100) {
-                    for (uint32_t s = 0; s < num_segments && (s + 1) * 4 + 4 <= size; ++s) {
-                        uint32_t seg_words = reinterpret_cast<const uint32_t*>(data)[s + 1];
-                        HOLOSCAN_LOG_INFO("    segment[{}]: {} words ({} bytes)", s, seg_words, seg_words * 8);
-                    }
-                }
             }
 
             // Notify publisher we received the sample
@@ -384,9 +360,6 @@ bool ShmSynchronizedBufferReceiver::receive_frame(
     auto cycle_time = iox2::bb::Duration::from_millis(static_cast<uint64_t>(cycle_time_ms));
 
     try {
-        HOLOSCAN_LOG_INFO("receive_frame: entering loop, sub_state_={:p}, subscriber={:p}",
-                          static_cast<void*>(sub_state_.get()),
-                          static_cast<const void*>(&(*sub_state_->subscriber)));
         while (true) {
             auto maybe_sample = sub_state_->subscriber->receive().value();
             if (maybe_sample.has_value()) {
