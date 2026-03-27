@@ -1,0 +1,6 @@
+{
+    "operator": {
+        "name": "TCN DepthImage Apply Mask",
+        "description": "Applies binary mask to depth image with configurable invert on the GPU."
+    }
+}

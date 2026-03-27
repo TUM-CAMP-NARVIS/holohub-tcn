@@ -1,0 +1,6 @@
+{
+    "operator": {
+        "name": "TCN DepthImage Foreground Background Mask",
+        "description": "Foreground/background separation using depth and reference frame with configurable sensitivity."
+    }
+}

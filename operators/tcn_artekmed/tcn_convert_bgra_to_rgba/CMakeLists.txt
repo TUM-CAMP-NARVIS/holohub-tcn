@@ -13,7 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.24)
+project(tcn_convert_bgra_to_rgba LANGUAGES CXX CUDA)
 
-add_subdirectory(cpp)
-add_subdirectory(python)
+find_package(holoscan 3.0 REQUIRED CONFIG
+             PATHS "/opt/nvidia/holoscan" "/workspace/holoscan-sdk/install")
+
+add_library(tcn_convert_bgra_to_rgba SHARED
+        tcn_convert_bgra_to_rgba.cu
+)
+add_library(holoscan::ops::tcn_convert_bgra_to_rgba ALIAS tcn_convert_bgra_to_rgba)
+
+target_link_libraries(tcn_convert_bgra_to_rgba PUBLIC
+  holoscan::core
+  cuda
+)
+target_include_directories(tcn_convert_bgra_to_rgba PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+)
+
+if(HOLOHUB_BUILD_PYTHON)
+  add_subdirectory(python)
+endif()

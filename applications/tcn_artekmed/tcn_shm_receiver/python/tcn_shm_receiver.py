@@ -490,7 +490,7 @@ class App(hs.core.Application):
         # merge Pointclouds
         merge_inputs = list({list(v[1])[0][1] for v in position_merge_connections})
         log.info(f"Merge Position Streams: {merge_inputs}")
-        position_merge_op = StreamMergerOp(self, cuda_stream_pool, merge_inputs, "output", "positions", True, name="point_fusion")
+        position_merge_op = StreamMergerOp(self, cuda_stream_pool, merge_inputs, "output", "positions", True, allocator=device_memory_pool, name="point_fusion")
         for op, conn in position_merge_connections:
             log.debug(f"Flow: {op.name} -> position_merge_op [point_fusion] {conn}")
             self.add_flow(op, position_merge_op, conn)

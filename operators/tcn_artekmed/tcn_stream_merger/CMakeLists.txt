@@ -13,7 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.24)
+project(tcn_stream_merger LANGUAGES CXX CUDA)
 
-add_subdirectory(cpp)
-add_subdirectory(python)
+find_package(holoscan 3.0 REQUIRED CONFIG
+             PATHS "/opt/nvidia/holoscan" "/workspace/holoscan-sdk/install")
+find_package(CUDAToolkit REQUIRED)
+
+add_library(tcn_stream_merger SHARED
+        tcn_stream_merger.cpp
+)
+add_library(holoscan::ops::tcn_stream_merger ALIAS tcn_stream_merger)
+
+target_link_libraries(tcn_stream_merger PUBLIC
+  holoscan::core
+  CUDA::cudart
+)
+target_include_directories(tcn_stream_merger PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+)
+
+if(HOLOHUB_BUILD_PYTHON)
+  add_subdirectory(python)
+endif()

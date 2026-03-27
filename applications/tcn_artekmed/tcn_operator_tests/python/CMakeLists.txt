@@ -14,6 +14,20 @@
 # limitations under the License.
 
 cmake_minimum_required(VERSION 3.20)
+project(tcn_operator_tests LANGUAGES NONE)
 
-add_subdirectory(cpp)
-add_subdirectory(python)
+find_package(holoscan 3.7.0 REQUIRED CONFIG
+             PATHS "/opt/nvidia/holoscan" "/workspace/holoscan-sdk/install")
+
+# Link all new C++ operators for compilation verification
+add_library(tcn_operator_tests INTERFACE)
+target_link_libraries(tcn_operator_tests INTERFACE
+    holoscan::core
+    holoscan::ops::tcn_convert_bgra_to_rgba
+    holoscan::ops::tcn_flatten_tensor
+    holoscan::ops::tcn_depthimage_max_distance
+    holoscan::ops::tcn_depthimage_apply_mask
+    holoscan::ops::tcn_depthimage_fgbg_mask
+    holoscan::ops::tcn_stream_splitter
+    holoscan::ops::tcn_stream_merger
+)

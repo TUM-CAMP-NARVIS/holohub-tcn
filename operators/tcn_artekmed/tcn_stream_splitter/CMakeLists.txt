@@ -13,7 +13,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.24)
+project(tcn_stream_splitter LANGUAGES CXX)
 
-add_subdirectory(cpp)
-add_subdirectory(python)
+find_package(holoscan 3.0 REQUIRED CONFIG
+             PATHS "/opt/nvidia/holoscan" "/workspace/holoscan-sdk/install")
+
+add_library(tcn_stream_splitter SHARED
+        tcn_stream_splitter.cpp
+)
+add_library(holoscan::ops::tcn_stream_splitter ALIAS tcn_stream_splitter)
+
+target_link_libraries(tcn_stream_splitter PUBLIC
+  holoscan::core
+)
+target_include_directories(tcn_stream_splitter PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+)
+
+if(HOLOHUB_BUILD_PYTHON)
+  add_subdirectory(python)
+endif()

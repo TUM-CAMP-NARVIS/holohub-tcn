@@ -1,0 +1,57 @@
+{
+	"application": {
+		"name": "tcn_operator_tests",
+		"description": "Test suite for C++ ported tcn_artekmed operators",
+		"authors": [
+			{
+				"name": "Ulrich Eck",
+				"affiliation": "TU Munich"
+			}
+		],
+		"language": "python",
+		"version": "0.1.0",
+		"changelog": {
+			"0.1.0": "Initial Release"
+		},
+		"dockerfile": "applications/tcn_artekmed/Dockerfile",
+		"holoscan_sdk": {
+			"minimum_required_version": "3.7.0",
+			"tested_versions": [
+				"3.7.0"
+			]
+		},
+		"platforms": ["x86_64", "aarch64"],
+		"tags": [
+			"Testing",
+			"Operators"
+		],
+		"ranking": 1,
+		"requirements": {
+			"gpu": {
+				"type": "hardware",
+				"name": "gpu",
+				"description": "NVIDIA GPU required for CUDA operators"
+			},
+			"packages": []
+		},
+		"default_mode": "standard",
+		"modes": {
+			"standard": {
+				"description": "Run operator test suite",
+				"requirements": [],
+				"run": {
+					"command": "python3 <holohub_app_source>/tcn_operator_tests.py",
+					"workdir": "holohub_bin"
+				}
+			},
+			"console": {
+				"description": "console",
+				"requirements": [],
+				"run": {
+					"command": "/bin/bash",
+					"workdir": "holohub_bin"
+				}
+			}
+		}
+	}
+}

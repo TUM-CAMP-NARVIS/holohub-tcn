@@ -1,0 +1,6 @@
+{
+    "operator": {
+        "name": "TCN Convert BGRA to RGBA",
+        "description": "Converts HxWx4 BGRA images to RGBA on the GPU using a CUDA kernel."
+    }
+}

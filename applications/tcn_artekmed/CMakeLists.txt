@@ -22,6 +22,16 @@ add_holohub_application(tcn_shm_receiver DEPENDS OPERATORS
                           tcn_depthimage_temporal_filter
                           tcn_depthimage_weights
                           tcn_texture_sampler
+                          tcn_convert_bgra_to_rgba
+                          tcn_depthimage_apply_mask
+                          tcn_depthimage_fgbg_mask
+                          tcn_depthimage_max_distance
+                          tcn_flatten_tensor
+                          tcn_stream_splitter
+                          tcn_stream_merger
+                          tcn_shm_serde
+                          tcn_shm_subscriber
+                          tcn_device_context
                           #slang_shader
                           )
 
@@ -39,4 +49,14 @@ add_holohub_application(tcn_shm_vlm_inference DEPENDS OPERATORS
         tcn_depthimage_temporal_filter
         tcn_depthimage_weights
         tcn_texture_sampler
+)
+
+add_holohub_application(tcn_operator_tests DEPENDS OPERATORS
+        tcn_convert_bgra_to_rgba
+        tcn_flatten_tensor
+        tcn_depthimage_max_distance
+        tcn_depthimage_apply_mask
+        tcn_depthimage_fgbg_mask
+        tcn_stream_splitter
+        tcn_stream_merger
 )

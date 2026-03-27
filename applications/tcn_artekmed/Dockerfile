@@ -53,6 +53,7 @@ ARG CMAKE_BUILD_TYPE=Release
 RUN apt-get update \
     && apt-get install -y \
       libavformat-dev gdb rustc cargo \
+      capnproto libcapnp-dev \
       libeigen3-dev \
       libglfw3-dev \
       libxkbcommon-x11-0 \
@@ -135,13 +136,35 @@ RUN rm -Rf /tmp/depencencies/pybind11 && \
     cmake --build . --config Release -- -j 8  && \
     cmake --install .
 
+# Upgrade Rust toolchain for iceoryx2 (base image has Cargo 1.75 which is too old)
+# Also install libclang-dev for bindgen
+RUN apt-get update && apt-get install -y --no-install-recommends libclang-dev && \
+    rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && \
+    . "$HOME/.cargo/env" && rustc --version && cargo --version
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Build and install iceoryx2 v0.8.1 C/C++ bindings (requires Rust toolchain)
+WORKDIR /tmp/dependencies
+RUN rm -Rf /tmp/dependencies/iceoryx2 && \
+    git clone --depth 1 --branch v0.8.1 https://github.com/eclipse-iceoryx/iceoryx2.git && \
+    cd iceoryx2 && \
+    cargo generate-lockfile && \
+    mkdir build && \
+    cd build && \
+    cmake -G "Ninja" .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF && \
+    cmake --build . --config Release -- -j $(nproc) && \
+    cmake --install . && \
+    cd /tmp/dependencies && \
+    rm -rf iceoryx2
+
 WORKDIR /tmp/dependencies
 RUN rm -Rf /tmp/dependencies/xylt && \
     git clone https://github.com/TUM-CAMP-NARVIS/xylt.git && \
     cd xylt && \
     mkdir build && \
     cd build && \
-    cmake -G "Ninja" .. -DCMAKE_BUILD_TYPE=Release && \
+    cmake -G "Ninja" .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON && \
     cmake --build . --config Release && \
     cmake --install . --prefix=/usr && \
     cp /tmp/dependencies/xylt/build/pyxylt.cpython*.so /usr/local/lib/python3.12/dist-packages/

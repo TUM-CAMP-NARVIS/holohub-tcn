@@ -35,8 +35,18 @@
 ## Set the SDK path for the operators to use
 #set(NVC_SDK_PATH ${NVC_SDK_DIR} CACHE PATH "Path to NVIDIA Video Codec SDK")
 
+add_holohub_operator(tcn_convert_bgra_to_rgba)
+add_holohub_operator(tcn_depthimage_apply_mask)
 add_holohub_operator(tcn_depthimage_backprojection)
+add_holohub_operator(tcn_depthimage_fgbg_mask)
+add_holohub_operator(tcn_depthimage_max_distance)
 add_holohub_operator(tcn_depthimage_temporal_filter)
 add_holohub_operator(tcn_depthimage_weights)
+add_holohub_operator(tcn_flatten_tensor)
 add_holohub_operator(tcn_texture_sampler)
 #add_holohub_operator(tcn_stream_synchronizer)
+add_holohub_operator(tcn_stream_splitter)
+add_holohub_operator(tcn_stream_merger)
+add_holohub_operator(tcn_shm_serde)
+add_holohub_operator(tcn_shm_subscriber)
+add_holohub_operator(tcn_device_context)

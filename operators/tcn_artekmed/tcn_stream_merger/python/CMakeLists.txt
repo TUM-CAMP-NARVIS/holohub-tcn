@@ -13,7 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-cmake_minimum_required(VERSION 3.20)
+include(pybind11_add_holohub_module)
 
-add_subdirectory(cpp)
-add_subdirectory(python)
+pybind11_add_holohub_module(
+    CPP_CMAKE_TARGET tcn_stream_merger
+    CLASS_NAME "TcnStreamMergerOp"
+    SOURCES tcn_stream_merger.cpp
+)

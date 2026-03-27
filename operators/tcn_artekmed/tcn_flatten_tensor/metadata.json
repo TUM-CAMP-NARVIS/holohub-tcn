@@ -1,0 +1,6 @@
+{
+    "operator": {
+        "name": "TCN Flatten Tensor",
+        "description": "Reshapes [H,W,...] tensors to [1,H*W,...] on the GPU."
+    }
+}
