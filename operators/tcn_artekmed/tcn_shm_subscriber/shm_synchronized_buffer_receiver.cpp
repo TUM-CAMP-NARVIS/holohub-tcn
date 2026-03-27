@@ -18,6 +18,7 @@
 #include "shm_synchronized_buffer_receiver.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <regex>
 #include <set>
@@ -151,16 +152,54 @@ auto receive_and_transform(
             auto data = payload.payload_data();
             auto size = payload.payload_len();
 
-            HOLOSCAN_LOG_DEBUG("Received message from {} ({} bytes)",
-                               service_name_str, size);
+            HOLOSCAN_LOG_INFO("Received message from {} ({} bytes, data={:p}, aligned={})",
+                              service_name_str, size,
+                              static_cast<const void*>(data),
+                              (reinterpret_cast<uintptr_t>(data) % 8 == 0));
+
+            if (size == 0) {
+                HOLOSCAN_LOG_ERROR("Empty payload from {} — skipping", service_name_str);
+                continue;
+            }
+            if (size < 8) {
+                HOLOSCAN_LOG_ERROR("Payload too small ({} bytes) from {} — need at least 8 for segment table",
+                                   size, service_name_str);
+                continue;
+            }
+
+            // Log first 64 bytes as hex for diagnostics
+            {
+                std::string hex;
+                for (std::size_t i = 0; i < std::min(size, std::size_t(64)); ++i) {
+                    char buf[4];
+                    snprintf(buf, sizeof(buf), "%02x ", data[i]);
+                    hex += buf;
+                }
+                HOLOSCAN_LOG_INFO("  payload hex[0..{}]: {}", std::min(size, std::size_t(64)), hex);
+
+                // Parse segment table manually for diagnostics
+                uint32_t num_segments = *reinterpret_cast<const uint32_t*>(data) + 1;
+                HOLOSCAN_LOG_INFO("  capnp segment count: {}", num_segments);
+                if (num_segments > 0 && num_segments < 100) {
+                    for (uint32_t s = 0; s < num_segments && (s + 1) * 4 + 4 <= size; ++s) {
+                        uint32_t seg_words = reinterpret_cast<const uint32_t*>(data)[s + 1];
+                        HOLOSCAN_LOG_INFO("    segment[{}]: {} words ({} bytes)", s, seg_words, seg_words * 8);
+                    }
+                }
+            }
 
             // Notify publisher we received the sample
             notifier.notify_with_custom_event_id(
                 iox2::EventId(static_cast<size_t>(PubSubEvent::ReceivedSample)));
 
             // Decode and transform while the sample (and its SHM buffer) is alive.
-            auto decoded = DecodedMessage<CapnpType>::decode(data, size);
-            return transform(decoded.root());
+            try {
+                auto decoded = DecodedMessage<CapnpType>::decode(data, size);
+                return transform(decoded.root());
+            } catch (const std::exception& e) {
+                HOLOSCAN_LOG_ERROR("Cap'n Proto decode/transform failed for {}: {}", service_name_str, e.what());
+                throw;
+            }
         }
         // Brief wait before retry
         node.wait(iox2::bb::Duration::from_millis(1));
