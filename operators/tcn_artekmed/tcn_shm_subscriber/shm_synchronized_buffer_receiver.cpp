@@ -43,6 +43,7 @@ struct ShmSynchronizedBufferReceiver::SubscriberState {
             .service_builder(std::declval<iox2::ServiceName>())
             .publish_subscribe<SlicePayload>()
             .user_header<ShmSerializedStreamHeader>()
+            .payload_alignment(8)
             .history_size(1U)
             .subscriber_max_buffer_size(4U)
             .open()

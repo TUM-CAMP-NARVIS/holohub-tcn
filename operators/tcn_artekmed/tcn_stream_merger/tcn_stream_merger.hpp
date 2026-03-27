@@ -44,6 +44,14 @@ class TcnStreamMergerOp : public holoscan::Operator {
     input_port_names_init_ = std::move(names);
   }
 
+  /// Create OperatorSpec and call setup().  Must be called after
+  /// set_input_port_names_init(), name(), and fragment() when the operator
+  /// is constructed manually (i.e. without make_operator<>()).
+  void init_spec() {
+    spec_ = std::make_shared<holoscan::OperatorSpec>(fragment());
+    setup(*spec_);
+  }
+
   void setup(holoscan::OperatorSpec& spec) override;
   void compute(holoscan::InputContext& op_input,
                holoscan::OutputContext& op_output,

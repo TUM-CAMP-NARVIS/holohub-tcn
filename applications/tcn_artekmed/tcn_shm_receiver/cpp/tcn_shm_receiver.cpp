@@ -191,6 +191,7 @@ class TcnShmReceiverApp : public holoscan::Application {
         split_op->set_channel_names_init(depth_channel_names);
         split_op->name("stream_splitter");
         split_op->fragment(this);
+        split_op->init_spec();
         split_op->add_arg(Arg("channel_names", depth_channel_names));
         split_op->add_arg(Arg("cuda_stream_pool", cuda_stream_pool));
         add_flow(subscriber_op, split_op, {{"depth_outputs", "receivers"}});
@@ -458,6 +459,7 @@ class TcnShmReceiverApp : public holoscan::Application {
         position_merge_op->set_input_port_names_init(merge_input_names);
         position_merge_op->name("point_fusion");
         position_merge_op->fragment(this);
+        position_merge_op->init_spec();
         position_merge_op->add_arg(Arg("input_port_names", merge_input_names));
         position_merge_op->add_arg(Arg("output_message_name", std::string("positions")));
         position_merge_op->add_arg(Arg("input_message_name", std::string("output")));
