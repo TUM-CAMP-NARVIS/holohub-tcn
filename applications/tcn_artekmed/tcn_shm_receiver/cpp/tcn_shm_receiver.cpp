@@ -153,14 +153,22 @@ class TcnShmReceiverApp : public holoscan::Application {
             Arg("reserved_size", static_cast<uint32_t>(num_channels)),
             Arg("max_size", static_cast<uint32_t>(256)));
 
-        HOLOSCAN_LOG_INFO("Creating device memory pool: {} bytes, {} blocks on device {}",
-                          discovery_->max_frame_size,
+        // Compute the fused positions tensor size (all depth cameras concatenated along width)
+        // so the block memory pool can accommodate it.
+        size_t fused_positions_size = 0;
+        for (const auto& ch : discovery_->depth_channels) {
+            fused_positions_size += static_cast<size_t>(ch.width) * ch.height * 3 * sizeof(float);
+        }
+        size_t block_size = std::max(discovery_->max_frame_size, fused_positions_size);
+
+        HOLOSCAN_LOG_INFO("Creating device memory pool: {} bytes/block ({} fused positions), {} blocks on device {}",
+                          block_size, fused_positions_size,
                           num_channels * block_memory_buffer_size,
                           cuda_device_id);
         auto device_memory_pool = make_resource<BlockMemoryPool>(
             "shm_subscriber_device_pool",
             Arg("storage_type", static_cast<int32_t>(1)),  // DEVICE
-            Arg("block_size", static_cast<int64_t>(discovery_->max_frame_size)),
+            Arg("block_size", static_cast<int64_t>(block_size)),
             Arg("num_blocks", static_cast<int64_t>(num_channels * block_memory_buffer_size)),
             Arg("dev_id", cuda_device_id));
 
