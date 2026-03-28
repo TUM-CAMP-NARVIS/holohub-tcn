@@ -64,7 +64,7 @@ struct TcnShmZenohSenderOp::PublisherState {
     PubSubService service;
     std::optional<Publisher> publisher;
 
-    static std::unique_ptr<PublisherState> create(
+    static std::shared_ptr<PublisherState> create(
         iox2::Node<IpcServiceType>& node,
         const std::string& service_name_str,
         size_t initial_slice_len) {
@@ -79,7 +79,7 @@ struct TcnShmZenohSenderOp::PublisherState {
             .open_or_create()
             .value();
 
-        auto state = std::unique_ptr<PublisherState>(
+        auto state = std::shared_ptr<PublisherState>(
             new PublisherState(std::move(service)));
 
         state->publisher.emplace(
@@ -97,8 +97,7 @@ private:
         : service(std::move(svc)) {}
 };
 
-// Out-of-line destructor (PublisherState is complete here)
-TcnShmZenohSenderOp::~TcnShmZenohSenderOp() = default;
+// No out-of-line destructor needed — shared_ptr stores deleter at construction time
 
 // ---------------------------------------------------------------------------
 // Operator lifecycle
@@ -193,12 +192,13 @@ void TcnShmZenohSenderOp::compute(
     // Gather tensor info for all ports
     struct PortInfo {
         std::string name;
-        nvidia::gxf::Handle<nvidia::gxf::Tensor> tensor;
+        std::shared_ptr<holoscan::Tensor> tensor;
         int32_t width;
         int32_t height;
         int32_t channels;
         int32_t bits_per_element;
         size_t data_size;
+        bool is_on_gpu;
         bool is_color;
         artekmed::schema::CameraPortType port_type;
         artekmed::schema::PixelFormat pixel_format;
@@ -206,27 +206,27 @@ void TcnShmZenohSenderOp::compute(
     std::vector<PortInfo> ports;
 
     for (const auto& name : tensor_names) {
-        auto maybe_tensor = entity.get<nvidia::gxf::Tensor>(name.c_str());
-        if (!maybe_tensor) {
+        auto tensor = entity.get<holoscan::Tensor>(name.c_str());
+        if (!tensor) {
             HOLOSCAN_LOG_DEBUG("Tensor '{}' not found in entity — skipping", name);
             continue;
         }
-        auto tensor = maybe_tensor.value();
-        auto shape = tensor->shape();
-        if (shape.rank() < 2) {
-            HOLOSCAN_LOG_WARN("Tensor '{}' has rank {} < 2 — skipping", name, shape.rank());
+        auto ndim = tensor->ndim();
+        if (ndim < 2) {
+            HOLOSCAN_LOG_WARN("Tensor '{}' has rank {} < 2 — skipping", name, ndim);
             continue;
         }
 
         PortInfo pi;
         pi.name = name;
         pi.tensor = tensor;
-        pi.height = shape.dimension(0);
-        pi.width = shape.dimension(1);
-        pi.channels = (shape.rank() >= 3) ? shape.dimension(2) : 1;
-        auto element_size = nvidia::gxf::PrimitiveTypeSize(tensor->element_type());
+        pi.height = static_cast<int32_t>(tensor->shape()[0]);
+        pi.width = static_cast<int32_t>(tensor->shape()[1]);
+        pi.channels = (ndim >= 3) ? static_cast<int32_t>(tensor->shape()[2]) : 1;
+        auto element_size = (tensor->dtype().bits + 7) / 8;
         pi.bits_per_element = static_cast<int32_t>(element_size * 8 * pi.channels);
         pi.data_size = static_cast<size_t>(pi.height) * pi.width * pi.channels * element_size;
+        pi.is_on_gpu = (tensor->device().device_type == kDLCUDA);
 
         // Determine port type and pixel format from channel count and element type
         if (pi.channels >= 3) {
@@ -289,17 +289,13 @@ void TcnShmZenohSenderOp::compute(
         auto data_blob = port_data.initData(static_cast<unsigned int>(pi.data_size));
 
         // Copy frame data into the Cap'n Proto blob
-        // First, get the data from GPU if needed
-        auto maybe_data = pi.tensor->data<uint8_t>();
-        if (!maybe_data) {
+        auto* src_ptr = static_cast<const uint8_t*>(pi.tensor->data());
+        if (!src_ptr) {
             HOLOSCAN_LOG_ERROR("Failed to get tensor data pointer for '{}'", pi.name);
             continue;
         }
 
-        auto* src_ptr = maybe_data.value();
-        auto storage_type = pi.tensor->storage_type();
-
-        if (storage_type == nvidia::gxf::MemoryStorageType::kDevice) {
+        if (pi.is_on_gpu) {
             // GPU memory — need to copy to CPU first
             if (staging_buffer_.size() < pi.data_size) {
                 staging_buffer_.resize(pi.data_size);

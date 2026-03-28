@@ -104,6 +104,30 @@ target_link_libraries(tcn_cdr_serde PUBLIC
     tcn_schema::builtin_interfaces
     tcn_schema::geometry_msgs
 )
+# Declare transitive dependencies for the tcn_schema static archives.
+# Without these, the linker sees the archives in the wrong order and fails
+# with "undefined reference" errors (static libs are order-sensitive).
+# Dependency chain: pcpd_msgs -> tcnart_msgs -> std_msgs -> builtin_interfaces
+# All tcn_schema static archives depend on fastcdr for serialization.
+# Declare the dependency chain so the linker sees them in correct order.
+if(TARGET tcn_schema::builtin_interfaces)
+    set_property(TARGET tcn_schema::builtin_interfaces APPEND PROPERTY
+        INTERFACE_LINK_LIBRARIES fastcdr)
+endif()
+if(TARGET tcn_schema::std_msgs AND TARGET tcn_schema::builtin_interfaces)
+    set_property(TARGET tcn_schema::std_msgs APPEND PROPERTY
+        INTERFACE_LINK_LIBRARIES tcn_schema::builtin_interfaces)
+endif()
+if(TARGET tcn_schema::geometry_msgs AND TARGET tcn_schema::std_msgs)
+    set_property(TARGET tcn_schema::geometry_msgs APPEND PROPERTY
+        INTERFACE_LINK_LIBRARIES tcn_schema::std_msgs)
+endif()
+if(TARGET tcn_schema::tcnart_msgs AND TARGET tcn_schema::std_msgs)
+    set_property(TARGET tcn_schema::tcnart_msgs APPEND PROPERTY
+        INTERFACE_LINK_LIBRARIES tcn_schema::std_msgs tcn_schema::geometry_msgs)
+endif()
 if(TARGET tcn_schema::pcpd_msgs)
+    set_property(TARGET tcn_schema::pcpd_msgs APPEND PROPERTY
+        INTERFACE_LINK_LIBRARIES tcn_schema::tcnart_msgs)
     target_link_libraries(tcn_cdr_serde PUBLIC tcn_schema::pcpd_msgs)
 endif()

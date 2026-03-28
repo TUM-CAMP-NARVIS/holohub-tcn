@@ -65,8 +65,7 @@ std::vector<ZenohStreamConfig> TcnZenohReceiverOp::discover_streams(
     // CDR-encode NullRequest payload (matches Python/C++ reference)
     tcnart_msgs::rpc::NullRequest null_req;
     tcn::cdr::CdrBufferWriter writer;
-    std::vector<uint8_t> null_bytes;
-    writer.write(null_req, null_bytes);
+    auto null_bytes = writer.write(null_req);
 
     // Configure GET options: query ALL queriables, 5s timeout, CDR encoding
     zenoh::Session::GetOptions get_opts = zenoh::Session::GetOptions::create_default();

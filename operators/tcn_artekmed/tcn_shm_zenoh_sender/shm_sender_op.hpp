@@ -53,7 +53,6 @@ class TcnShmZenohSenderOp : public holoscan::Operator {
     HOLOSCAN_OPERATOR_FORWARD_ARGS(TcnShmZenohSenderOp)
 
     TcnShmZenohSenderOp() = default;
-    ~TcnShmZenohSenderOp() override;
 
     void setup(holoscan::OperatorSpec& spec) override;
     void initialize() override;
@@ -64,9 +63,9 @@ class TcnShmZenohSenderOp : public holoscan::Operator {
     void stop() override;
 
  private:
-    // iceoryx2 publisher state (PIMPL to avoid exposing complex template types)
+    // iceoryx2 publisher state (PIMPL — shared_ptr so incomplete type works across TUs)
     struct PublisherState;
-    std::unique_ptr<PublisherState> pub_state_;
+    std::shared_ptr<PublisherState> pub_state_;
 
     // iceoryx2 node — must outlive pub_state_
     std::unique_ptr<iox2::Node<iox2::ServiceType::Ipc>> node_;
