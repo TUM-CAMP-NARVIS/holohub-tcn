@@ -204,7 +204,7 @@ WORKDIR /tmp/dependencies
 RUN rm -rf /tmp/dependencies/tcn_schema && \
     git clone --depth 1 https://github.com/TUM-CAMP-NARVIS/tcn_schema.git && \
     cd tcn_schema && \
-    sed -i '23,26s/^/#/' CMakeLists.txt && \
+    sed -i '22,26s/^/#/' CMakeLists.txt && \
     mkdir build && \
     cd build && \
     cmake -G "Ninja" .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
