@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -64,6 +65,37 @@ struct ChannelPortInfo {
 using FrameCallback = std::function<bool(
     const ShmSerializedStreamHeader& header,
     artekmed::shm::ShmBufferDescriptor::Reader descriptor)>;
+
+// ---------------------------------------------------------------------------
+// Zero-copy frame: holds raw pointers into SHM + an opaque handle that keeps
+// the iceoryx2 sample alive until all consumers (CUDA copies) are done.
+// ---------------------------------------------------------------------------
+
+/// Per-port view into shared memory — valid only while the parent
+/// ShmZeroCopyFrame::shm_handle is alive.
+struct ShmPortView {
+    std::string name;
+    bool is_color;          // true = COLORIMAGE, false = DEPTHIMAGE
+    int32_t width = 0;
+    int32_t height = 0;
+    int32_t channels = 0;
+    const uint8_t* data_ptr = nullptr;  // points directly into SHM
+    size_t data_size = 0;
+};
+
+/// A received frame whose pixel data still resides in iceoryx2 shared memory.
+/// The `shm_handle` keeps the SHM segment pinned — callers MUST ensure all
+/// reads (including async CUDA copies) are complete before dropping this struct.
+struct ShmZeroCopyFrame {
+    uint64_t timestamp = 0;
+    std::vector<ShmPortView> ports;
+
+    /// Opaque ownership of the iceoryx2 sample + capnp reader.
+    /// Dropping this releases the SHM segment back to the publisher pool.
+    std::shared_ptr<void> shm_handle;
+
+    explicit operator bool() const { return shm_handle != nullptr; }
+};
 
 /**
  * @brief Low-level iceoryx2 subscriber for receiving SHM camera data.
@@ -112,6 +144,14 @@ public:
     /// @param cycle_time_ms Wait time between polls in milliseconds.
     /// @return true if callback returned true, false on error or callback returned false.
     bool receive_frame(const FrameCallback& callback, int cycle_time_ms = 1);
+
+    /// Zero-copy frame receive.  Returns a frame whose pixel data still
+    /// resides in iceoryx2 SHM.  The caller MUST complete all reads
+    /// (including async CUDA copies) and then drop the returned frame to
+    /// release the SHM segment back to the publisher pool.
+    /// @param cycle_time_ms Wait time before returning nullopt if no data.
+    /// @return Populated frame on success, std::nullopt if no data available.
+    std::optional<ShmZeroCopyFrame> receive_frame_zero_copy(int cycle_time_ms = 1);
 
     /// Clean up all subscribers and services.
     void teardown();

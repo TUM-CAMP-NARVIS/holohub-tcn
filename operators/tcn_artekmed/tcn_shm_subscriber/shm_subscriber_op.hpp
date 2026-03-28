@@ -24,8 +24,6 @@
 #include <queue>
 #include <string>
 #include <thread>
-#include <unordered_map>
-#include <vector>
 
 #include <holoscan/holoscan.hpp>
 #include <cuda_runtime.h>
@@ -34,27 +32,13 @@
 
 namespace tcn::ops {
 
-/// Data received from a single frame: color and depth tensors keyed by port name.
-struct ShmFrameData {
-    uint64_t timestamp;
-    std::unordered_map<std::string, std::vector<uint8_t>> color_data;  // port_name -> RGBA/BGRA pixels
-    std::unordered_map<std::string, std::vector<uint8_t>> depth_data;  // port_name -> uint16 depth
-    // Dimensions per port
-    struct PortDims {
-        int32_t width;
-        int32_t height;
-        int32_t channels;
-    };
-    std::unordered_map<std::string, PortDims> color_dims;
-    std::unordered_map<std::string, PortDims> depth_dims;
-};
-
 /**
  * @brief Holoscan operator that subscribes to SHM camera streams via iceoryx2.
  *
- * C++ port of Python ShmSubscriberOp. Wraps ShmSynchronizedBufferReceiver in a
- * background thread, using an AsynchronousCondition to wake the Holoscan scheduler
- * when new data arrives.
+ * Zero-copy pipeline: the background receiver thread keeps the iceoryx2 SHM
+ * sample alive and passes raw pointers into SHM to the Holoscan scheduler
+ * thread.  compute() performs cudaMemcpyAsync directly from SHM to GPU
+ * device memory, then releases the SHM segment.
  *
  * Outputs:
  *   - color_outputs: Entity with named tensors (one per camera, RGBA/BGRA uint8)
@@ -81,8 +65,6 @@ class TcnShmSubscriberOp : public holoscan::Operator {
 
  private:
     void receiver_mainloop();
-    bool on_receive(const tcn::shm::ShmSerializedStreamHeader& header,
-                    artekmed::shm::ShmBufferDescriptor::Reader descriptor);
 
     // Parameters
     holoscan::Parameter<std::string> stream_name_;
@@ -97,10 +79,12 @@ class TcnShmSubscriberOp : public holoscan::Operator {
     std::thread receiver_thread_;
     std::atomic<bool> should_stop_{false};
 
-    // Thread-safe frame queue
+    // Thread-safe zero-copy frame queue
     std::mutex queue_mutex_;
-    std::condition_variable queue_cv_;
-    std::queue<ShmFrameData> frame_queue_;
+    std::queue<tcn::shm::ShmZeroCopyFrame> frame_queue_;
+
+    // Dedicated CUDA stream for SHM→GPU async copies
+    cudaStream_t copy_stream_ = nullptr;
 };
 
 }  // namespace tcn::ops

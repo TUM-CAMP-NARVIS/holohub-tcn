@@ -348,7 +348,7 @@ bool ShmSynchronizedBufferReceiver::subscribe(const std::string& stream_name) {
 }
 
 // ---------------------------------------------------------------------------
-// receive_frame
+// receive_frame (legacy callback API)
 // ---------------------------------------------------------------------------
 bool ShmSynchronizedBufferReceiver::receive_frame(
     const FrameCallback& callback, int cycle_time_ms) {
@@ -384,6 +384,92 @@ bool ShmSynchronizedBufferReceiver::receive_frame(
         HOLOSCAN_LOG_ERROR("Error receiving frame: {}", e.what());
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// receive_frame_zero_copy — returns a frame with raw pointers into SHM.
+// The iceoryx2 sample is kept alive via a shared_ptr so that callers can
+// perform async CUDA copies before releasing the segment.
+// ---------------------------------------------------------------------------
+std::optional<ShmZeroCopyFrame> ShmSynchronizedBufferReceiver::receive_frame_zero_copy(
+    int cycle_time_ms) {
+    if (!sub_state_ || !sub_state_->subscriber.has_value()) {
+        HOLOSCAN_LOG_ERROR("Missing subscriber (sub_state_ or subscriber is null)");
+        return std::nullopt;
+    }
+
+    try {
+        auto maybe_sample = sub_state_->subscriber->receive().value();
+        if (!maybe_sample.has_value()) {
+            // No data yet — brief wait, then return to let caller check stop flag
+            node_.wait(iox2::bb::Duration::from_millis(
+                static_cast<uint64_t>(cycle_time_ms)));
+            return std::nullopt;
+        }
+
+        auto& sample = maybe_sample.value();
+        auto& user_header = sample.user_header();
+        auto payload_slice = sample.payload();
+        auto* data = payload_slice.data();
+        auto size = payload_slice.number_of_bytes();
+
+        // Decode capnp in-place — reader pointers go directly into SHM
+        auto decoded = DecodedBufferDescriptor::decode(data, size);
+        auto descriptor = decoded.root();
+
+        ShmZeroCopyFrame frame;
+        frame.timestamp = user_header.timestamp;
+
+        for (auto port : descriptor.getPorts()) {
+            auto port_data = port.getData();
+            auto port_type = port_data.getPortType();
+
+            // Only process color and depth image ports
+            if (port_type != artekmed::schema::CameraPortType::COLORIMAGE &&
+                port_type != artekmed::schema::CameraPortType::DEPTHIMAGE) {
+                continue;
+            }
+
+            ShmPortView pv;
+            pv.name = std::string(port.getName().cStr());
+            pv.is_color = (port_type == artekmed::schema::CameraPortType::COLORIMAGE);
+
+            auto metadata = port_data.getMetadata();
+            auto stream_header = metadata.getHeader();
+            pv.width = stream_header.getDimX();
+            pv.height = stream_header.getDimY();
+            int32_t bits_per_element = stream_header.getBitsPerElement();
+            pv.channels = pv.is_color ? (bits_per_element / 8) : 1;
+
+            auto raw_data = port_data.getData();
+            pv.data_ptr = reinterpret_cast<const uint8_t*>(raw_data.begin());
+            pv.data_size = raw_data.size();
+
+            frame.ports.push_back(std::move(pv));
+        }
+
+        if (frame.ports.empty()) {
+            return std::nullopt;
+        }
+
+        // Move sample + decoded reader to the heap so the SHM segment stays
+        // alive until the caller drops the frame.  We define the lifetime
+        // holder locally because the iceoryx2 sample type is complex and
+        // involves private SubscriberState types.
+        using SampleOptType = std::decay_t<decltype(maybe_sample)>;
+        struct ShmLifetime {
+            SampleOptType sample;
+            DecodedBufferDescriptor decoded;
+        };
+        frame.shm_handle = std::make_shared<ShmLifetime>(
+            ShmLifetime{std::move(maybe_sample), std::move(decoded)});
+
+        return frame;
+
+    } catch (const std::exception& e) {
+        HOLOSCAN_LOG_ERROR("Error in zero-copy frame receive: {}", e.what());
+    }
+    return std::nullopt;
 }
 
 // ---------------------------------------------------------------------------

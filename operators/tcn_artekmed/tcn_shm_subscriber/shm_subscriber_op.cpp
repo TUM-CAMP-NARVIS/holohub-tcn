@@ -17,9 +17,6 @@
 
 #include "shm_subscriber_op.hpp"
 
-#include <cmath>
-#include <cstring>
-
 #include <holoscan/utils/cuda_macros.hpp>
 
 #include "../common/utils.h"
@@ -68,6 +65,9 @@ void TcnShmSubscriberOp::start() {
         return;
     }
 
+    // Create a dedicated CUDA stream for SHM→GPU async copies
+    HOLOSCAN_CUDA_CALL(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
+
     should_stop_.store(false);
 
     // Set async condition to waiting state
@@ -78,7 +78,7 @@ void TcnShmSubscriberOp::start() {
     // Launch background receiver thread
     receiver_thread_ = std::thread(&TcnShmSubscriberOp::receiver_mainloop, this);
 
-    HOLOSCAN_LOG_INFO("ShmSubscriberOp started for stream: {}", name);
+    HOLOSCAN_LOG_INFO("ShmSubscriberOp started for stream: {} (zero-copy)", name);
 }
 
 void TcnShmSubscriberOp::stop() {
@@ -94,6 +94,21 @@ void TcnShmSubscriberOp::stop() {
         receiver_thread_.join();
     }
 
+    // Drain the queue to release any held SHM segments
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        while (!frame_queue_.empty()) {
+            frame_queue_.pop();
+        }
+    }
+
+    // Destroy CUDA stream
+    if (copy_stream_) {
+        cudaStreamSynchronize(copy_stream_);
+        cudaStreamDestroy(copy_stream_);
+        copy_stream_ = nullptr;
+    }
+
     // Clean up receiver
     if (receiver_) {
         receiver_->teardown();
@@ -104,62 +119,20 @@ void TcnShmSubscriberOp::stop() {
 
 void TcnShmSubscriberOp::receiver_mainloop() {
     while (!should_stop_.load()) {
-        bool ok = receiver_->receive_frame(
-            [this](const tcn::shm::ShmSerializedStreamHeader& header,
-                   artekmed::shm::ShmBufferDescriptor::Reader descriptor) -> bool {
-                return on_receive(header, descriptor);
-            },
-            cycle_time_ms_.get());
-
-        if (!ok && !should_stop_.load()) {
-            HOLOSCAN_LOG_WARN("Could not receive frame.");
+        auto frame = receiver_->receive_frame_zero_copy(cycle_time_ms_.get());
+        if (!frame.has_value()) {
+            continue;
         }
-    }
-}
 
-bool TcnShmSubscriberOp::on_receive(
-    const tcn::shm::ShmSerializedStreamHeader& header,
-    artekmed::shm::ShmBufferDescriptor::Reader descriptor) {
-
-    // Check if we should stop
-    if (async_condition_.get() &&
-        async_condition_.get()->event_state() == holoscan::AsynchronousEventState::EVENT_NEVER) {
-        return false;
-    }
-
-    ShmFrameData frame;
-    frame.timestamp = header.timestamp;
-
-    // Iterate over ports in the buffer descriptor
-    for (auto port : descriptor.getPorts()) {
-        auto port_name = std::string(port.getName().cStr());
-        auto port_data = port.getData();
-        auto port_type = port_data.getPortType();
-        auto metadata = port_data.getMetadata();
-        auto stream_header = metadata.getHeader();
-
-        int32_t dimX = stream_header.getDimX();
-        int32_t dimY = stream_header.getDimY();
-        int32_t bitsPerElement = stream_header.getBitsPerElement();
-        int32_t bytesPerPixel = bitsPerElement / 8;
-
-        auto raw_data = port_data.getData();
-        auto data_ptr = reinterpret_cast<const uint8_t*>(raw_data.begin());
-        auto data_size = raw_data.size();
-
-        if (port_type == artekmed::schema::CameraPortType::COLORIMAGE) {
-            frame.color_data[port_name].assign(data_ptr, data_ptr + data_size);
-            frame.color_dims[port_name] = {dimX, dimY, bytesPerPixel};
-        } else if (port_type == artekmed::schema::CameraPortType::DEPTHIMAGE) {
-            frame.depth_data[port_name].assign(data_ptr, data_ptr + data_size);
-            frame.depth_dims[port_name] = {dimX, dimY, 1};
+        // Check if we should stop before queuing
+        if (async_condition_.get() &&
+            async_condition_.get()->event_state() == holoscan::AsynchronousEventState::EVENT_NEVER) {
+            break;
         }
-    }
 
-    if (!frame.color_data.empty() || !frame.depth_data.empty()) {
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
-            frame_queue_.push(std::move(frame));
+            frame_queue_.push(std::move(*frame));
         }
 
         // Notify the Holoscan scheduler
@@ -167,10 +140,7 @@ bool TcnShmSubscriberOp::on_receive(
             async_condition_.get()->event_state() == holoscan::AsynchronousEventState::EVENT_WAITING) {
             async_condition_.get()->event_state(holoscan::AsynchronousEventState::EVENT_DONE);
         }
-        return true;
     }
-
-    return false;
 }
 
 void TcnShmSubscriberOp::compute(
@@ -178,8 +148,8 @@ void TcnShmSubscriberOp::compute(
     holoscan::OutputContext& op_output,
     holoscan::ExecutionContext& context) {
 
-    // Pop a frame from the queue
-    ShmFrameData frame;
+    // Pop a zero-copy frame from the queue
+    tcn::shm::ShmZeroCopyFrame frame;
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         if (frame_queue_.empty()) {
@@ -193,7 +163,8 @@ void TcnShmSubscriberOp::compute(
         frame_queue_.pop();
     }
 
-    HOLOSCAN_LOG_DEBUG("Processing frame with timestamp {}", frame.timestamp);
+    HOLOSCAN_LOG_DEBUG("Processing frame ts={} (zero-copy, {} ports)",
+                       frame.timestamp, frame.ports.size());
 
     // Get allocator handle for tensor allocation
     auto allocator_handle = nvidia::gxf::Handle<nvidia::gxf::Allocator>::Create(
@@ -203,66 +174,68 @@ void TcnShmSubscriberOp::compute(
         return;
     }
 
-    // Get CUDA stream
-    cudaStream_t cuda_stream = nullptr;  // Use default stream
-
-    // Create color output entity
+    // Create output entities
     auto color_entity = nvidia::gxf::Entity::New(context.context());
     if (!color_entity) {
         HOLOSCAN_LOG_ERROR("Failed to create color entity");
         return;
     }
-
-    for (auto& [port_name, pixels] : frame.color_data) {
-        auto& dims = frame.color_dims[port_name];
-        nvidia::gxf::Handle<nvidia::gxf::Tensor> tensor;
-        if (!tcn::allocate_named_tensor<uint8_t>(
-                allocator_handle.value(), cuda_stream, color_entity.value(),
-                nvidia::gxf::Shape{{dims.height, dims.width, dims.channels}},
-                nvidia::gxf::MemoryStorageType::kDevice,
-                port_name, tensor)) {
-            HOLOSCAN_LOG_ERROR("Failed to allocate color tensor for {}", port_name);
-            continue;
-        }
-
-        // Copy pixel data to GPU
-        auto maybe_data = tensor->data<uint8_t>();
-        if (maybe_data) {
-            HOLOSCAN_CUDA_CALL(cudaMemcpyAsync(
-                maybe_data.value(), pixels.data(), pixels.size(),
-                cudaMemcpyHostToDevice, cuda_stream));
-        }
-    }
-
-    // Create depth output entity
     auto depth_entity = nvidia::gxf::Entity::New(context.context());
     if (!depth_entity) {
         HOLOSCAN_LOG_ERROR("Failed to create depth entity");
         return;
     }
 
-    for (auto& [port_name, pixels] : frame.depth_data) {
-        auto& dims = frame.depth_dims[port_name];
-        nvidia::gxf::Handle<nvidia::gxf::Tensor> tensor;
-        if (!tcn::allocate_named_tensor<uint16_t>(
-                allocator_handle.value(), cuda_stream, depth_entity.value(),
-                nvidia::gxf::Shape{{dims.height, dims.width, dims.channels}},
-                nvidia::gxf::MemoryStorageType::kDevice,
-                port_name, tensor)) {
-            HOLOSCAN_LOG_ERROR("Failed to allocate depth tensor for {}", port_name);
-            continue;
-        }
+    // For each port, allocate a GPU tensor and kick off an async copy
+    // directly from the SHM pointer to GPU device memory.
+    for (const auto& pv : frame.ports) {
+        if (pv.is_color) {
+            nvidia::gxf::Handle<nvidia::gxf::Tensor> tensor;
+            if (!tcn::allocate_named_tensor<uint8_t>(
+                    allocator_handle.value(), copy_stream_, color_entity.value(),
+                    nvidia::gxf::Shape{{pv.height, pv.width, pv.channels}},
+                    nvidia::gxf::MemoryStorageType::kDevice,
+                    pv.name, tensor)) {
+                HOLOSCAN_LOG_ERROR("Failed to allocate color tensor for {}", pv.name);
+                continue;
+            }
 
-        auto maybe_data = tensor->data<uint16_t>();
-        if (maybe_data) {
-            HOLOSCAN_CUDA_CALL(cudaMemcpyAsync(
-                maybe_data.value(), pixels.data(), pixels.size(),
-                cudaMemcpyHostToDevice, cuda_stream));
+            auto maybe_data = tensor->data<uint8_t>();
+            if (maybe_data) {
+                HOLOSCAN_CUDA_CALL(cudaMemcpyAsync(
+                    maybe_data.value(), pv.data_ptr, pv.data_size,
+                    cudaMemcpyHostToDevice, copy_stream_));
+            }
+        } else {
+            nvidia::gxf::Handle<nvidia::gxf::Tensor> tensor;
+            if (!tcn::allocate_named_tensor<uint16_t>(
+                    allocator_handle.value(), copy_stream_, depth_entity.value(),
+                    nvidia::gxf::Shape{{pv.height, pv.width, pv.channels}},
+                    nvidia::gxf::MemoryStorageType::kDevice,
+                    pv.name, tensor)) {
+                HOLOSCAN_LOG_ERROR("Failed to allocate depth tensor for {}", pv.name);
+                continue;
+            }
+
+            auto maybe_data = tensor->data<uint16_t>();
+            if (maybe_data) {
+                HOLOSCAN_CUDA_CALL(cudaMemcpyAsync(
+                    maybe_data.value(), pv.data_ptr, pv.data_size,
+                    cudaMemcpyHostToDevice, copy_stream_));
+            }
         }
     }
 
-    // Synchronize before emitting
-    HOLOSCAN_CUDA_CALL(cudaStreamSynchronize(cuda_stream));
+    // Wait for all async copies to complete before releasing the SHM segment.
+    // This is the critical safety barrier: SHM data_ptrs are valid only while
+    // frame.shm_handle is alive, and the CUDA DMA engine reads from those
+    // addresses asynchronously.
+    HOLOSCAN_CUDA_CALL(cudaStreamSynchronize(copy_stream_));
+
+    // Release SHM segment — frame goes out of scope at function end, but
+    // we explicitly clear it here to make the release point obvious and to
+    // ensure it happens before the emit (defense in depth).
+    frame = {};
 
     // Emit outputs
     op_output.emit(color_entity.value(), "color_outputs");
