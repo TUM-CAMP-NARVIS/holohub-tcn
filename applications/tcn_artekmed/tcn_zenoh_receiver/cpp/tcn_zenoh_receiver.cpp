@@ -184,7 +184,7 @@ int main(int argc, char** argv) {
 
             // Optional: explicit stream topics list
             if (zenoh_cfg["stream_topics"]) {
-                for (auto& t : zenoh_cfg["stream_topics"]) {
+                for (const auto& t : zenoh_cfg["stream_topics"]) {
                     discovery->stream_topics.push_back(t.as<std::string>());
                 }
             }

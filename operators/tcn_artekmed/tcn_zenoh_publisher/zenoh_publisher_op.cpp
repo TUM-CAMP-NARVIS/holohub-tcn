@@ -68,7 +68,7 @@ void TcnZenohPublisherOp::compute(
     }
 
     // Publish with CDR encoding and type name as attachment
-    zenoh::ZBytes zbytes(std::string(
+    zenoh::Bytes zbytes(std::string(
         reinterpret_cast<const char*>(payload.data()), payload.size()));
 
     auto options = zenoh::Publisher::PutOptions::create_default();
