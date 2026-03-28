@@ -16,9 +16,7 @@
  */
 
 #include "cdr_decoder_op.hpp"
-#include "cdr_serde.hpp"
-
-#include <tcnart_msgs/msg/VideoStream.h>
+#include "cdr_type_registry.hpp"
 
 namespace tcn::ops {
 
@@ -44,7 +42,6 @@ void TcnCdrDecoderOp::compute(
 
     auto payload = op_input.receive<std::vector<uint8_t>>("input").value();
 
-    // Read CDR type name from upstream port
     auto type_name_opt = op_input.receive<std::string>("type_name");
     std::string type_name = type_name_opt.has_value() ? type_name_opt.value() : "";
 
@@ -53,20 +50,22 @@ void TcnCdrDecoderOp::compute(
         return;
     }
 
-    // Deserialize VideoStreamMessage
-    tcn::cdr::CdrBufferReader reader;
-    tcnart_msgs::msg::VideoStreamMessage video_msg;
+    auto& registry = tcn::cdr::CdrTypeRegistry::instance();
 
-    if (!reader.read(payload, video_msg)) {
-        HOLOSCAN_LOG_ERROR("CdrDecoderOp: failed to deserialize VideoStreamMessage");
+    if (!registry.has_type(type_name)) {
+        HOLOSCAN_LOG_WARN("CdrDecoderOp: unknown type '{}', skipping", type_name);
         return;
     }
 
-    // Extract image bytes from the deserialized message
-    auto& image_data = video_msg.image();
-    std::vector<uint8_t> image_bytes(image_data.begin(), image_data.end());
+    tcn::cdr::DecodedMessage decoded;
+    if (!registry.decode(type_name, payload, decoded)) {
+        HOLOSCAN_LOG_ERROR("CdrDecoderOp: failed to deserialize type '{}'", type_name);
+        return;
+    }
 
-    op_output.emit(std::move(image_bytes), "output");
+    // Emit the primary payload (e.g. image bytes for VideoStreamMessage,
+    // empty for metadata-only types like StreamDescriptorMessage).
+    op_output.emit(std::move(decoded.payload), "output");
 }
 
 }  // namespace tcn::ops

@@ -27,35 +27,26 @@
 #define ZENOHCXX_ZENOHC 1
 #include <zenoh.hxx>
 
-#include "zenoh_subscriber_op.hpp"
-#include "cdr_decoder_op.hpp"
+#include "zenoh_receiver_op.hpp"
+#include "shm_sender_op.hpp"
 
 namespace {
 
-/// Simple sink operator that logs received messages (test endpoint).
-class LogSinkOp : public holoscan::Operator {
+/// Simple sink operator that discards input (needed to consume unused outputs).
+class DummySinkOp : public holoscan::Operator {
  public:
-    HOLOSCAN_OPERATOR_FORWARD_ARGS(LogSinkOp)
-    LogSinkOp() = default;
+    HOLOSCAN_OPERATOR_FORWARD_ARGS(DummySinkOp)
+    DummySinkOp() = default;
 
     void setup(holoscan::OperatorSpec& spec) override {
-        spec.input<std::vector<uint8_t>>("input");
+        spec.input<holoscan::gxf::Entity>("input");
     }
 
     void compute(holoscan::InputContext& op_input,
                  holoscan::OutputContext&,
                  holoscan::ExecutionContext&) override {
-        auto data = op_input.receive<std::vector<uint8_t>>("input").value();
-
-        count_++;
-        if (count_ % 30 == 1) {
-            HOLOSCAN_LOG_INFO("LogSink [{}]: received {} bytes (total: {})",
-                              name(), data.size(), count_);
-        }
+        op_input.receive<holoscan::gxf::Entity>("input");
     }
-
- private:
-    uint64_t count_ = 0;
 };
 
 /// Pre-compose discovery data passed from main() to compose().
@@ -63,7 +54,8 @@ struct ZenohDiscoveryData {
     std::shared_ptr<zenoh::Session> session;
     std::string topic_prefix;
     std::string capture_node;
-    std::vector<std::string> stream_topics;
+    std::vector<std::string> stream_types;
+    std::vector<tcn::ops::ZenohStreamConfig> stream_configs;
 };
 
 }  // namespace
@@ -78,48 +70,113 @@ class TcnZenohReceiverApp : public holoscan::Application {
 
         HOLOSCAN_LOG_INFO("Starting TCN Zenoh Receiver (C++)");
 
-        auto& topics = discovery_->stream_topics;
-
-        if (topics.empty()) {
-            HOLOSCAN_LOG_WARN("No stream topics configured — subscribing to wildcard");
-            // Subscribe to all streams under the capture node
-            std::string wildcard_topic = discovery_->topic_prefix + "/" +
-                                         discovery_->capture_node + "/stream/**";
-            topics.push_back(wildcard_topic);
+        const auto& configs = discovery_->stream_configs;
+        if (configs.empty()) {
+            HOLOSCAN_LOG_ERROR("No streams discovered — cannot compose pipeline");
+            return;
         }
 
-        for (size_t i = 0; i < topics.size(); ++i) {
-            auto& topic = topics[i];
-            std::string stream_name = "stream_" + std::to_string(i);
+        // Read configuration
+        auto& yaml_cfg = config().yaml_nodes();
+        int32_t cuda_device_id = 0;
+        std::string shm_stream_name = "camera_streams";
+        bool enable_shm_output = true;
 
-            HOLOSCAN_LOG_INFO("Creating pipeline for topic: {}", topic);
+        if (!yaml_cfg.empty()) {
+            auto root = yaml_cfg[0];
+            if (root["pipeline"]) {
+                auto pipe = root["pipeline"];
+                cuda_device_id = pipe["device_id"].as<int32_t>(0);
+            }
+            if (root["shared_memory"]) {
+                auto shm = root["shared_memory"];
+                shm_stream_name = shm["stream_name"].as<std::string>("camera_streams");
+                enable_shm_output = shm["enabled"].as<bool>(true);
+            }
+        }
 
-            // Zenoh subscriber
-            auto async_cond = make_condition<AsynchronousCondition>(
-                stream_name + "_async_condition");
-            auto subscriber_op = make_operator<tcn::ops::TcnZenohSubscriberOp>(
-                "subscriber_" + stream_name,
-                Arg("topic", topic),
-                Arg("async_condition", async_cond));
-            subscriber_op->set_session(discovery_->session);
+        // GPU allocator for ZenohReceiverOp tensor uploads
+        auto device_memory_pool = make_resource<UnboundedAllocator>(
+            "zenoh_receiver_allocator");
 
-            // CDR decoder
-            auto decoder_op = make_operator<tcn::ops::TcnCdrDecoderOp>(
-                "cdr_decoder_" + stream_name,
-                Arg("source_name", stream_name),
-                Arg("stream_index", static_cast<int32_t>(i)));
+        auto cuda_stream_pool = make_resource<CudaStreamPool>(
+            "cuda_stream_pool",
+            Arg("dev_id", cuda_device_id),
+            Arg("stream_flags", static_cast<uint32_t>(0)),
+            Arg("stream_priority", static_cast<uint32_t>(0)),
+            Arg("reserved_size", static_cast<uint32_t>(configs.size())),
+            Arg("max_size", static_cast<uint32_t>(64)));
 
-            // Log sink (test endpoint — replace with NvVideoDecoder + HolovizOp later)
-            auto sink_op = make_operator<LogSinkOp>("sink_" + stream_name);
+        // --- TcnZenohReceiverOp (composite: subscribe + CDR decode + GPU upload) ---
+        auto async_cond = make_condition<AsynchronousCondition>("zenoh_receiver_async");
 
-            add_flow(subscriber_op, decoder_op, {{"output", "input"}, {"type_name", "type_name"}});
-            add_flow(decoder_op, sink_op, {{"output", "input"}});
+        auto receiver_op = std::make_shared<tcn::ops::TcnZenohReceiverOp>();
+        receiver_op->set_stream_configs(configs);
+        receiver_op->set_session(discovery_->session);
+        receiver_op->name("zenoh_receiver");
+        receiver_op->fragment(this);
+        receiver_op->init_spec();
+        receiver_op->add_arg(Arg("async_condition", async_cond));
+        receiver_op->add_arg(Arg("allocator", device_memory_pool));
+        receiver_op->add_arg(Arg("cuda_stream_pool", cuda_stream_pool));
+
+        // --- Per-stream output routing ---
+        // Each stream gets its own SHM sender (the sender expects an entity with
+        // named tensors, and each ZenohReceiverOp output is a single-tensor entity).
+        for (const auto& cfg : configs) {
+            if (enable_shm_output) {
+                // Per-stream SHM sender with the stream name as the service prefix
+                auto sender_op = make_operator<tcn::ops::TcnShmZenohSenderOp>(
+                    "shm_sender_" + cfg.name,
+                    Arg("stream_name", shm_stream_name + "/" + cfg.name),
+                    Arg("input_tensor_names",
+                        std::vector<std::string>{std::string{""}}));
+                add_flow(receiver_op, sender_op, {{cfg.name, "frame_input"}});
+            } else {
+                auto sink = make_operator<DummySinkOp>("sink_" + cfg.name);
+                add_flow(receiver_op, sink, {{cfg.name, "input"}});
+            }
         }
     }
 
  private:
     std::shared_ptr<ZenohDiscoveryData> discovery_;
 };
+
+// ---------------------------------------------------------------------------
+// Pre-compose: Zenoh discovery (runs before the Holoscan runtime starts)
+// ---------------------------------------------------------------------------
+static std::shared_ptr<ZenohDiscoveryData> discover_zenoh(
+    std::shared_ptr<zenoh::Session> session,
+    const std::string& topic_prefix,
+    const std::string& capture_node,
+    const std::vector<std::string>& stream_types) {
+
+    auto discovery = std::make_shared<ZenohDiscoveryData>();
+    discovery->session = session;
+    discovery->topic_prefix = topic_prefix;
+    discovery->capture_node = capture_node;
+    discovery->stream_types = stream_types;
+
+    HOLOSCAN_LOG_INFO("Discovering Zenoh streams: prefix={}, node={}", topic_prefix, capture_node);
+
+    discovery->stream_configs = tcn::ops::TcnZenohReceiverOp::discover_streams(
+        *session, topic_prefix, capture_node, stream_types);
+
+    if (discovery->stream_configs.empty()) {
+        HOLOSCAN_LOG_ERROR("No streams discovered via Zenoh");
+        return nullptr;
+    }
+
+    HOLOSCAN_LOG_INFO("Discovered {} streams", discovery->stream_configs.size());
+    for (const auto& cfg : discovery->stream_configs) {
+        HOLOSCAN_LOG_INFO("  {} -> {} ({}x{}, compression={})",
+                          cfg.name, cfg.topic, cfg.image_width, cfg.image_height,
+                          cfg.image_compression);
+    }
+
+    return discovery;
+}
 
 // ---------------------------------------------------------------------------
 // main
@@ -140,9 +197,9 @@ int main(int argc, char** argv) {
         } else if (arg == "-h" || arg == "--help") {
             std::cout << "ARTEKMED Holoscan Zenoh Receiver (C++)\n"
                       << "Usage: " << argv[0] << " [options]\n"
-                      << "  -c, --config <file>     Config YAML (default: tcn_zenoh_receiver.yaml)\n"
+                      << "  -c, --config <file>     Config YAML\n"
                       << "  -s, --scheduler <type>  Scheduler: greedy|event_based (default: event_based)\n"
-                      << "  -l, --log-level <lvl>   Log level: warn|info|debug (default: info)\n"
+                      << "  -l, --log-level <lvl>   Log level: warn|info|debug|trace (default: info)\n"
                       << "  -h, --help              Show this help\n";
             return 0;
         }
@@ -170,29 +227,29 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Read Zenoh config from YAML
-    auto discovery = std::make_shared<ZenohDiscoveryData>();
+    // Read configuration
+    std::string topic_prefix = "tcn/loc/pcpd";
+    std::string capture_node = "k4a_capture_multi";
     std::string zenoh_config_file;
+    std::vector<std::string> stream_types = {"color", "depth"};
 
     try {
         YAML::Node cfg = YAML::LoadFile(config_file);
         if (cfg["zenoh"]) {
             auto zenoh_cfg = cfg["zenoh"];
-            discovery->topic_prefix = zenoh_cfg["topic_prefix"].as<std::string>("tcn/loc/pcpd");
-            discovery->capture_node = zenoh_cfg["capture_node"].as<std::string>("k4a_capture_multi");
+            topic_prefix = zenoh_cfg["topic_prefix"].as<std::string>(topic_prefix);
+            capture_node = zenoh_cfg["capture_node"].as<std::string>(capture_node);
             zenoh_config_file = zenoh_cfg["zenoh_config_file"].as<std::string>("");
 
-            // Optional: explicit stream topics list
-            if (zenoh_cfg["stream_topics"]) {
-                for (const auto& t : zenoh_cfg["stream_topics"]) {
-                    discovery->stream_topics.push_back(t.as<std::string>());
+            if (zenoh_cfg["stream_types"]) {
+                stream_types.clear();
+                for (const auto& t : zenoh_cfg["stream_types"]) {
+                    stream_types.push_back(t.as<std::string>());
                 }
             }
         }
     } catch (const std::exception& e) {
         HOLOSCAN_LOG_WARN("Could not read config ({}), using defaults", e.what());
-        discovery->topic_prefix = "tcn/loc/pcpd";
-        discovery->capture_node = "k4a_capture_multi";
     }
 
     // Open Zenoh session
@@ -208,8 +265,15 @@ int main(int argc, char** argv) {
     }
 
     auto session = zenoh::Session::open(std::move(zenoh_config));
-    discovery->session = std::make_shared<zenoh::Session>(std::move(session));
+    auto session_ptr = std::make_shared<zenoh::Session>(std::move(session));
     HOLOSCAN_LOG_INFO("Zenoh session opened");
+
+    // Pre-compose: discover Zenoh streams
+    auto discovery = discover_zenoh(session_ptr, topic_prefix, capture_node, stream_types);
+    if (!discovery) {
+        HOLOSCAN_LOG_ERROR("Zenoh discovery failed — no streams found. Exiting.");
+        return 1;
+    }
 
     // Create and configure application
     auto app = holoscan::make_application<TcnZenohReceiverApp>(discovery);
@@ -222,6 +286,9 @@ int main(int argc, char** argv) {
     } else if (scheduler_type == "event_based") {
         app->scheduler(app->make_scheduler<holoscan::EventBasedScheduler>(
             "ebs", holoscan::Arg("worker_thread_number", static_cast<int64_t>(8))));
+    } else {
+        HOLOSCAN_LOG_ERROR("Invalid scheduler type: {}", scheduler_type);
+        return 1;
     }
 
     // Run
@@ -234,6 +301,7 @@ int main(int argc, char** argv) {
 
     // Clean up Zenoh session
     discovery->session.reset();
+    session_ptr.reset();
 
     return 0;
 }

@@ -24,6 +24,8 @@ if(NOT tcn_schema_FOUND)
                  PATHS "/usr/lib" "/usr/local/lib")
     find_library(TCN_SCHEMA_BUILTIN_LIB tcn_schema_builtin_interfaces
                  PATHS "/usr/lib" "/usr/local/lib")
+    find_library(TCN_SCHEMA_GEOMETRY_LIB tcn_schema_geometry_msgs
+                 PATHS "/usr/lib" "/usr/local/lib")
     find_library(TCN_SCHEMA_PCPD_LIB tcn_schema_pcpd_msgs
                  PATHS "/usr/lib" "/usr/local/lib")
 
@@ -47,6 +49,13 @@ if(NOT tcn_schema_FOUND)
             add_library(tcn_schema::builtin_interfaces STATIC IMPORTED)
             set_target_properties(tcn_schema::builtin_interfaces PROPERTIES
                 IMPORTED_LOCATION "${TCN_SCHEMA_BUILTIN_LIB}"
+                INTERFACE_INCLUDE_DIRECTORIES "${TCN_SCHEMA_INCLUDE_DIR}"
+            )
+        endif()
+        if(TCN_SCHEMA_GEOMETRY_LIB AND NOT TARGET tcn_schema::geometry_msgs)
+            add_library(tcn_schema::geometry_msgs STATIC IMPORTED)
+            set_target_properties(tcn_schema::geometry_msgs PROPERTIES
+                IMPORTED_LOCATION "${TCN_SCHEMA_GEOMETRY_LIB}"
                 INTERFACE_INCLUDE_DIRECTORIES "${TCN_SCHEMA_INCLUDE_DIR}"
             )
         endif()
@@ -76,6 +85,7 @@ find_path(FASTRTPS_STUB_INCLUDE "fastrtps/utils/fixed_size_string.hpp"
 # ---------------------------------------------------------------------------
 add_library(tcn_cdr_serde SHARED
     cdr_serde.cpp
+    cdr_type_registry.cpp
 )
 add_library(holoscan::ops::tcn_cdr_serde ALIAS tcn_cdr_serde)
 
@@ -92,6 +102,7 @@ target_link_libraries(tcn_cdr_serde PUBLIC
     tcn_schema::tcnart_msgs
     tcn_schema::std_msgs
     tcn_schema::builtin_interfaces
+    tcn_schema::geometry_msgs
 )
 if(TARGET tcn_schema::pcpd_msgs)
     target_link_libraries(tcn_cdr_serde PUBLIC tcn_schema::pcpd_msgs)

@@ -25,23 +25,23 @@
 namespace tcn::ops {
 
 /**
- * @brief Holoscan operator that decodes CDR-encoded VideoStreamMessage payloads.
+ * @brief Holoscan operator that decodes CDR-encoded messages using the type registry.
  *
- * Takes raw CDR bytes from a Zenoh subscriber (or any source), deserializes
- * the VideoStreamMessage using FastCDR, and emits the raw image bytes on
- * the "output" port.
+ * Takes raw CDR bytes and a type name string, looks up the deserializer in the
+ * CdrTypeRegistry, and emits decoded payload bytes + metadata.
  *
- * The CDR type name is read from input metadata ("CdrTypeName") and used to
- * verify the expected message type.
+ * Supports all types registered in the CdrTypeRegistry (VideoStreamMessage,
+ * StreamDescriptorMessage, Pose6DMessage, CameraInfoMessage, etc.).
  *
  * Inputs:
  *   - input: raw CDR payload bytes (std::vector<uint8_t>)
+ *   - type_name: CDR type name string (e.g. "tcnart_msgs::msg::VideoStreamMessage")
  *
  * Outputs:
- *   - output: decoded image bytes (std::vector<uint8_t>)
+ *   - output: decoded payload bytes (std::vector<uint8_t>)
  *
- * Metadata propagated:
- *   - StreamSource, StreamIndex, SemanticType (if configured)
+ * Metadata propagated via Holoscan message metadata:
+ *   - All key-value pairs from the decoded message (frame_id, stamp, dimensions, etc.)
  */
 class TcnCdrDecoderOp : public holoscan::Operator {
  public:
@@ -55,7 +55,6 @@ class TcnCdrDecoderOp : public holoscan::Operator {
                  holoscan::ExecutionContext& context) override;
 
  private:
-    // Optional metadata to attach to output
     holoscan::Parameter<std::string> source_name_;
     holoscan::Parameter<int32_t> stream_index_;
 };

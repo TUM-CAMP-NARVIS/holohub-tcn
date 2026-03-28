@@ -7,7 +7,7 @@ project(tcn_zenoh_receiver_cpp LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(holoscan 3.0 REQUIRED CONFIG
+find_package(holoscan 3.7.0 REQUIRED CONFIG
              PATHS "/opt/nvidia/holoscan" "/workspace/holoscan-sdk/install")
 
 add_executable(tcn_zenoh_receiver_cpp
@@ -31,14 +31,14 @@ endif()
 
 target_link_libraries(tcn_zenoh_receiver_cpp
     holoscan::core
-    holoscan::ops::tcn_zenoh_subscriber
-    holoscan::ops::tcn_cdr_decoder
+    holoscan::ops::tcn_zenoh_receiver
+    holoscan::ops::tcn_shm_zenoh_sender
     $<$<BOOL:${yaml-cpp_FOUND}>:yaml-cpp::yaml-cpp>
 )
 
 # Copy the YAML config file next to the executable
 configure_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/../python/tcn_zenoh_receiver.yaml
+    ${CMAKE_CURRENT_SOURCE_DIR}/tcn_zenoh_receiver.yaml
     ${CMAKE_CURRENT_BINARY_DIR}/tcn_zenoh_receiver.yaml
     COPYONLY
 )

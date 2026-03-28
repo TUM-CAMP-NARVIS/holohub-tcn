@@ -1,0 +1,6 @@
+{
+    "operator": {
+        "name": "TCN SHM Zenoh Sender",
+        "description": "Publishes Holoscan frames to iceoryx2 shared memory with Cap'n Proto serialization for local IPC consumption."
+    }
+}

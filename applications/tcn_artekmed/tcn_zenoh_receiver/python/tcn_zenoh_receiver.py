@@ -1,5 +1,6 @@
 #
-# Place the license header here
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 import os
 import logging
@@ -23,8 +24,7 @@ from holoscan.schedulers import EventBasedScheduler, GreedyScheduler, MultiThrea
 from holoscan.operators import HolovizOp
 
 from holohub.nv_video_decoder import NvVideoDecoderOp
-# from holohub.tcn_stream_synchronizer import TcnStreamSynchronizerOp
-
+from holohub.tcn_shm_zenoh_sender import TcnShmZenohSenderOp
 
 import zenoh
 
@@ -94,14 +94,12 @@ class StatsOp(Operator):
 
 
 class CdrDecoderOp(Operator):
-    """Decode CDR Payload Baseclass.
+    """Decode CDR Payload.
 
-    This operator has 1 input and 1 output port:
-        input:  "in"
-        output: "out"
-
-    The data from each input is multiplied by a user-defined value.
-
+    Inputs:
+        input: raw CDR payload bytes
+    Outputs:
+        output: decoded message data (e.g. image bytes as numpy array)
     """
 
     def __init__(self,
@@ -122,7 +120,6 @@ class CdrDecoderOp(Operator):
         self.annotations = annotations
         self.result_factory = result_factory if result_factory else lambda m, tn, d: d
 
-        # Need to call the base class constructor last
         super().__init__(fragment, *args, **kwargs)
 
     def setup(self, spec: OperatorSpec):
@@ -144,9 +141,7 @@ class CdrDecoderOp(Operator):
         for k,v in self.annotations.items():
             self.metadata.set(k, v)
 
-        # decode using the provided type_class
         try:
-            # allocates buffers in library ...
             msg = self.type_class.deserialize(value)
         except MessageError as e:
             log.exception(e)
@@ -156,17 +151,14 @@ class CdrDecoderOp(Operator):
         op_output.emit(result, "output")
 
 
-
-
 class ZenohSubscriberOp(Operator):
-    """Simple zenoh subscriber.
+    """Zenoh subscriber source operator.
 
-    On each tick, it transmits a received message to the "out" port.
+    Subscribes to a Zenoh topic and emits received CDR payloads.
+    Uses AsynchronousCondition for event-driven scheduling.
 
-    **==Named Outputs==**
-
-        out : bytes
-        the received payload.
+    Outputs:
+        output: raw CDR payload bytes
     """
 
     def __init__(
@@ -186,15 +178,9 @@ class ZenohSubscriberOp(Operator):
         self.async_cond_ = AsynchronousCondition(fragment, name="async_cond")
         self.buffer = queue.Queue()
 
-        # Need to call the base class constructor last
         super().__init__(fragment, self.async_cond_, *args, **kwargs)
 
     def on_receive(self, sample: Any):
-        """Function to be supplied as callback
-
-        When the condition's event_state is EVENT_WAITING, set to EVENT_DONE. This function will
-        only exit once the condition is set to EVENT_NEVER.
-        """
         if self.async_cond_.event_state == AsynchronousEventState.EVENT_NEVER:
             return
 
@@ -211,7 +197,6 @@ class ZenohSubscriberOp(Operator):
             payload = None
 
         if payload is not None and type_name is not None:
-            # how does ts relate to fragment.scheduler().clock.timestamp()?
             self.buffer.put((type_name, payload))
 
             if self.async_cond_.event_state == AsynchronousEventState.EVENT_WAITING:
@@ -243,35 +228,9 @@ class ZenohSubscriberOp(Operator):
             self.subscriber = None
 
 
-
-class PingRxOp(Operator):
-    """Simple receiver operator.
-
-    This is an example of a native operator with one input port.
-    On each tick, it receives an integer from the "in" port.
-
-    **==Named Inputs==**
-
-        in : any
-            A received value.
-    """
-
-    def __init__(self, fragment, *args, **kwargs):
-        # Need to call the base class constructor last
-        super().__init__(fragment, *args, **kwargs)
-
-    def setup(self, spec: OperatorSpec):
-        spec.input("input")
-
-    def compute(self, op_input, op_output, context):
-        value = op_input.receive("input")
-        #print(f"Received: {value}", self.metadata.keys())
-
-
 class App(hs.core.Application):
     def compose(self):
-        # Add your operators here
-        print("Starting TCN Test Receiver")
+        print("Starting TCN Zenoh Receiver (Python)")
 
         zenoh_config = self.kwargs("zenoh")
 
@@ -279,6 +238,13 @@ class App(hs.core.Application):
         capture_node = zenoh_config.get("capture_node")
         zenoh_config_file = zenoh_config.get("zenoh_config_file")
 
+        try:
+            shm_config = self.kwargs("shared_memory")
+            shm_stream_name = shm_config.get("stream_name", "camera_streams")
+            enable_shm_output = shm_config.get("enabled", False)
+        except Exception:
+            shm_stream_name = "camera_streams"
+            enable_shm_output = False
 
         zenoh.init_log_from_env_or("info")
         self.session = zenoh.open(zenoh.Config.from_json5(open(zenoh_config_file).read()))
@@ -296,7 +262,6 @@ class App(hs.core.Application):
         print(stream_keys)
 
         def cb_decoder(meta, type_name, msg):
-            # is a video message, so return the raw image-bytes (typically bit/bytestream)
             return np.asarray(msg.image, dtype=np.uint8, copy=True)
 
         for stream_index, stream_name in enumerate(stream_keys):
@@ -323,24 +288,18 @@ class App(hs.core.Application):
             self.add_flow(deserializer, decoder, {('output', 'input')})
             self.add_flow(decoder, stats, {("output", "input")})
 
-        # visualizer = HolovizOp(
-        #     self,
-        #     name="visualizer",
-        #     allocator=CudaStreamPool(
-        #         self,
-        #         name="cuda_stream",
-        #         dev_id=0,
-        #         stream_flags=0,
-        #         stream_priority=0,
-        #         reserved_size=1,
-        #         max_size=num_streams,
-        #     ),
-        #     **self.kwargs("holoviz"),
-        # )
+            # Route decoded frames to per-stream SHM sender (C++ operator via pybind11)
+            if enable_shm_output:
+                shm_sender = TcnShmZenohSenderOp(
+                    self,
+                    stream_name=f"{shm_stream_name}/{stream_name}",
+                    input_tensor_names=[""],
+                    name=f"shm_sender_{stream_name}",
+                )
+                self.add_flow(decoder, shm_sender, {("output", "frame_input")})
 
 
 def main(config_file=None):
-    # make configurable or use holoscan debug level here too
     logging.basicConfig(level=logging.DEBUG)
     set_log_level(LogLevel.INFO)
 
@@ -359,7 +318,6 @@ def main(config_file=None):
 
 
 if __name__ == "__main__":
-
 
     parser = ArgumentParser(description="ARTEKMED Holoscan Client.")
 
