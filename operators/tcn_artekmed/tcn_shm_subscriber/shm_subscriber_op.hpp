@@ -18,6 +18,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -79,9 +80,15 @@ class TcnShmSubscriberOp : public holoscan::Operator {
     std::thread receiver_thread_;
     std::atomic<bool> should_stop_{false};
 
-    // Thread-safe zero-copy frame queue
+    // Thread-safe zero-copy frame queue (bounded to 1 for back-pressure)
+    static constexpr size_t kMaxQueuedFrames = 1;
     std::mutex queue_mutex_;
     std::queue<tcn::shm::ShmZeroCopyFrame> frame_queue_;
+
+    // Skip-frame statistics (logged periodically)
+    std::atomic<uint64_t> frames_skipped_{0};
+    std::atomic<uint64_t> frames_received_{0};
+    std::chrono::steady_clock::time_point last_stats_log_;
 
     // Dedicated CUDA stream for SHM→GPU async copies
     cudaStream_t copy_stream_ = nullptr;

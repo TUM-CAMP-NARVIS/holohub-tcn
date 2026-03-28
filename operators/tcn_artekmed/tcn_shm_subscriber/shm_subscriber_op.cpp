@@ -118,6 +118,8 @@ void TcnShmSubscriberOp::stop() {
 }
 
 void TcnShmSubscriberOp::receiver_mainloop() {
+    last_stats_log_ = std::chrono::steady_clock::now();
+
     while (!should_stop_.load()) {
         auto frame = receiver_->receive_frame_zero_copy(cycle_time_ms_.get());
         if (!frame.has_value()) {
@@ -130,9 +132,32 @@ void TcnShmSubscriberOp::receiver_mainloop() {
             break;
         }
 
+        frames_received_.fetch_add(1, std::memory_order_relaxed);
+
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
+            // Back-pressure: if queue is full, drop oldest frame to keep
+            // at most kMaxQueuedFrames in-flight (releases the SHM segment).
+            while (frame_queue_.size() >= kMaxQueuedFrames) {
+                frame_queue_.pop();
+                frames_skipped_.fetch_add(1, std::memory_order_relaxed);
+            }
             frame_queue_.push(std::move(*frame));
+        }
+
+        // Periodic stats log (every 5 seconds)
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_stats_log_ >= std::chrono::seconds(5)) {
+            auto skipped = frames_skipped_.exchange(0, std::memory_order_relaxed);
+            auto received = frames_received_.exchange(0, std::memory_order_relaxed);
+            if (skipped > 0) {
+                HOLOSCAN_LOG_WARN("SHM receiver: {}/{} frames skipped in last 5s",
+                                  skipped, received);
+            } else {
+                HOLOSCAN_LOG_INFO("SHM receiver: {}/{} frames processed in last 5s",
+                                  received, received);
+            }
+            last_stats_log_ = now;
         }
 
         // Notify the Holoscan scheduler
