@@ -24,6 +24,7 @@ namespace tcn::ops {
 
 void TcnZenohSubscriberOp::setup(holoscan::OperatorSpec& spec) {
     spec.output<std::vector<uint8_t>>("output");
+    spec.output<std::string>("type_name");
 
     spec.param(topic_, "topic",
                "Topic",
@@ -54,12 +55,12 @@ void TcnZenohSubscriberOp::start() {
         async_condition_.get()->event_state(holoscan::AsynchronousEventState::EVENT_WAITING);
     }
 
-    // Declare Zenoh subscriber with callback.
+    // Declare Zenoh subscriber with callback + on_drop.
     // The callback runs on Zenoh's internal thread — must be fast.
     auto key_expr = zenoh::KeyExpr(topic);
     auto sub = session_->declare_subscriber(
         key_expr,
-        [this](const zenoh::Sample& sample) {
+        [this](zenoh::Sample& sample) {
             // Check if we're shutting down
             if (async_condition_.get() &&
                 async_condition_.get()->event_state() ==
@@ -72,17 +73,11 @@ void TcnZenohSubscriberOp::start() {
             // Extract type name from attachment (if present)
             auto attachment = sample.get_attachment();
             if (attachment.has_value()) {
-                auto att_bytes = attachment.value();
-                auto att_str = att_bytes.as_string();
-                zs.type_name = std::string(att_str);
+                zs.type_name = attachment.value().get().as_string();
             }
 
             // Extract payload bytes
-            auto payload = sample.get_payload();
-            auto payload_str = payload.as_string();
-            zs.payload.assign(
-                reinterpret_cast<const uint8_t*>(payload_str.data()),
-                reinterpret_cast<const uint8_t*>(payload_str.data()) + payload_str.size());
+            zs.payload = sample.get_payload().as_vector();
 
             {
                 std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -101,9 +96,10 @@ void TcnZenohSubscriberOp::start() {
                 async_condition_.get()->event_state(
                     holoscan::AsynchronousEventState::EVENT_DONE);
             }
-        });
+        },
+        []() {});  // on_drop (no-op)
 
-    subscriber_ = std::make_unique<zenoh::Subscriber>(std::move(sub));
+    subscriber_ = std::make_unique<zenoh::Subscriber<void>>(std::move(sub));
     HOLOSCAN_LOG_INFO("Zenoh subscriber active on: {}", topic);
 }
 
@@ -127,11 +123,8 @@ void TcnZenohSubscriberOp::compute(
         sample_queue_.pop();
     }
 
-    // Set CDR type name as metadata for downstream decoders
-    auto metadata = context.get_output_metadata("output");
-    if (metadata) {
-        metadata->set("CdrTypeName", sample.type_name);
-    }
+    // Emit CDR type name for downstream decoders
+    op_output.emit(sample.type_name, "type_name");
 
     // Emit raw CDR payload bytes
     op_output.emit(sample.payload, "output");

@@ -43,18 +43,13 @@ class LogSinkOp : public holoscan::Operator {
 
     void compute(holoscan::InputContext& op_input,
                  holoscan::OutputContext&,
-                 holoscan::ExecutionContext& context) override {
+                 holoscan::ExecutionContext&) override {
         auto data = op_input.receive<std::vector<uint8_t>>("input").value();
 
         count_++;
         if (count_ % 30 == 1) {
-            std::string type_name;
-            auto metadata = context.get_input_metadata("input");
-            if (metadata) {
-                type_name = metadata->get<std::string>("CdrTypeName", "unknown");
-            }
-            HOLOSCAN_LOG_INFO("LogSink [{}]: received {} bytes (type: {}, total: {})",
-                              name(), data.size(), type_name, count_);
+            HOLOSCAN_LOG_INFO("LogSink [{}]: received {} bytes (total: {})",
+                              name(), data.size(), count_);
         }
     }
 
@@ -116,7 +111,7 @@ class TcnZenohReceiverApp : public holoscan::Application {
             // Log sink (test endpoint — replace with NvVideoDecoder + HolovizOp later)
             auto sink_op = make_operator<LogSinkOp>("sink_" + stream_name);
 
-            add_flow(subscriber_op, decoder_op, {{"output", "input"}});
+            add_flow(subscriber_op, decoder_op, {{"output", "input"}, {"type_name", "type_name"}});
             add_flow(decoder_op, sink_op, {{"output", "input"}});
         }
     }
@@ -201,15 +196,13 @@ int main(int argc, char** argv) {
 
     // Open Zenoh session
     HOLOSCAN_LOG_INFO("Opening Zenoh session...");
-    zenoh::Config zenoh_config;
+    zenoh::Config zenoh_config = zenoh::Config::create_default();
     if (!zenoh_config_file.empty()) {
-        std::ifstream f(zenoh_config_file);
-        if (f.good()) {
-            std::string json_str((std::istreambuf_iterator<char>(f)),
-                                  std::istreambuf_iterator<char>());
-            zenoh_config = zenoh::Config::from_json5(json_str);
-        } else {
-            HOLOSCAN_LOG_WARN("Could not read Zenoh config file: {}", zenoh_config_file);
+        try {
+            zenoh_config = zenoh::Config::from_file(zenoh_config_file);
+        } catch (const std::exception& e) {
+            HOLOSCAN_LOG_WARN("Could not read Zenoh config file: {} ({})",
+                              zenoh_config_file, e.what());
         }
     }
 

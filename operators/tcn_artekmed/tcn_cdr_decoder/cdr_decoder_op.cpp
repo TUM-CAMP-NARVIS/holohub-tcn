@@ -24,15 +24,16 @@ namespace tcn::ops {
 
 void TcnCdrDecoderOp::setup(holoscan::OperatorSpec& spec) {
     spec.input<std::vector<uint8_t>>("input");
+    spec.input<std::string>("type_name");
     spec.output<std::vector<uint8_t>>("output");
 
     spec.param(source_name_, "source_name",
                "Source Name",
-               "Stream source identifier for metadata",
+               "Stream source identifier",
                std::string{});
     spec.param(stream_index_, "stream_index",
                "Stream Index",
-               "Stream index for metadata",
+               "Stream index",
                static_cast<int32_t>(0));
 }
 
@@ -43,15 +44,12 @@ void TcnCdrDecoderOp::compute(
 
     auto payload = op_input.receive<std::vector<uint8_t>>("input").value();
 
-    // Read CDR type name from upstream metadata
-    auto in_metadata = context.get_input_metadata("input");
-    std::string type_name;
-    if (in_metadata) {
-        type_name = in_metadata->get<std::string>("CdrTypeName", "");
-    }
+    // Read CDR type name from upstream port
+    auto type_name_opt = op_input.receive<std::string>("type_name");
+    std::string type_name = type_name_opt.has_value() ? type_name_opt.value() : "";
 
     if (type_name.empty()) {
-        HOLOSCAN_LOG_WARN("CdrDecoderOp: no CdrTypeName in metadata, skipping");
+        HOLOSCAN_LOG_WARN("CdrDecoderOp: no type_name received, skipping");
         return;
     }
 
@@ -67,16 +65,6 @@ void TcnCdrDecoderOp::compute(
     // Extract image bytes from the deserialized message
     auto& image_data = video_msg.image();
     std::vector<uint8_t> image_bytes(image_data.begin(), image_data.end());
-
-    // Propagate metadata
-    auto out_metadata = context.get_output_metadata("output");
-    if (out_metadata) {
-        out_metadata->set("CdrTypeName", type_name);
-        if (!source_name_.get().empty()) {
-            out_metadata->set("StreamSource", source_name_.get());
-        }
-        out_metadata->set("StreamIndex", stream_index_.get());
-    }
 
     op_output.emit(std::move(image_bytes), "output");
 }

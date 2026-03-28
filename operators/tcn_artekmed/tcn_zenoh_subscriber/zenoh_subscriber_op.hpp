@@ -29,6 +29,7 @@
 // Forward-declare zenoh types to avoid pulling the full header into every consumer.
 namespace zenoh {
 class Session;
+template <class Handler>
 class Subscriber;
 }  // namespace zenoh
 
@@ -79,7 +80,7 @@ class TcnZenohSubscriberOp : public holoscan::Operator {
 
     // Zenoh state
     std::shared_ptr<zenoh::Session> session_;
-    std::unique_ptr<zenoh::Subscriber> subscriber_;
+    std::unique_ptr<zenoh::Subscriber<void>> subscriber_;
 
     // Thread-safe sample queue (bounded for back-pressure)
     static constexpr size_t kMaxQueuedSamples = 4;
