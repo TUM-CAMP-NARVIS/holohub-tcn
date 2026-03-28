@@ -12,10 +12,10 @@ shared_memory:
 camera_stream_processing:
   device_id: 0
   buffer_size: 8
-  enable_temporal_filter: False
+  enable_temporal_filter: True
   enable_background_substract: False
-  enable_compute_weights: False
-  enable_warp_colorimage: False
+  enable_compute_weights: True
+  enable_warp_colorimage: True
 
 depthimage_temporal_filter:
   alpha: 0.15
@@ -47,9 +47,9 @@ rmm_allocator:
 
 debug_output:
   enable_colorimage: True
-  enable_depthimage: False
-  enable_weights: False
-  enable_pointcloud: False
+  enable_depthimage: True
+  enable_weights: True
+  enable_pointcloud: True
   enable_warped_color: False
 
 resources:
