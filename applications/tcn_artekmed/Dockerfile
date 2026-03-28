@@ -197,13 +197,14 @@ RUN rm -rf /tmp/dependencies/zenoh-cpp && \
     rm -rf zenoh-cpp
 
 # Build and install tcn_schema (IDL-generated CDR message types)
-# Requires: FastCDR, Java runtime (for fastddsgen code generator)
-RUN apt-get update && apt-get install -y --no-install-recommends default-jre-headless && \
-    rm -rf /var/lib/apt/lists/*
+# Note: upstream CMakeLists.txt unconditionally requires fastddsgen.jar even
+# with -DWITH_DDS=OFF.  We patch lines 23-26 (the include + find_file) to
+# skip them when DDS is disabled, avoiding the Java/fastddsgen dependency.
 WORKDIR /tmp/dependencies
 RUN rm -rf /tmp/dependencies/tcn_schema && \
     git clone --depth 1 https://github.com/TUM-CAMP-NARVIS/tcn_schema.git && \
     cd tcn_schema && \
+    sed -i '23,26s/^/#/' CMakeLists.txt && \
     mkdir build && \
     cd build && \
     cmake -G "Ninja" .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
