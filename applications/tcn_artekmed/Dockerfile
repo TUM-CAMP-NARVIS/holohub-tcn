@@ -158,6 +158,61 @@ RUN rm -Rf /tmp/dependencies/iceoryx2 && \
     cd /tmp/dependencies && \
     rm -rf iceoryx2
 
+# Build and install eProsima Fast-CDR 2.0.0 (CDR serialization for Zenoh)
+WORKDIR /tmp/dependencies
+RUN rm -rf /tmp/dependencies/Fast-CDR && \
+    git clone --depth 1 --branch v2.0.0 https://github.com/eProsima/Fast-CDR.git && \
+    cd Fast-CDR && \
+    mkdir build && \
+    cd build && \
+    cmake -G "Ninja" .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_TESTING=OFF && \
+    cmake --build . --config Release -- -j $(nproc) && \
+    cmake --install . && \
+    cd /tmp/dependencies && \
+    rm -rf Fast-CDR
+
+# Build and install zenoh-c + zenoh-cpp 1.3.4 (Zenoh C++ API)
+WORKDIR /tmp/dependencies
+RUN rm -rf /tmp/dependencies/zenoh-c && \
+    git clone --depth 1 --branch 1.3.4 https://github.com/eclipse-zenoh/zenoh-c.git && \
+    cd zenoh-c && \
+    mkdir build && \
+    cd build && \
+    cmake -G "Ninja" .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DZENOHC_BUILD_TESTS_WITH_CXX=OFF && \
+    cmake --build . --config Release -- -j $(nproc) && \
+    cmake --install . && \
+    cd /tmp/dependencies && \
+    rm -rf zenoh-c
+
+WORKDIR /tmp/dependencies
+RUN rm -rf /tmp/dependencies/zenoh-cpp && \
+    git clone --depth 1 --branch 1.3.4 https://github.com/eclipse-zenoh/zenoh-cpp.git && \
+    cd zenoh-cpp && \
+    mkdir build && \
+    cd build && \
+    cmake -G "Ninja" .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DZENOHCXX_ZENOHC=ON && \
+    cmake --build . --config Release -- -j $(nproc) && \
+    cmake --install . && \
+    cd /tmp/dependencies && \
+    rm -rf zenoh-cpp
+
+# Build and install tcn_schema (IDL-generated CDR message types)
+# Requires: FastCDR, Java runtime (for fastddsgen code generator)
+RUN apt-get update && apt-get install -y --no-install-recommends default-jre-headless && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /tmp/dependencies
+RUN rm -rf /tmp/dependencies/tcn_schema && \
+    git clone --depth 1 https://github.com/TUM-CAMP-NARVIS/tcn_schema.git && \
+    cd tcn_schema && \
+    mkdir build && \
+    cd build && \
+    cmake -G "Ninja" .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
+        -DWITH_DDS=OFF -DBUILD_SHARED_LIBS=OFF && \
+    cmake --build . --config Release -- -j $(nproc) && \
+    cmake --install . && \
+    cd /tmp/dependencies && \
+    rm -rf tcn_schema
+
 WORKDIR /tmp/dependencies
 RUN rm -Rf /tmp/dependencies/xylt && \
     git clone https://github.com/TUM-CAMP-NARVIS/xylt.git && \
