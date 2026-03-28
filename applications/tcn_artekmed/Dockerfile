@@ -197,12 +197,13 @@ RUN rm -rf /tmp/dependencies/zenoh-cpp && \
     rm -rf zenoh-cpp
 
 # Install Java runtime + build fastddsgen (IDL-to-C++ code generator for tcn_schema)
+# Java 17 specifically — Gradle 7.6 (used by fastddsgen v3.x) doesn't support Java 21
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends default-jdk-headless && \
+    apt-get install -y --no-install-recommends openjdk-17-jdk-headless && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /tmp/dependencies
 RUN rm -rf /tmp/dependencies/Fast-DDS-Gen && \
-    git clone --depth 1 --branch v4.3.0.0 --recurse-submodules \
+    git clone --depth 1 --branch v3.3.2 --recurse-submodules \
         https://github.com/eProsima/Fast-DDS-Gen.git && \
     cd Fast-DDS-Gen && \
     ./gradlew assemble && \
