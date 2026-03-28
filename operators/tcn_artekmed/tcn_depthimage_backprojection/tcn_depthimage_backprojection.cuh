@@ -39,6 +39,7 @@ class TcnDepthImageBackprojectionOp : public holoscan::Operator {
   holoscan::Parameter<bool> enable_positions_;
   holoscan::Parameter<bool> enable_texcoords_;
   holoscan::Parameter<bool> enable_depth_float_;
+  holoscan::Parameter<std::shared_ptr<holoscan::CudaStreamPool>> cuda_stream_pool_;
 
   std::shared_ptr<holoscan::Tensor> xylookup_table_tensor_;
 

@@ -363,7 +363,13 @@ bool ShmSynchronizedBufferReceiver::receive_frame(
         while (true) {
             auto receive_result = sub_state_->subscriber->receive();
             if (!receive_result.has_value()) {
-                HOLOSCAN_LOG_WARN("receive() returned error — retrying");
+                auto err = receive_result.error();
+                auto err_str = iox2::bb::from<iox2::ReceiveError, const char*>(err);
+                if (err == iox2::ReceiveError::FailedToEstablishConnection) {
+                    HOLOSCAN_LOG_DEBUG("receive(): {} — waiting for publisher", err_str);
+                } else {
+                    HOLOSCAN_LOG_WARN("receive(): {} — retrying", err_str);
+                }
                 node_.wait(cycle_time);
                 continue;
             }
@@ -407,7 +413,13 @@ std::optional<ShmZeroCopyFrame> ShmSynchronizedBufferReceiver::receive_frame_zer
     try {
         auto receive_result = sub_state_->subscriber->receive();
         if (!receive_result.has_value()) {
-            HOLOSCAN_LOG_WARN("receive() returned error — retrying");
+            auto err = receive_result.error();
+            auto err_str = iox2::bb::from<iox2::ReceiveError, const char*>(err);
+            if (err == iox2::ReceiveError::FailedToEstablishConnection) {
+                HOLOSCAN_LOG_DEBUG("receive(): {} — waiting for publisher", err_str);
+            } else {
+                HOLOSCAN_LOG_WARN("receive(): {} — retrying", err_str);
+            }
             node_.wait(iox2::bb::Duration::from_millis(
                 static_cast<uint64_t>(cycle_time_ms)));
             return std::nullopt;

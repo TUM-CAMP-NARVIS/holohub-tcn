@@ -69,6 +69,7 @@ class TcnStreamMergerOp : public holoscan::Operator {
   holoscan::Parameter<std::string> output_message_name_;
   holoscan::Parameter<bool> fuse_buffers_;
   holoscan::Parameter<std::shared_ptr<holoscan::Allocator>> allocator_;
+  holoscan::Parameter<std::shared_ptr<holoscan::CudaStreamPool>> cuda_stream_pool_;
 
   std::regex portname_pattern_{R"(^(camera[0-9]+)_.*$)"};
 };

@@ -32,6 +32,16 @@ void TcnFlattenTensorOp::setup(holoscan::OperatorSpec& spec) {
     spec.output<holoscan::gxf::Entity>("output");
 
     spec.param(message_name_, "message_name", "Message Name", "Name of tensor in the message.", ""s);
+    spec.param(allocator_,
+               "allocator",
+               "Allocator",
+               "Allocator for output tensors.",
+               holoscan::ParameterFlag::kOptional);
+    spec.param(cuda_stream_pool_,
+               "cuda_stream_pool",
+               "Cuda Stream Pool",
+               "Instance of gxf::CudaStreamPool.",
+               holoscan::ParameterFlag::kOptional);
 }
 
 void TcnFlattenTensorOp::compute(holoscan::InputContext& op_input,

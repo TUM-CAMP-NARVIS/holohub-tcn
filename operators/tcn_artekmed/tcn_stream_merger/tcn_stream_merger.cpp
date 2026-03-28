@@ -53,6 +53,12 @@ void TcnStreamMergerOp::setup(holoscan::OperatorSpec& spec) {
              "Allocator for output tensors (required for fuse mode).",
              holoscan::ParameterFlag::kOptional);
 
+  spec.param(cuda_stream_pool_,
+             "cuda_stream_pool",
+             "Cuda Stream Pool",
+             "Instance of gxf::CudaStreamPool.",
+             holoscan::ParameterFlag::kOptional);
+
   // Register dynamic input ports — input_port_names_init_ was set in the
   // constructor, so it is available here before add_flow() checks ports.
   for (const auto& name : input_port_names_init_) {

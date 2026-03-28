@@ -41,6 +41,11 @@ void TcnDepthImageWeightsOp::setup(holoscan::OperatorSpec& spec) {
              "CudaDeviceOrdinal",
              "Device to use for CUDA operations",
              holoscan::ParameterFlag::kOptional);
+  spec.param(cuda_stream_pool_,
+             "cuda_stream_pool",
+             "Cuda Stream Pool",
+             "Instance of gxf::CudaStreamPool.",
+             holoscan::ParameterFlag::kOptional);
 }
 
 

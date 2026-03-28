@@ -32,6 +32,8 @@ class TcnFlattenTensorOp : public holoscan::Operator {
 
  private:
   holoscan::Parameter<std::string> message_name_;
+  holoscan::Parameter<std::shared_ptr<holoscan::Allocator>> allocator_;
+  holoscan::Parameter<std::shared_ptr<holoscan::CudaStreamPool>> cuda_stream_pool_;
 };
 
 }  // namespace tcn::ops

@@ -26,6 +26,7 @@ class TcnTextureSamplerOp : public holoscan::Operator {
   holoscan::Parameter<std::string> in_color_tensor_name_;
   holoscan::Parameter<std::string> in_texcoord_tensor_name_;
   holoscan::Parameter<std::string> out_tensor_name_;
+  holoscan::Parameter<std::shared_ptr<holoscan::CudaStreamPool>> cuda_stream_pool_;
 
   CUcontext cu_context_ = nullptr;
   CUdevice cu_device_{};

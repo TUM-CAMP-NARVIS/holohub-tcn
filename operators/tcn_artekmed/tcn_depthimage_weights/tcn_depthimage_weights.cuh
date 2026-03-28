@@ -33,6 +33,7 @@ class TcnDepthImageWeightsOp : public holoscan::Operator {
 
   holoscan::Parameter<std::string> in_tensor_name_;
   holoscan::Parameter<std::string> out_tensor_name_;
+  holoscan::Parameter<std::shared_ptr<holoscan::CudaStreamPool>> cuda_stream_pool_;
 
   std::shared_ptr<holoscan::Tensor> xylookup_table_tensor_;
 

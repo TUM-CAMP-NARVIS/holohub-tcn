@@ -31,6 +31,12 @@ void TcnStreamSplitterOp::setup(holoscan::OperatorSpec& spec) {
              "Channel Names",
              "List of channel names to split the input entity into separate outputs.");
 
+  spec.param(cuda_stream_pool_,
+             "cuda_stream_pool",
+             "Cuda Stream Pool",
+             "Instance of gxf::CudaStreamPool.",
+             holoscan::ParameterFlag::kOptional);
+
   // Register dynamic output ports — channel_names_init_ was set in the
   // constructor, so it is available here even though the Parameter hasn't
   // been bound yet.

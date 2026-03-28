@@ -58,6 +58,7 @@ class TcnStreamSplitterOp : public holoscan::Operator {
 
  private:
   holoscan::Parameter<std::vector<std::string>> channel_names_;
+  holoscan::Parameter<std::shared_ptr<holoscan::CudaStreamPool>> cuda_stream_pool_;
 };
 
 }  // namespace tcn::ops
