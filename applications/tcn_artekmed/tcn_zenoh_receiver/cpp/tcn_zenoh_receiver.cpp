@@ -22,6 +22,7 @@
 #include <vector>
 
 #include <holoscan/holoscan.hpp>
+#include <yaml-cpp/yaml.h>
 
 #define ZENOHCXX_ZENOHC 1
 #include <zenoh.hxx>

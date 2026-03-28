@@ -24,6 +24,8 @@ namespace tcn::ops {
 
 void TcnZenohPublisherOp::setup(holoscan::OperatorSpec& spec) {
     spec.input<std::vector<uint8_t>>("input");
+    spec.input<std::string>("type_name").condition(
+        holoscan::ConditionType::kNone);
 
     spec.param(topic_, "topic",
                "Topic",
@@ -58,11 +60,11 @@ void TcnZenohPublisherOp::compute(
         return;
     }
 
-    // Read CDR type name from metadata (if present)
+    // Read CDR type name from optional input port (if connected)
     std::string type_name;
-    auto metadata = context.get_input_metadata("input");
-    if (metadata) {
-        type_name = metadata->get<std::string>("CdrTypeName", "");
+    auto type_name_opt = op_input.receive<std::string>("type_name");
+    if (type_name_opt) {
+        type_name = type_name_opt.value();
     }
 
     // Publish with type name as attachment
