@@ -361,7 +361,13 @@ bool ShmSynchronizedBufferReceiver::receive_frame(
 
     try {
         while (true) {
-            auto maybe_sample = sub_state_->subscriber->receive().value();
+            auto receive_result = sub_state_->subscriber->receive();
+            if (!receive_result.has_value()) {
+                HOLOSCAN_LOG_WARN("receive() returned error — retrying");
+                node_.wait(cycle_time);
+                continue;
+            }
+            auto& maybe_sample = receive_result.value();
             if (maybe_sample.has_value()) {
                 auto& sample = maybe_sample.value();
 
@@ -399,7 +405,14 @@ std::optional<ShmZeroCopyFrame> ShmSynchronizedBufferReceiver::receive_frame_zer
     }
 
     try {
-        auto maybe_sample = sub_state_->subscriber->receive().value();
+        auto receive_result = sub_state_->subscriber->receive();
+        if (!receive_result.has_value()) {
+            HOLOSCAN_LOG_WARN("receive() returned error — retrying");
+            node_.wait(iox2::bb::Duration::from_millis(
+                static_cast<uint64_t>(cycle_time_ms)));
+            return std::nullopt;
+        }
+        auto& maybe_sample = receive_result.value();
         if (!maybe_sample.has_value()) {
             // No data yet — brief wait, then return to let caller check stop flag
             node_.wait(iox2::bb::Duration::from_millis(
