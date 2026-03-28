@@ -60,7 +60,7 @@ void TcnZenohSubscriberOp::start() {
     auto key_expr = zenoh::KeyExpr(topic);
     auto sub = session_->declare_subscriber(
         key_expr,
-        [this](zenoh::Sample& sample) {
+        [this](const zenoh::Sample& sample) {
             // Check if we're shutting down
             if (async_condition_.get() &&
                 async_condition_.get()->event_state() ==
@@ -76,8 +76,9 @@ void TcnZenohSubscriberOp::start() {
                 zs.type_name = attachment.value().get().as_string();
             }
 
-            // Extract payload bytes
-            zs.payload = sample.get_payload().as_vector();
+            // Extract payload bytes (zenoh-cpp 1.3.4 Bytes API → string → vector)
+            auto payload_str = sample.get_payload().as_string();
+            zs.payload.assign(payload_str.begin(), payload_str.end());
 
             {
                 std::lock_guard<std::mutex> lock(queue_mutex_);

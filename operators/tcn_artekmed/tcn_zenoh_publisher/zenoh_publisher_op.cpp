@@ -67,13 +67,14 @@ void TcnZenohPublisherOp::compute(
         type_name = type_name_opt.value();
     }
 
-    // Publish with type name as attachment
+    // Publish with CDR encoding and type name as attachment
     zenoh::ZBytes zbytes(std::string(
         reinterpret_cast<const char*>(payload.data()), payload.size()));
 
-    zenoh::Publisher::PutOptions options;
+    auto options = zenoh::Publisher::PutOptions::create_default();
+    options.encoding = zenoh::Encoding::Predefined::application_cdr();
     if (!type_name.empty()) {
-        options.attachment = zenoh::ZBytes(type_name);
+        options.attachment = type_name;
     }
 
     publisher_->put(std::move(zbytes), std::move(options));

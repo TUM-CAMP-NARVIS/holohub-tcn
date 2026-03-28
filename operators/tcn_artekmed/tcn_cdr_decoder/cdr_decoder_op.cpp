@@ -55,7 +55,7 @@ void TcnCdrDecoderOp::compute(
 
     // Deserialize VideoStreamMessage
     tcn::cdr::CdrBufferReader reader;
-    tcnart_msgs::msg::VideoStream video_msg;
+    tcnart_msgs::msg::VideoStreamMessage video_msg;
 
     if (!reader.read(payload, video_msg)) {
         HOLOSCAN_LOG_ERROR("CdrDecoderOp: failed to deserialize VideoStreamMessage");
