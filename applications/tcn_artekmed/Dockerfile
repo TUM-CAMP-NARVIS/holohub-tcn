@@ -203,7 +203,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /tmp/dependencies
 RUN rm -rf /tmp/dependencies/Fast-DDS-Gen && \
-    git clone --depth 1 --branch v3.3.2 --recurse-submodules \
+    git clone --depth 1 --branch v3.0.0 --recurse-submodules \
         https://github.com/eProsima/Fast-DDS-Gen.git && \
     cd Fast-DDS-Gen && \
     ./gradlew assemble && \
