@@ -15,6 +15,8 @@
 #include <tcnart_msgs/msg/SpatialRelations.h>
 #include <tcnart_msgs/msg/XRInput.h>
 #include <tcnart_msgs/msg/XRRuntime.h>
+#include <pcpd_msgs/rpc/ServiceController.h>
+#include <pcpd_msgs/msg/CameraSensor.h>
 
 namespace tcn::cdr {
 namespace {
@@ -117,6 +119,26 @@ static CdrTypeRegistrar reg_camera_info(
         out.metadata["principal_point_y"] = std::to_string(pp[1]);
         auto& header = msg.header();
         out.metadata["frame_id"] = header.frame_id();
+        return true;
+    });
+
+// --- DeviceContextReply (RPC sensor discovery) ---
+static CdrTypeRegistrar reg_device_context_reply(
+    "pcpd_msgs::rpc::DeviceContextReply",
+    [](const uint8_t* data, size_t size, DecodedMessage& out) -> bool {
+        pcpd_msgs::rpc::DeviceContextReply msg;
+        if (!deserialize_cdr(data, size, msg)) return false;
+        out.metadata["name"] = msg.name();
+        out.metadata["is_valid"] = std::to_string(msg.is_valid());
+        out.metadata["sensor_type"] = msg.sensor_type();
+        out.metadata["serial_number"] = msg.serial_number();
+        out.metadata["frame_rate"] = std::to_string(msg.frame_rate());
+        out.metadata["depth_units_per_meter"] = std::to_string(msg.depth_units_per_meter());
+        const auto& cam = msg.value();
+        out.metadata["camera_name"] = cam.name();
+        out.metadata["color_enabled"] = std::to_string(cam.color_enabled());
+        out.metadata["depth_enabled"] = std::to_string(cam.depth_enabled());
+        out.metadata["infrared_enabled"] = std::to_string(cam.infrared_enabled());
         return true;
     });
 

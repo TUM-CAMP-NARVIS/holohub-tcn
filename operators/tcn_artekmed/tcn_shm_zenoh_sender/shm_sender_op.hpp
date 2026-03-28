@@ -53,6 +53,7 @@ class TcnShmZenohSenderOp : public holoscan::Operator {
     HOLOSCAN_OPERATOR_FORWARD_ARGS(TcnShmZenohSenderOp)
 
     TcnShmZenohSenderOp() = default;
+    ~TcnShmZenohSenderOp() override;
 
     void setup(holoscan::OperatorSpec& spec) override;
     void initialize() override;

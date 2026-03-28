@@ -97,6 +97,9 @@ private:
         : service(std::move(svc)) {}
 };
 
+// Out-of-line destructor (PublisherState is complete here)
+TcnShmZenohSenderOp::~TcnShmZenohSenderOp() = default;
+
 // ---------------------------------------------------------------------------
 // Operator lifecycle
 // ---------------------------------------------------------------------------

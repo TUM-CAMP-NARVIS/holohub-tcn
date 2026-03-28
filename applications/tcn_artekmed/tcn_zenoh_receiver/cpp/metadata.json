@@ -38,6 +38,11 @@
         "name": "gpu",
         "description": "NVIDIA GPU with at least 8GB memory"
       },
+      "operators": [
+        { "name": "tcn_zenoh_receiver" },
+        { "name": "tcn_shm_zenoh_sender" },
+        { "name": "tcn_cdr_serde" }
+      ],
       "packages": []
     },
     "default_mode": "standard",

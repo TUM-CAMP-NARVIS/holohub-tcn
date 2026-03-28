@@ -24,12 +24,27 @@
 
 #include <holoscan/utils/cuda_macros.hpp>
 
+#include "../tcn_cdr_serde/cdr_serde.hpp"
 #include "../tcn_cdr_serde/cdr_type_registry.hpp"
+
+// tcn_schema generated message types for RPC discovery
+#include <pcpd_msgs/rpc/ServiceController.h>
+#include <pcpd_msgs/msg/CameraSensor.h>
+#include <tcnart_msgs/rpc/Requests.h>
+#include <tcnart_msgs/msg/StreamDescriptor.h>
 
 namespace tcn::ops {
 
 // ---------------------------------------------------------------------------
 // Discovery: resolve Zenoh streams via RPC + descriptor GET
+//
+// Protocol (matches artekmed pcp_shm_zenoh_receiver):
+//   Phase 1: GET {prefix}/{capture_node}/rpc/sensor/*/describe
+//            Send NullRequest CDR payload, receive DeviceContextReply per sensor
+//   Phase 2: For each sensor with enabled streams:
+//            GET {prefix}/{sensor}/cfg/dsc/{type}_image_bitstream
+//            Receive StreamDescriptorMessage with actual data topic + metadata
+//   Phase 3: subscribe_streams() uses the stream_topic from each descriptor
 // ---------------------------------------------------------------------------
 
 std::vector<ZenohStreamConfig> TcnZenohReceiverOp::discover_streams(
@@ -40,105 +55,208 @@ std::vector<ZenohStreamConfig> TcnZenohReceiverOp::discover_streams(
 
     std::vector<ZenohStreamConfig> configs;
 
+    // -----------------------------------------------------------------------
     // Phase 1: Discover camera sensors via RPC GET
-    // Key: {topic_prefix}/{capture_node}/rpc/sensor/*/describe
+    // -----------------------------------------------------------------------
     std::string discover_topic =
         topic_prefix + "/" + capture_node + "/rpc/sensor/*/describe";
-    HOLOSCAN_LOG_INFO("Discovering cameras on: {}", discover_topic);
+    HOLOSCAN_LOG_INFO("Phase 1 — discovering sensors: {}", discover_topic);
 
-    auto key_expr = zenoh::KeyExpr(discover_topic);
-    auto replies = session.get(key_expr, "", zenoh::channels::FifoChannel(16));
+    // CDR-encode NullRequest payload (matches Python/C++ reference)
+    tcnart_msgs::rpc::NullRequest null_req;
+    tcn::cdr::CdrBufferWriter writer;
+    std::vector<uint8_t> null_bytes;
+    writer.write(null_req, null_bytes);
 
-    // Collect sensor names from replies
-    std::vector<std::string> sensor_names;
+    // Configure GET options: query ALL queriables, 5s timeout, CDR encoding
+    zenoh::Session::GetOptions get_opts = zenoh::Session::GetOptions::create_default();
+    get_opts.timeout_ms = 5000;
+    get_opts.target = Z_QUERY_TARGET_ALL;
+    get_opts.consolidation = zenoh::QueryConsolidation(Z_CONSOLIDATION_MODE_MONOTONIC);
+    get_opts.payload = zenoh::Bytes(std::move(null_bytes));
+    get_opts.encoding = zenoh::Encoding::Predefined::application_cdr();
+
+    auto replies = session.get(
+        zenoh::KeyExpr(discover_topic), "",
+        zenoh::channels::FifoChannel(16),
+        std::move(get_opts));
+
+    // Collect sensor info from DeviceContextReply messages (blocking recv)
+    struct SensorInfo {
+        std::string name;
+        bool color_enabled = false;
+        bool depth_enabled = false;
+        bool infrared_enabled = false;
+    };
+    std::vector<SensorInfo> sensors;
+
     while (true) {
-        auto reply_opt = replies.try_recv();
-        if (!reply_opt.has_value()) break;
-        auto& reply = reply_opt.value();
+        auto result = replies.recv();
+        if (std::holds_alternative<zenoh::channels::RecvError>(result)) {
+            break;  // Z_DISCONNECTED — all replies received
+        }
 
-        if (reply.is_ok()) {
-            auto& sample = reply.get_ok();
-            auto key_str = sample.get_keyexpr().as_string_view();
+        auto& reply = std::get<zenoh::Reply>(result);
+        if (!reply.is_ok()) {
+            HOLOSCAN_LOG_WARN("Received error reply during sensor discovery");
+            continue;
+        }
 
-            // Extract sensor name from key:
-            // {prefix}/{capture_node}/rpc/sensor/{sensor_name}/describe
-            std::string key(key_str);
-            auto rpc_pos = key.find("/rpc/sensor/");
+        auto& sample = reply.get_ok();
+        auto payload_vec = sample.get_payload().as_vector();
+
+        // Decode DeviceContextReply to get CameraSensor with enabled streams
+        pcpd_msgs::rpc::DeviceContextReply ctx_reply;
+        tcn::cdr::CdrBufferReader reader;
+        if (reader.read(payload_vec.data(), payload_vec.size(), ctx_reply)) {
+            const auto& cam = ctx_reply.value();
+            SensorInfo info;
+            info.name = cam.name();
+            info.color_enabled = cam.color_enabled();
+            info.depth_enabled = cam.depth_enabled();
+            info.infrared_enabled = cam.infrared_enabled();
+            HOLOSCAN_LOG_INFO("  Sensor '{}': color={}, depth={}, infrared={} (type: {})",
+                              info.name, info.color_enabled, info.depth_enabled,
+                              info.infrared_enabled, ctx_reply.sensor_type());
+            sensors.push_back(std::move(info));
+        } else {
+            // Fallback: extract sensor name from the reply key expression
+            auto key_str = std::string(sample.get_keyexpr().as_string_view());
+            auto rpc_pos = key_str.find("/rpc/sensor/");
             if (rpc_pos != std::string::npos) {
                 auto name_start = rpc_pos + std::string("/rpc/sensor/").size();
-                auto name_end = key.find("/describe", name_start);
+                auto name_end = key_str.find("/describe", name_start);
                 if (name_end != std::string::npos) {
-                    sensor_names.push_back(key.substr(name_start, name_end - name_start));
+                    SensorInfo info;
+                    info.name = key_str.substr(name_start, name_end - name_start);
+                    info.color_enabled = true;
+                    info.depth_enabled = true;
+                    HOLOSCAN_LOG_WARN("  Failed to decode DeviceContextReply, using key: '{}'",
+                                      info.name);
+                    sensors.push_back(std::move(info));
                 }
             }
         }
     }
 
-    HOLOSCAN_LOG_INFO("Discovered {} sensors", sensor_names.size());
+    HOLOSCAN_LOG_INFO("Discovered {} sensors", sensors.size());
+    if (sensors.empty()) {
+        HOLOSCAN_LOG_ERROR("No sensors responded to discovery query on '{}'", discover_topic);
+        return configs;
+    }
 
-    // Phase 2: For each sensor, fetch stream descriptors
+    // -----------------------------------------------------------------------
+    // Phase 2: For each enabled stream, fetch its StreamDescriptor
+    // -----------------------------------------------------------------------
+    HOLOSCAN_LOG_INFO("Phase 2 — resolving stream descriptors");
+
+    // Build stream_types filter set (empty = accept all enabled)
+    std::set<std::string> type_filter(stream_types.begin(), stream_types.end());
+
     int32_t stream_index = 0;
-    for (const auto& sensor : sensor_names) {
-        for (const auto& stype : stream_types) {
-            // Key: {topic_prefix}/{sensor}/cfg/dsc/{stype}_image_bitstream
+    for (const auto& sensor : sensors) {
+        // Map stream type → enabled flag
+        struct StreamEntry {
+            std::string type;
+            bool enabled;
+        };
+        std::vector<StreamEntry> entries = {
+            {"color", sensor.color_enabled},
+            {"depth", sensor.depth_enabled},
+            {"infrared", sensor.infrared_enabled},
+        };
+
+        for (const auto& entry : entries) {
+            if (!entry.enabled) continue;
+            if (!type_filter.empty() && type_filter.count(entry.type) == 0) continue;
+
+            // Descriptor key: {prefix}/{sensor}/cfg/dsc/{type}_image_bitstream
             std::string desc_topic =
-                topic_prefix + "/" + sensor + "/cfg/dsc/" + stype + "_image_bitstream";
+                topic_prefix + "/" + sensor.name + "/cfg/dsc/" + entry.type + "_image_bitstream";
 
-            auto desc_key = zenoh::KeyExpr(desc_topic);
-            auto desc_replies = session.get(desc_key, "", zenoh::channels::FifoChannel(4));
+            HOLOSCAN_LOG_INFO("  Fetching descriptor: {}", desc_topic);
 
-            auto desc_reply_opt = desc_replies.try_recv();
-            if (!desc_reply_opt.has_value() || !desc_reply_opt.value().is_ok()) {
-                HOLOSCAN_LOG_WARN("No descriptor for {}/{} — skipping", sensor, stype);
+            zenoh::Session::GetOptions desc_opts = zenoh::Session::GetOptions::create_default();
+            desc_opts.timeout_ms = 5000;
+            desc_opts.target = Z_QUERY_TARGET_ALL;
+            desc_opts.consolidation = zenoh::QueryConsolidation(Z_CONSOLIDATION_MODE_MONOTONIC);
+
+            auto desc_replies = session.get(
+                zenoh::KeyExpr(desc_topic), "",
+                zenoh::channels::FifoChannel(4),
+                std::move(desc_opts));
+
+            auto desc_result = desc_replies.recv();
+            if (std::holds_alternative<zenoh::channels::RecvError>(desc_result)) {
+                HOLOSCAN_LOG_WARN("  No descriptor reply for {}/{} — skipping",
+                                  sensor.name, entry.type);
                 continue;
             }
 
-            auto& desc_sample = desc_reply_opt.value().get_ok();
-
-            // CDR-decode the StreamDescriptorMessage
-            auto payload_str = desc_sample.get_payload().as_string();
-            std::vector<uint8_t> desc_bytes(payload_str.begin(), payload_str.end());
-
-            auto& registry = tcn::cdr::CdrTypeRegistry::instance();
-            tcn::cdr::DecodedMessage decoded;
-            std::string desc_type = "tcnart_msgs::msg::StreamDescriptorMessage";
-
-            ZenohStreamConfig cfg;
-            cfg.sensor_name = sensor;
-            cfg.name = sensor + "_" + stype;
-            cfg.stream_index = stream_index++;
-
-            if (registry.decode(desc_type, desc_bytes, decoded)) {
-                // Extract stream topic from metadata
-                auto it = decoded.metadata.find("stream_topic");
-                if (it != decoded.metadata.end()) {
-                    cfg.topic = it->second;
-                } else {
-                    cfg.topic = desc_topic;  // Fallback to descriptor topic
-                }
-
-                // Extract image dimensions
-                auto w_it = decoded.metadata.find("image_width");
-                if (w_it != decoded.metadata.end()) cfg.image_width = std::stoi(w_it->second);
-                auto h_it = decoded.metadata.find("image_height");
-                if (h_it != decoded.metadata.end()) cfg.image_height = std::stoi(h_it->second);
-                auto s_it = decoded.metadata.find("image_step");
-                if (s_it != decoded.metadata.end()) cfg.image_step = std::stoi(s_it->second);
-                auto f_it = decoded.metadata.find("image_format");
-                if (f_it != decoded.metadata.end()) cfg.image_format = std::stoi(f_it->second);
-                auto c_it = decoded.metadata.find("image_compression");
-                if (c_it != decoded.metadata.end()) cfg.image_compression = std::stoi(c_it->second);
-                auto r_it = decoded.metadata.find("frame_rate");
-                if (r_it != decoded.metadata.end()) cfg.frame_rate = std::stof(r_it->second);
-            } else {
-                HOLOSCAN_LOG_WARN("Failed to decode descriptor for {} — using topic as-is",
-                                  cfg.name);
-                cfg.topic = desc_topic;
+            auto& desc_reply = std::get<zenoh::Reply>(desc_result);
+            if (!desc_reply.is_ok()) {
+                HOLOSCAN_LOG_WARN("  Error reply for descriptor {}/{}", sensor.name, entry.type);
+                continue;
             }
 
-            HOLOSCAN_LOG_INFO("Stream '{}': topic={} ({}x{}, compression={})",
+            auto& desc_sample = desc_reply.get_ok();
+            auto desc_bytes = desc_sample.get_payload().as_vector();
+
+            // CDR-decode StreamDescriptorMessage directly (no registry indirection)
+            tcnart_msgs::msg::StreamDescriptorMessage desc_msg;
+            tcn::cdr::CdrBufferReader desc_reader;
+
+            ZenohStreamConfig cfg;
+            cfg.sensor_name = sensor.name;
+            cfg.name = sensor.name + "_" + entry.type;
+            cfg.stream_index = stream_index++;
+
+            if (desc_reader.read(desc_bytes.data(), desc_bytes.size(), desc_msg)) {
+                cfg.topic = desc_msg.stream_topic();
+                cfg.image_width = static_cast<int32_t>(desc_msg.image_width());
+                cfg.image_height = static_cast<int32_t>(desc_msg.image_height());
+                cfg.image_step = static_cast<int32_t>(desc_msg.image_step());
+                cfg.image_format = static_cast<int32_t>(desc_msg.image_format());
+                cfg.image_compression = static_cast<int32_t>(desc_msg.image_compression());
+                cfg.frame_rate = static_cast<float>(desc_msg.frame_rate());
+            } else {
+                HOLOSCAN_LOG_WARN("  Failed to decode StreamDescriptorMessage for {}",
+                                  cfg.name);
+                // Fallback: use registry-based decode
+                auto& registry = tcn::cdr::CdrTypeRegistry::instance();
+                tcn::cdr::DecodedMessage decoded;
+                if (registry.decode("tcnart_msgs::msg::StreamDescriptorMessage",
+                                    desc_bytes, decoded)) {
+                    auto it = decoded.metadata.find("stream_topic");
+                    cfg.topic = (it != decoded.metadata.end()) ? it->second : desc_topic;
+                    auto w = decoded.metadata.find("image_width");
+                    if (w != decoded.metadata.end()) cfg.image_width = std::stoi(w->second);
+                    auto h = decoded.metadata.find("image_height");
+                    if (h != decoded.metadata.end()) cfg.image_height = std::stoi(h->second);
+                    auto s = decoded.metadata.find("image_step");
+                    if (s != decoded.metadata.end()) cfg.image_step = std::stoi(s->second);
+                    auto f = decoded.metadata.find("image_format");
+                    if (f != decoded.metadata.end()) cfg.image_format = std::stoi(f->second);
+                    auto c = decoded.metadata.find("image_compression");
+                    if (c != decoded.metadata.end()) cfg.image_compression = std::stoi(c->second);
+                    auto r = decoded.metadata.find("frame_rate");
+                    if (r != decoded.metadata.end()) cfg.frame_rate = std::stof(r->second);
+                } else {
+                    HOLOSCAN_LOG_ERROR("  Cannot decode descriptor for {} — skipping", cfg.name);
+                    stream_index--;
+                    continue;
+                }
+            }
+
+            if (cfg.topic.empty()) {
+                HOLOSCAN_LOG_WARN("  Descriptor for {} has no stream_topic — skipping", cfg.name);
+                stream_index--;
+                continue;
+            }
+
+            HOLOSCAN_LOG_INFO("  Stream '{}': topic={} ({}x{}, compression={}, fps={})",
                               cfg.name, cfg.topic, cfg.image_width, cfg.image_height,
-                              cfg.image_compression);
+                              cfg.image_compression, cfg.frame_rate);
             configs.push_back(std::move(cfg));
         }
     }
@@ -226,9 +344,8 @@ void TcnZenohReceiverOp::start() {
                         rs.type_name = attachment.value().get().as_string();
                     }
 
-                    // Extract payload bytes
-                    auto payload_str = sample.get_payload().as_string();
-                    rs.payload.assign(payload_str.begin(), payload_str.end());
+                    // Extract payload bytes (use as_vector for binary CDR data)
+                    rs.payload = sample.get_payload().as_vector();
 
                     {
                         std::lock_guard<std::mutex> lock(state_ptr->queue_mutex);
