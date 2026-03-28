@@ -221,7 +221,8 @@ RUN rm -rf /tmp/dependencies/tcn_schema && \
     cd build && \
     cmake -G "Ninja" .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
         -DWITH_DDS=OFF -DBUILD_SHARED_LIBS=OFF \
-        -DFASTDDS_GEN_JAR_PATH=/usr/share/fastddsgen/java && \
+        -DFASTDDS_GEN_JAR_PATH=/usr/share/fastddsgen/java \
+        -DCMAKE_INSTALL_INCLUDEDIR=include && \
     cmake --build . --config Release -- -j $(nproc) && \
     cmake --install . && \
     cd /tmp/dependencies && \
