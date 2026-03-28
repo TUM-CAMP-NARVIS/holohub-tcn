@@ -196,19 +196,31 @@ RUN rm -rf /tmp/dependencies/zenoh-cpp && \
     cd /tmp/dependencies && \
     rm -rf zenoh-cpp
 
+# Install Java runtime + build fastddsgen (IDL-to-C++ code generator for tcn_schema)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends default-jdk-headless && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /tmp/dependencies
+RUN rm -rf /tmp/dependencies/Fast-DDS-Gen && \
+    git clone --depth 1 --branch v4.0.3 --recurse-submodules \
+        https://github.com/eProsima/Fast-DDS-Gen.git && \
+    cd Fast-DDS-Gen && \
+    ./gradlew assemble && \
+    mkdir -p /usr/share/fastddsgen/java && \
+    cp share/fastddsgen/java/fastddsgen.jar /usr/share/fastddsgen/java/ && \
+    cd /tmp/dependencies && \
+    rm -rf Fast-DDS-Gen
+
 # Build and install tcn_schema (IDL-generated CDR message types)
-# Note: upstream CMakeLists.txt unconditionally requires fastddsgen.jar even
-# with -DWITH_DDS=OFF.  We patch lines 23-26 (the include + find_file) to
-# skip them when DDS is disabled, avoiding the Java/fastddsgen dependency.
 WORKDIR /tmp/dependencies
 RUN rm -rf /tmp/dependencies/tcn_schema && \
     git clone --depth 1 https://github.com/TUM-CAMP-NARVIS/tcn_schema.git && \
     cd tcn_schema && \
-    sed -i '22,26s/^/#/' CMakeLists.txt && \
     mkdir build && \
     cd build && \
     cmake -G "Ninja" .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
-        -DWITH_DDS=OFF -DBUILD_SHARED_LIBS=OFF && \
+        -DWITH_DDS=OFF -DBUILD_SHARED_LIBS=OFF \
+        -DFASTDDS_GEN_JAR_PATH=/usr/share/fastddsgen/java && \
     cmake --build . --config Release -- -j $(nproc) && \
     cmake --install . && \
     cd /tmp/dependencies && \
