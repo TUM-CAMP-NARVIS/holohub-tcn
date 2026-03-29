@@ -28,6 +28,7 @@
 
 #include <holoscan/holoscan.hpp>
 #include <cuda_runtime.h>
+#include <cuda.h>  // CUcontext, CUdevice for NVDEC H264/H265 decode
 
 // Forward-declare zenoh types to avoid pulling the full header into every consumer.
 namespace zenoh {
@@ -35,6 +36,11 @@ class Session;
 template <class Handler>
 class Subscriber;
 }  // namespace zenoh
+
+// Forward-declare NVDEC types (only used for compressed streams)
+class NvDecoder;
+class FFmpegDemuxer;
+namespace holoscan::ops { class StreamDataProvider; }
 
 namespace tcn::ops {
 
@@ -147,6 +153,11 @@ class TcnZenohReceiverOp : public holoscan::Operator {
         std::atomic<uint64_t> frames_emitted{0};
 
         static constexpr size_t kMaxQueuedSamples = 4;
+
+        // H264/H265 NVDEC decoder state (lazy-initialized for compressed streams)
+        std::unique_ptr<holoscan::ops::StreamDataProvider> data_provider;
+        std::unique_ptr<FFmpegDemuxer> demuxer;
+        std::unique_ptr<NvDecoder> decoder;
     };
 
     std::vector<ZenohStreamConfig> stream_configs_;
@@ -160,6 +171,11 @@ class TcnZenohReceiverOp : public holoscan::Operator {
 
     // CUDA stream for host-to-device copies
     cudaStream_t upload_stream_ = nullptr;
+
+    // NVDEC H264/H265 support (shared CUDA driver context across all compressed streams)
+    CUcontext cu_context_ = nullptr;
+    CUdevice cu_device_ = 0;
+    bool has_compressed_streams_ = false;
 };
 
 }  // namespace tcn::ops

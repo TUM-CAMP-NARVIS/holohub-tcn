@@ -33,6 +33,25 @@
 #include <tcnart_msgs/rpc/Requests.h>
 #include <tcnart_msgs/msg/StreamDescriptor.h>
 
+// NVDEC H264/H265 decode support (optional, guarded by TCN_HAS_NVDEC)
+#if TCN_HAS_NVDEC
+#include <cuda.h>
+#include "nv_video_decoder.hpp"  // StreamDataProvider, includes FFmpegDemuxer.h + NvDecoder
+#include <gxf/std/video_buffer.hpp>
+
+// CUDA driver API error check macro
+#define CU_CHECK(call)                                                              \
+    do {                                                                            \
+        CUresult _cu_result = (call);                                               \
+        if (_cu_result != CUDA_SUCCESS) {                                           \
+            const char* _err_name = nullptr;                                        \
+            cuGetErrorName(_cu_result, &_err_name);                                 \
+            HOLOSCAN_LOG_ERROR("CUDA driver error: {} ({}:{})",                     \
+                               _err_name ? _err_name : "unknown", __FILE__, __LINE__); \
+        }                                                                           \
+    } while (0)
+#endif  // TCN_HAS_NVDEC
+
 namespace tcn::ops {
 
 // ---------------------------------------------------------------------------
@@ -110,7 +129,7 @@ std::vector<ZenohStreamConfig> TcnZenohReceiverOp::discover_streams(
         if (reader.read(payload_vec.data(), payload_vec.size(), ctx_reply)) {
             const auto& cam = ctx_reply.value();
             SensorInfo info;
-            info.name = cam.name();
+            info.name = ctx_reply.name();
             info.color_enabled = cam.color_enabled();
             info.depth_enabled = cam.depth_enabled();
             info.infrared_enabled = cam.infrared_enabled();
@@ -306,6 +325,24 @@ void TcnZenohReceiverOp::start() {
     // Create CUDA stream for host-to-device uploads
     HOLOSCAN_CUDA_CALL(cudaStreamCreateWithFlags(&upload_stream_, cudaStreamNonBlocking));
 
+#if TCN_HAS_NVDEC
+    // Check if any streams require H264/H265 decoding
+    for (const auto& cfg : stream_configs_) {
+        if (cfg.image_compression == 1 || cfg.image_compression == 2) {
+            has_compressed_streams_ = true;
+            break;
+        }
+    }
+
+    // Initialize CUDA driver context for NVDEC (shared across all compressed streams)
+    if (has_compressed_streams_) {
+        CU_CHECK(cuInit(0));
+        CU_CHECK(cuDeviceGet(&cu_device_, 0));
+        CU_CHECK(cuDevicePrimaryCtxRetain(&cu_context_, cu_device_));
+        HOLOSCAN_LOG_INFO("NVDEC context initialized for H264/H265 decode");
+    }
+#endif  // TCN_HAS_NVDEC
+
     // Set initial async state
     if (async_condition_.get()) {
         async_condition_.get()->event_state(holoscan::AsynchronousEventState::EVENT_WAITING);
@@ -434,6 +471,152 @@ void TcnZenohReceiverOp::compute(
 
         if (frame_size == 0) continue;
 
+#if TCN_HAS_NVDEC
+        // --- H264/H265 compressed stream: decode with NVDEC ---
+        if (cfg.image_compression == 1 || cfg.image_compression == 2) {
+            // Lazy-initialize per-stream decoder on first frame
+            if (!state->data_provider) {
+                state->data_provider =
+                    std::make_unique<holoscan::ops::StreamDataProvider>();
+            }
+
+            state->data_provider->SetData(
+                const_cast<uint8_t*>(frame_data),
+                static_cast<int>(frame_size));
+
+            if (!state->demuxer || !state->decoder) {
+                CU_CHECK(cuCtxPushCurrent(cu_context_));
+                try {
+                    state->demuxer = std::make_unique<FFmpegDemuxer>(
+                        state->data_provider.get());
+                    state->decoder = std::make_unique<NvDecoder>(
+                        cu_context_,
+                        true,   // bUseDeviceFrame
+                        FFmpeg2NvCodecId(state->demuxer->GetVideoCodec()),
+                        true,   // bLowLatency
+                        false,  // bDeviceFramePitched
+                        nullptr, nullptr,
+                        false,  // extract_user_SEI_Message
+                        0, 0,   // maxWidth, maxHeight
+                        1000,   // clkRate
+                        true);  // force_zero_latency
+                    HOLOSCAN_LOG_INFO(
+                        "Stream '{}': NVDEC decoder initialized (compression={})",
+                        cfg.name, cfg.image_compression);
+                } catch (const std::exception& e) {
+                    HOLOSCAN_LOG_ERROR(
+                        "Stream '{}': NVDEC init failed: {}", cfg.name, e.what());
+                    state->demuxer.reset();
+                    state->decoder.reset();
+                    CU_CHECK(cuCtxPopCurrent(nullptr));
+                    continue;
+                }
+            }
+
+            // Demux and decode
+            uint8_t* pVideo = nullptr;
+            int nVideoBytes = 0;
+            int nFrameReturned = 0;
+
+            do {
+                state->demuxer->Demux(&pVideo, &nVideoBytes);
+                try {
+                    nFrameReturned = state->decoder->Decode(pVideo, nVideoBytes);
+                } catch (const std::exception& e) {
+                    HOLOSCAN_LOG_ERROR(
+                        "Stream '{}': decode error: {}", cfg.name, e.what());
+                    continue;
+                }
+                if (nFrameReturned > 0) break;
+            } while (nVideoBytes);
+
+            if (nFrameReturned == 0) {
+                HOLOSCAN_LOG_DEBUG(
+                    "Stream '{}': no decoded frame yet (codec initialization)",
+                    cfg.name);
+                continue;
+            }
+
+            uint8_t* pFrame = state->decoder->GetLockedFrame();
+            if (!pFrame) {
+                HOLOSCAN_LOG_ERROR(
+                    "Stream '{}': GetLockedFrame returned null", cfg.name);
+                continue;
+            }
+
+            auto dec_width = state->decoder->GetWidth();
+            auto dec_height = state->decoder->GetHeight();
+
+            // Emit decoded NV12 frame as VideoBuffer
+            auto out_entity = holoscan::gxf::Entity::New(&context);
+            auto maybe_vbuf = static_cast<nvidia::gxf::Entity&>(out_entity)
+                                  .add<nvidia::gxf::VideoBuffer>();
+            if (!maybe_vbuf) {
+                HOLOSCAN_LOG_ERROR(
+                    "Stream '{}': failed to add VideoBuffer", cfg.name);
+                state->decoder->UnlockFrame(&pFrame);
+                continue;
+            }
+
+            auto video_buffer = maybe_vbuf.value();
+            nvidia::gxf::VideoFormatSize<nvidia::gxf::VideoFormat::GXF_VIDEO_FORMAT_NV12>
+                color_format;
+
+            auto resize_result =
+                video_buffer->resize<nvidia::gxf::VideoFormat::GXF_VIDEO_FORMAT_NV12>(
+                    static_cast<uint32_t>(dec_width),
+                    static_cast<uint32_t>(dec_height),
+                    nvidia::gxf::SurfaceLayout::GXF_SURFACE_LAYOUT_PITCH_LINEAR,
+                    nvidia::gxf::MemoryStorageType::kDevice,
+                    gxf_alloc);
+            if (!resize_result) {
+                HOLOSCAN_LOG_ERROR(
+                    "Stream '{}': VideoBuffer resize failed", cfg.name);
+                state->decoder->UnlockFrame(&pFrame);
+                continue;
+            }
+
+            // Compute plane offsets using the same method as NvVideoDecoderOp
+            auto color_planes = color_format.getDefaultColorPlanes(
+                dec_width, dec_height, true);
+            nvidia::gxf::VideoBufferInfo vbuf_info{
+                static_cast<uint32_t>(dec_width),
+                static_cast<uint32_t>(dec_height),
+                nvidia::gxf::VideoFormat::GXF_VIDEO_FORMAT_NV12,
+                std::move(color_planes),
+                nvidia::gxf::SurfaceLayout::GXF_SURFACE_LAYOUT_PITCH_LINEAR};
+            vbuf_info.color_planes[0].offset = 0;
+            vbuf_info.color_planes[1].offset = vbuf_info.color_planes[0].size;
+
+            // Copy Y plane
+            HOLOSCAN_CUDA_CALL(cudaMemcpy2D(
+                video_buffer->pointer() + vbuf_info.color_planes[0].offset,
+                vbuf_info.color_planes[0].stride,
+                pFrame,
+                state->decoder->GetDeviceFramePitch(),
+                dec_width,
+                dec_height,
+                cudaMemcpyDeviceToDevice));
+
+            // Copy UV plane
+            HOLOSCAN_CUDA_CALL(cudaMemcpy2D(
+                video_buffer->pointer() + vbuf_info.color_planes[1].offset,
+                vbuf_info.color_planes[1].stride,
+                pFrame + state->decoder->GetLumaPlaneSize(),
+                state->decoder->GetDeviceFramePitch(),
+                dec_width,
+                dec_height / 2,
+                cudaMemcpyDeviceToDevice));
+
+            state->decoder->UnlockFrame(&pFrame);
+            op_output.emit(out_entity, cfg.name.c_str());
+            state->frames_emitted.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+#endif  // TCN_HAS_NVDEC
+
+        // --- Raw (uncompressed) stream: upload bytes to GPU tensor ---
+
         // Compute tensor shape: HxWxC if dimensions known, otherwise 1D
         nvidia::gxf::Shape shape;
         if (height > 0 && width > 0) {
@@ -485,7 +668,7 @@ void TcnZenohReceiverOp::stop() {
             holoscan::AsynchronousEventState::EVENT_NEVER);
     }
 
-    // Undeclare subscribers and drain queues
+    // Undeclare subscribers and drain queues; release per-stream decoders
     for (auto& state : stream_states_) {
         state->subscriber.reset();
         {
@@ -494,6 +677,11 @@ void TcnZenohReceiverOp::stop() {
                 state->sample_queue.pop();
             }
         }
+        // Release NVDEC resources (decoder before demuxer before provider)
+        state->decoder.reset();
+        state->demuxer.reset();
+        state->data_provider.reset();
+
         auto dropped = state->samples_dropped.load(std::memory_order_relaxed);
         auto emitted = state->frames_emitted.load(std::memory_order_relaxed);
         HOLOSCAN_LOG_INFO("Stream '{}': {} frames emitted, {} samples dropped",
@@ -506,6 +694,20 @@ void TcnZenohReceiverOp::stop() {
         cudaStreamDestroy(upload_stream_);
         upload_stream_ = nullptr;
     }
+
+#if TCN_HAS_NVDEC
+    // Release CUDA driver context for NVDEC
+    if (cu_context_) {
+        CUcontext current_ctx;
+        CUresult result = cuCtxGetCurrent(&current_ctx);
+        if (result == CUDA_SUCCESS && current_ctx == cu_context_) {
+            cuCtxPopCurrent(nullptr);
+        }
+        cuDevicePrimaryCtxRelease(cu_device_);
+        cu_context_ = nullptr;
+        has_compressed_streams_ = false;
+    }
+#endif  // TCN_HAS_NVDEC
 
     HOLOSCAN_LOG_INFO("TcnZenohReceiverOp stopped");
 }
