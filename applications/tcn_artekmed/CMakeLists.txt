@@ -21,6 +21,7 @@ add_holohub_application(tcn_zenoh_receiver DEPENDS OPERATORS
                           tcn_zenoh_publisher
                           tcn_shm_serde
                           tcn_shm_zenoh_sender
+                          nv_video_decoder
                           )
 
 add_holohub_application(tcn_shm_receiver DEPENDS OPERATORS
