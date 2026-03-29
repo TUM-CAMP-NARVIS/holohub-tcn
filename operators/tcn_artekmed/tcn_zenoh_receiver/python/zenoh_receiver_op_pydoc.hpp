@@ -22,11 +22,14 @@ fragment : holoscan.core.Fragment
 async_condition : holoscan.conditions.AsynchronousCondition
     AsynchronousCondition for event-driven scheduling.
 allocator : holoscan.resources.Allocator, optional
-    GPU memory allocator.
+    GPU memory allocator for tensor uploads.
 cuda_stream_pool : holoscan.resources.CudaStreamPool, optional
-    Pool for CUDA streams.
+    Pool for CUDA streams used in async GPU operations.
 name : str, optional
     The name of the operator.
+
+After construction, call ``set_stream_configs()``, ``set_session()``, and
+``init_spec()`` before the Holoscan runtime starts.
 )doc";
 
 constexpr const char* doc_initialize = R"doc(

@@ -5,49 +5,29 @@
 import os
 import logging
 from argparse import ArgumentParser
-from typing import Any, Dict, List, Optional, Callable, Tuple, Union
-import queue
-import threading
 
 import holoscan as hs
-import numpy as np
 
-from holoscan.gxf import Entity
 from holoscan.logger import LogLevel, set_log_level
 
-from holoscan.resources import CudaStreamPool, UnboundedAllocator, BlockMemoryPool
+from holoscan.resources import CudaStreamPool, UnboundedAllocator
+from holoscan.conditions import AsynchronousCondition
+from holoscan.core import Application, Operator, OperatorSpec, Tracker
+from holoscan.schedulers import EventBasedScheduler
 
-from holoscan.conditions import AsynchronousCondition, AsynchronousEventState, BooleanCondition, CountCondition, PeriodicCondition, MessageAvailableCondition, DownstreamMessageAffordableCondition
-from holoscan.core import Application, ConditionType, IOSpec, Operator, OperatorSpec, Tracker
-from holoscan.schedulers import EventBasedScheduler, GreedyScheduler, MultiThreadScheduler
-
-from holoscan.operators import HolovizOp
-
-from holohub.nv_video_decoder import NvVideoDecoderOp
+from holohub.tcn_zenoh_receiver import (
+    TcnZenohReceiverOp,
+    ZenohStreamConfig,
+    open_zenoh_session,
+    discover_streams,
+)
 from holohub.tcn_shm_zenoh_sender import TcnShmZenohSenderOp
-
-import zenoh
-
-from tcnart.network.discovery import find_camera_sensors, build_channel_configs
-from tcnart.network.receiver import resolve_stream_descriptors, start_all_receivers
-from tcnart.serialization.cdr_serialization import decode_raw_message, encode_raw_message
-from tcnart.serialization.error import MessageError
-from tcnart.core.semantic_type import SemanticType
-from tcnart.schema.messages.rpc import NullRequest
-from tcnart.schema.messages.service_controller import DeviceContextReply
-from tcnart.schema.messages.stream import StreamDescriptorMessage
-from tcnart.schema.messages.video import VideoStreamMessage
-from tcnart.schema.messages.common import InvalidMessage
-from tcnart.schema.types.primitives import CameraModel
-from tcnart.schema.types.transform import RigidTransform
-from tcnart.core.dataflow import StreamConfig
-from tcnart.core.frames import FrameAnnotation
 
 log = logging.getLogger(__name__)
 
 
 class StatsOp(Operator):
-    """Print common streaming statistics"""
+    """Print common streaming statistics."""
 
     def __init__(self, app, *args, **kwargs):
         self.encode_latency = []
@@ -67,7 +47,6 @@ class StatsOp(Operator):
             self.first_frame_ignored = True
             return
 
-        # Check if metadata exists before accessing it
         if hasattr(self, "metadata"):
             self.encode_latency.append(self.metadata.get("video_encoder_encode_latency_ms", 0))
             self.decode_latency.append(self.metadata.get("video_decoder_decode_latency_ms", 0))
@@ -93,150 +72,15 @@ class StatsOp(Operator):
             )
 
 
-class CdrDecoderOp(Operator):
-    """Decode CDR Payload.
-
-    Inputs:
-        input: raw CDR payload bytes
-    Outputs:
-        output: decoded message data (e.g. image bytes as numpy array)
-    """
-
-    def __init__(self,
-                 fragment: Any,
-                 type_class: Any,
-                 result_factory: Callable,
-                 source: str,
-                 stream_index: int,
-                 semantic_type: SemanticType,
-                 annotations: Dict[str, FrameAnnotation],
-                 *args,
-                 **kwargs):
-
-        self.type_class = type_class
-        self.source = source
-        self.stream_index = stream_index
-        self.semantic_type = semantic_type
-        self.annotations = annotations
-        self.result_factory = result_factory if result_factory else lambda m, tn, d: d
-
-        super().__init__(fragment, *args, **kwargs)
-
-    def setup(self, spec: OperatorSpec):
-        spec.input("input")
-        spec.output("output")
-
-    def compute(self, op_input, op_output, context):
-        value = op_input.receive("input")
-
-        type_name = self.metadata.get("CdrTypeName", None)
-
-        if type_name is None:
-            return
-
-        self.metadata.set("StreamSource", self.source)
-        self.metadata.set("StreamIndex", self.stream_index)
-        self.metadata.set("SemanticType", self.semantic_type)
-
-        for k,v in self.annotations.items():
-            self.metadata.set(k, v)
-
-        try:
-            msg = self.type_class.deserialize(value)
-        except MessageError as e:
-            log.exception(e)
-            msg = InvalidMessage()
-
-        result = {"": self.result_factory(self.metadata, type_name, msg)}
-        op_output.emit(result, "output")
-
-
-class ZenohSubscriberOp(Operator):
-    """Zenoh subscriber source operator.
-
-    Subscribes to a Zenoh topic and emits received CDR payloads.
-    Uses AsynchronousCondition for event-driven scheduling.
-
-    Outputs:
-        output: raw CDR payload bytes
-    """
-
-    def __init__(
-        self,
-        fragment: Any,
-        session: Any,
-        topic: str,
-        *args,
-        **kwargs,
-    ):
-        self.session = session
-        self.topic = topic
-
-        self.subscriber = None
-        self.pool = None
-
-        self.async_cond_ = AsynchronousCondition(fragment, name="async_cond")
-        self.buffer = queue.Queue()
-
-        super().__init__(fragment, self.async_cond_, *args, **kwargs)
-
-    def on_receive(self, sample: Any):
-        if self.async_cond_.event_state == AsynchronousEventState.EVENT_NEVER:
-            return
-
-        if sample is None or sample.payload is None or sample.attachment is None:
-            log.warning("received incomplete sample.")
-            return
-
-        try:
-            payload = sample.payload.to_bytes()
-            type_name = sample.attachment.to_string()
-        except Exception as e:
-            log.exception(e)
-            type_name = None
-            payload = None
-
-        if payload is not None and type_name is not None:
-            self.buffer.put((type_name, payload))
-
-            if self.async_cond_.event_state == AsynchronousEventState.EVENT_WAITING:
-                self.async_cond_.event_state = AsynchronousEventState.EVENT_DONE
-
-    def setup(self, spec: OperatorSpec):
-        spec.output("output")
-
-    def start(self):
-        self.subscriber = self.session.declare_subscriber(self.topic, self.on_receive)
-
-    def compute(self, op_input, op_output, context):
-        scheduler = self.fragment.scheduler()
-        clock = scheduler.clock
-        ts = clock.timestamp()
-
-        type_name, block = self.buffer.get()
-
-        self.async_cond_.event_state = AsynchronousEventState.EVENT_WAITING
-
-        self.metadata.set("CdrTypeName", type_name)
-
-        op_output.emit(block, "output", acq_timestamp=ts)
-
-    def stop(self):
-        self.async_cond_.event_state = AsynchronousEventState.EVENT_NEVER
-        if self.subscriber is not None:
-            self.subscriber.undeclare()
-            self.subscriber = None
-
-
 class App(hs.core.Application):
     def compose(self):
-        print("Starting TCN Zenoh Receiver (Python)")
+        print("Starting TCN Zenoh Receiver (Python + C++ operators via pybind11)")
 
         zenoh_config = self.kwargs("zenoh")
-
         topic_prefix = zenoh_config.get("topic_prefix")
         capture_node = zenoh_config.get("capture_node")
-        zenoh_config_file = zenoh_config.get("zenoh_config_file")
+        zenoh_config_file = zenoh_config.get("zenoh_config_file", "")
+        stream_types = zenoh_config.get("stream_types", ["color", "depth"])
 
         try:
             shm_config = self.kwargs("shared_memory")
@@ -246,57 +90,64 @@ class App(hs.core.Application):
             shm_stream_name = "camera_streams"
             enable_shm_output = False
 
-        zenoh.init_log_from_env_or("info")
-        self.session = zenoh.open(zenoh.Config.from_json5(open(zenoh_config_file).read()))
+        # Open a C++ Zenoh session (shared with the C++ operator).
+        # Stored on self to prevent garbage collection while the operator holds a reference.
+        try:
+            self.zenoh_session = open_zenoh_session(zenoh_config_file)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to open Zenoh session (config: {zenoh_config_file}): {e}"
+            ) from e
 
-        find_cameras_topic = f"{topic_prefix}/{capture_node}/rpc/sensor/*/describe"
-        print(f"Find cameras: {find_cameras_topic}")
-
-        cameras = find_camera_sensors(self.session, find_cameras_topic)
-        channels_config, channel_calibration, channel_poses = build_channel_configs(cameras)
-        stream_config = resolve_stream_descriptors(
-            topic_prefix, None, channel_calibration, channel_poses, channels_config, self.session
+        # Discover camera streams via C++ Zenoh RPC (same protocol as C++ app)
+        stream_configs = discover_streams(
+            self.zenoh_session, topic_prefix, capture_node, stream_types
         )
-        stream_keys = list(sorted(stream_config.keys()))
-        num_streams = len(stream_keys)
-        print(stream_keys)
+        if not stream_configs:
+            raise RuntimeError("No streams discovered via Zenoh")
 
-        def cb_decoder(meta, type_name, msg):
-            return np.asarray(msg.image, dtype=np.uint8, copy=True)
+        print(f"Discovered {len(stream_configs)} streams:")
+        for cfg in stream_configs:
+            print(f"  {cfg.name} -> {cfg.topic} ({cfg.image_width}x{cfg.image_height}, "
+                  f"compression={cfg.image_compression})")
 
-        for stream_index, stream_name in enumerate(stream_keys):
-            config = stream_config[stream_name]
-            topic = config.descriptor.stream_topic
-            subscriber = ZenohSubscriberOp(self, self.session, topic,
-                                           name=f"subscriber_{stream_name}")
+        # Single composite C++ operator: subscribe + CDR decode + GPU upload
+        async_cond = AsynchronousCondition(self, name="zenoh_receiver_async")
+        allocator = UnboundedAllocator(self, name="zenoh_receiver_allocator")
+        cuda_stream_pool = CudaStreamPool(
+            self,
+            dev_id=0,
+            stream_flags=0,
+            stream_priority=0,
+            reserved_size=len(stream_configs),
+            max_size=64,
+            name="zenoh_receiver_cuda_pool",
+        )
 
-            deserializer = CdrDecoderOp(self, VideoStreamMessage, cb_decoder, stream_name, stream_index,
-                                   SemanticType.from_identifier(config.descriptor.buffer_info.semantic_type),
-                                   config.annotations,
-                                   name=f"cdr_decoder_{stream_name}")
+        receiver = TcnZenohReceiverOp(
+            self,
+            async_condition=async_cond,
+            allocator=allocator,
+            cuda_stream_pool=cuda_stream_pool,
+            name="zenoh_receiver",
+        )
+        receiver.set_stream_configs(stream_configs)
+        receiver.set_session(self.zenoh_session)
+        receiver.init_spec()
 
-            decoder = NvVideoDecoderOp(
-                self,
-                name=f"nv_decoder_{stream_name}",
-                allocator=UnboundedAllocator(self, name=f"video_decoder_pool_{stream_name}"),
-                **self.kwargs("decoder"),
-            )
+        # Per-stream output routing: connect each dynamic output port to a sink
+        for cfg in stream_configs:
+            stats = StatsOp(self, name=f"stats_{cfg.name}")
+            self.add_flow(receiver, stats, {(cfg.name, "input")})
 
-            stats = StatsOp(self, name=f"stats_{stream_name}")
-
-            self.add_flow(subscriber, deserializer, {('output', 'input')})
-            self.add_flow(deserializer, decoder, {('output', 'input')})
-            self.add_flow(decoder, stats, {("output", "input")})
-
-            # Route decoded frames to per-stream SHM sender (C++ operator via pybind11)
             if enable_shm_output:
                 shm_sender = TcnShmZenohSenderOp(
                     self,
-                    stream_name=f"{shm_stream_name}/{stream_name}",
+                    stream_name=f"{shm_stream_name}/{cfg.name}",
                     input_tensor_names=[""],
-                    name=f"shm_sender_{stream_name}",
+                    name=f"shm_sender_{cfg.name}",
                 )
-                self.add_flow(decoder, shm_sender, {("output", "frame_input")})
+                self.add_flow(receiver, shm_sender, {(cfg.name, "frame_input")})
 
 
 def main(config_file=None):
@@ -331,7 +182,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.config == "none":
-        config_file = config_file = os.path.join(os.path.dirname(__file__), "tcn_zenoh_receiver.yaml")
+        config_file = os.path.join(os.path.dirname(__file__), "tcn_zenoh_receiver.yaml")
     else:
         config_file = args.config
 
