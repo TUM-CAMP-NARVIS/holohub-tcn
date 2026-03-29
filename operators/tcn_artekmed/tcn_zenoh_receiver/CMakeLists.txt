@@ -62,11 +62,6 @@ if(NOT TARGET holoscan::ops::tcn_cdr_serde)
     return()
 endif()
 
-# nv_video_decoder provides NVDEC H264/H265 decoding (StreamDataProvider, NvDecoder, FFmpegDemuxer)
-if(NOT TARGET holoscan::ops::nv_video_decoder)
-    message(WARNING "nv_video_decoder not available - tcn_zenoh_receiver H264/H265 decode disabled.")
-endif()
-
 # ---------------------------------------------------------------------------
 # Main library
 # ---------------------------------------------------------------------------
@@ -85,14 +80,7 @@ target_link_libraries(tcn_zenoh_receiver PUBLIC
     holoscan::core
     holoscan::ops::tcn_cdr_serde
     CUDA::cudart
-    CUDA::cuda_driver
 )
-
-# Optional NVDEC H264/H265 decode support
-if(TARGET holoscan::ops::nv_video_decoder)
-    target_link_libraries(tcn_zenoh_receiver PUBLIC holoscan::ops::nv_video_decoder)
-    target_compile_definitions(tcn_zenoh_receiver PRIVATE TCN_HAS_NVDEC=1)
-endif()
 if(TARGET zenohcxx::zenohcxx)
     target_link_libraries(tcn_zenoh_receiver PUBLIC zenohcxx::zenohcxx)
 elseif(TARGET zenohc::lib)
