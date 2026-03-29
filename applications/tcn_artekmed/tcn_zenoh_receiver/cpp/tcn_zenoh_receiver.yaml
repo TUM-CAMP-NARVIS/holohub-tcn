@@ -18,7 +18,7 @@ zenoh:
   zenoh_config_file: "/workspace/volumes/zenoh_config/zenoh_config.json5"
   stream_types:
     - "color"
-    - "depth"
+    # - "depth"
 
 pipeline:
   device_id: 0
