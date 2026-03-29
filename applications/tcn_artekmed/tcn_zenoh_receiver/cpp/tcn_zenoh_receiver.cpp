@@ -24,22 +24,11 @@
 #include <holoscan/holoscan.hpp>
 #include <yaml-cpp/yaml.h>
 
-// GXF codec wrapping for H264/H265 decoder operators
-#include <holoscan/core/resources/gxf/gxf_component_resource.hpp>
-#include <holoscan/operators/gxf_codelet/gxf_codelet.hpp>
-
 #define ZENOHCXX_ZENOHC 1
 #include <zenoh.hxx>
 
 #include "zenoh_receiver_op.hpp"
-
-// Wrap GXF H264 decoder codelets as Holoscan operators (SDK >= 2.1.0)
-HOLOSCAN_WRAP_GXF_CODELET_AS_OPERATOR(
-    VideoDecoderRequestOp, "nvidia::gxf::VideoDecoderRequest")
-HOLOSCAN_WRAP_GXF_CODELET_AS_OPERATOR(
-    VideoDecoderResponseOp, "nvidia::gxf::VideoDecoderResponse")
-HOLOSCAN_WRAP_GXF_COMPONENT_AS_RESOURCE(
-    VideoDecoderContext, "nvidia::gxf::VideoDecoderContext")
+#include "nv_video_decoder.hpp"
 
 namespace {
 
@@ -87,21 +76,6 @@ class TcnZenohReceiverApp : public holoscan::Application {
             return;
         }
 
-        // Load GXF extensions for H264/H265 decoding
-        bool has_compressed = false;
-        for (const auto& cfg : configs) {
-            if (cfg.image_compression == 1 || cfg.image_compression == 2) {
-                has_compressed = true;
-                break;
-            }
-        }
-        if (has_compressed) {
-            auto ext_mgr = executor().extension_manager();
-            ext_mgr->load_extension("libgxf_videodecoder.so");
-            ext_mgr->load_extension("libgxf_videodecoderio.so");
-            HOLOSCAN_LOG_INFO("Loaded GXF video decoder extensions for H264/H265");
-        }
-
         // Read configuration
         auto& yaml_cfg = config().yaml_nodes();
         int32_t cuda_device_id = 0;
@@ -128,7 +102,7 @@ class TcnZenohReceiverApp : public holoscan::Application {
 
         // --- TcnZenohReceiverOp (subscribe + CDR decode + output) ---
         // Raw streams: GPU tensor output
-        // Compressed streams: host tensor with H264/H265 bitstream
+        // Compressed streams (2=H264, 3=H265): host tensor with bitstream
         auto async_cond = make_condition<AsynchronousCondition>("zenoh_receiver_async");
 
         auto receiver_op = std::make_shared<tcn::ops::TcnZenohReceiverOp>();
@@ -144,50 +118,27 @@ class TcnZenohReceiverApp : public holoscan::Application {
         // --- Per-stream output routing ---
         int decoder_idx = 0;
         for (const auto& cfg : configs) {
-            if (cfg.image_compression == 1 || cfg.image_compression == 2) {
-                // Compressed stream: receiver → GXF decoder → sink
-                // Each compressed stream gets its own decoder context + request/response pair.
+            if (cfg.image_compression == 2 || cfg.image_compression == 3) {
+                // Compressed stream: receiver → NvVideoDecoderOp → sink
                 std::string suffix = "_" + std::to_string(decoder_idx++);
 
-                auto response_cond = make_condition<AsynchronousCondition>(
-                    "decoder_response_cond" + suffix);
-                auto decoder_ctx = make_resource<VideoDecoderContext>(
-                    "decoder_ctx" + suffix,
-                    Arg("async_scheduling_term") = response_cond);
+                auto decoder_alloc = make_resource<UnboundedAllocator>(
+                    "decoder_alloc" + suffix);
 
-                auto request_cond = make_condition<AsynchronousCondition>(
-                    "decoder_request_cond" + suffix);
-                auto decoder_request = make_operator<VideoDecoderRequestOp>(
-                    "decoder_request" + suffix,
-                    from_config("video_decoder_request"),
-                    Arg("async_scheduling_term") = request_cond,
-                    Arg("videodecoder_context") = decoder_ctx);
-
-                // Output pool sized for decoded NV12 frame
-                int64_t decoded_frame_size =
-                    static_cast<int64_t>(cfg.image_width) *
-                    cfg.image_height * 3 / 2 * 4;  // NV12 with padding
-                if (decoded_frame_size <= 0) decoded_frame_size = 1920 * 1080 * 3;
-
-                auto decoder_response = make_operator<VideoDecoderResponseOp>(
-                    "decoder_response" + suffix,
-                    from_config("video_decoder_response"),
-                    Arg("pool") = make_resource<BlockMemoryPool>(
-                        "decoder_pool" + suffix,
-                        1,  // kDevice
-                        decoded_frame_size,
-                        2),  // double-buffer
-                    Arg("videodecoder_context") = decoder_ctx);
+                auto decoder = make_operator<holoscan::ops::NvVideoDecoderOp>(
+                    "nv_decoder" + suffix,
+                    Arg("cuda_device_ordinal", cuda_device_id),
+                    Arg("allocator", decoder_alloc));
 
                 auto sink = make_operator<DummySinkOp>("sink_" + cfg.name);
 
-                // receiver[stream] → decoder_request → decoder_response → sink
-                add_flow(receiver_op, decoder_request,
-                         {{cfg.name, "input_frame"}});
-                add_flow(decoder_response, sink,
-                         {{"output_transmitter", "input"}});
+                // receiver[stream] → NvVideoDecoderOp → sink
+                add_flow(receiver_op, decoder, {{cfg.name, "input"}});
+                add_flow(decoder, sink, {{"output", "input"}});
 
-                HOLOSCAN_LOG_INFO("Stream '{}': wired GXF H264/H265 decoder", cfg.name);
+                HOLOSCAN_LOG_INFO(
+                    "Stream '{}': wired NvVideoDecoderOp (compression={})",
+                    cfg.name, cfg.image_compression);
             } else {
                 // Raw stream: receiver → sink directly
                 auto sink = make_operator<DummySinkOp>("sink_" + cfg.name);

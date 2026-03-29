@@ -49,7 +49,7 @@ struct ZenohStreamConfig {
     int32_t image_height = 0;
     int32_t image_step = 0;
     int32_t image_format = 0;       ///< Pixel format enum
-    int32_t image_compression = 0;  ///< Compression enum (0=raw, 1=H264, 2=H265)
+    int32_t image_compression = 0;  ///< ImageCompressionType (0=none,1=jpeg,2=h264,3=h265)
     float frame_rate = 0.0f;
 };
 

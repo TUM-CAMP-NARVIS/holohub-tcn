@@ -22,10 +22,3 @@ zenoh:
 
 pipeline:
   device_id: 0
-
-# GXF H264/H265 decoder configuration (used for compressed streams)
-video_decoder_request:
-  inbuf_storage_type: 0  # 0: kHost (receiver emits host tensors for compressed)
-
-video_decoder_response:
-  outbuf_storage_type: 1  # 1: kDevice (decoded frames on GPU)

@@ -112,7 +112,11 @@ std::vector<ZenohStreamConfig> TcnZenohReceiverOp::discover_streams(
         if (reader.read(payload_vec.data(), payload_vec.size(), ctx_reply)) {
             const auto& cam = ctx_reply.value();
             SensorInfo info;
+            // sensor name is sometimes in ctx_reply - somehow cam.name() seems to be empty for some cameras - probably backend bug.
             info.name = cam.name();
+            if (info.name.empty()) {
+                info.name = ctx_reply.name();
+            }
             info.color_enabled = cam.color_enabled();
             info.depth_enabled = cam.depth_enabled();
             info.infrared_enabled = cam.infrared_enabled();
@@ -438,10 +442,10 @@ void TcnZenohReceiverOp::compute(
 
         auto out_entity = holoscan::gxf::Entity::New(&context);
 
-        if (cfg.image_compression == 1 || cfg.image_compression == 2) {
-            // --- Compressed stream (H264/H265): emit as 1D host tensor ---
-            // The application should wire GXF VideoDecoderRequestOp/ResponseOp
-            // downstream to decode the bitstream into NV12 GPU frames.
+        if (cfg.image_compression == 2 || cfg.image_compression == 3) {
+            // --- Compressed stream (2=H264, 3=H265): emit as 1D host tensor ---
+            // The application wires NvVideoDecoderOp downstream to decode the
+            // bitstream into NV12 GPU frames.
             nvidia::gxf::Shape shape({static_cast<int32_t>(frame_size)});
             auto strides = nvidia::gxf::ComputeTrivialStrides(shape, sizeof(uint8_t));
 
