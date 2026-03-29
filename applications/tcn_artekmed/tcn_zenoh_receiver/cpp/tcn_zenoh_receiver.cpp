@@ -28,7 +28,6 @@
 #include <zenoh.hxx>
 
 #include "zenoh_receiver_op.hpp"
-#include "shm_sender_op.hpp"
 
 namespace {
 
@@ -79,19 +78,12 @@ class TcnZenohReceiverApp : public holoscan::Application {
         // Read configuration
         auto& yaml_cfg = config().yaml_nodes();
         int32_t cuda_device_id = 0;
-        std::string shm_stream_name = "camera_streams";
-        bool enable_shm_output = true;
 
         if (!yaml_cfg.empty()) {
             auto root = yaml_cfg[0];
             if (root["pipeline"]) {
                 auto pipe = root["pipeline"];
                 cuda_device_id = pipe["device_id"].as<int32_t>(0);
-            }
-            if (root["shared_memory"]) {
-                auto shm = root["shared_memory"];
-                shm_stream_name = shm["stream_name"].as<std::string>("camera_streams");
-                enable_shm_output = shm["enabled"].as<bool>(true);
             }
         }
 
@@ -121,21 +113,10 @@ class TcnZenohReceiverApp : public holoscan::Application {
         receiver_op->add_arg(Arg("cuda_stream_pool", cuda_stream_pool));
 
         // --- Per-stream output routing ---
-        // Each stream gets its own SHM sender (the sender expects an entity with
-        // named tensors, and each ZenohReceiverOp output is a single-tensor entity).
+        // Route each stream output to a dummy sink (SHM sender removed for now).
         for (const auto& cfg : configs) {
-            if (enable_shm_output) {
-                // Per-stream SHM sender with the stream name as the service prefix
-                auto sender_op = make_operator<tcn::ops::TcnShmZenohSenderOp>(
-                    "shm_sender_" + cfg.name,
-                    Arg("stream_name", shm_stream_name + "/" + cfg.name),
-                    Arg("input_tensor_names",
-                        std::vector<std::string>{std::string{""}}));
-                add_flow(receiver_op, sender_op, {{cfg.name, "frame_input"}});
-            } else {
-                auto sink = make_operator<DummySinkOp>("sink_" + cfg.name);
-                add_flow(receiver_op, sink, {{cfg.name, "input"}});
-            }
+            auto sink = make_operator<DummySinkOp>("sink_" + cfg.name);
+            add_flow(receiver_op, sink, {{cfg.name, "input"}});
         }
     }
 

@@ -32,7 +32,6 @@ endif()
 target_link_libraries(tcn_zenoh_receiver_cpp
     holoscan::core
     holoscan::ops::tcn_zenoh_receiver
-    holoscan::ops::tcn_shm_zenoh_sender
     $<$<BOOL:${yaml-cpp_FOUND}>:yaml-cpp::yaml-cpp>
 )
 
