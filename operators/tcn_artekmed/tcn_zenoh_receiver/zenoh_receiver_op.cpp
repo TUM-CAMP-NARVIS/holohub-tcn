@@ -17,6 +17,8 @@
 
 #include "zenoh_receiver_op.hpp"
 
+#include <cstring>
+
 #define ZENOHCXX_ZENOHC 1
 #include <zenoh.hxx>
 
@@ -434,38 +436,62 @@ void TcnZenohReceiverOp::compute(
 
         if (frame_size == 0) continue;
 
-        // Compute tensor shape: HxWxC if dimensions known, otherwise 1D
-        nvidia::gxf::Shape shape;
-        if (height > 0 && width > 0) {
-            int32_t channels = static_cast<int32_t>(
-                static_cast<int64_t>(frame_size) / (height * width));
-            if (channels < 1) channels = 1;
-            shape = nvidia::gxf::Shape({height, width, channels});
-        } else {
-            shape = nvidia::gxf::Shape({static_cast<int32_t>(frame_size)});
-        }
-
-        auto strides = nvidia::gxf::ComputeTrivialStrides(shape, sizeof(uint8_t));
-
-        // Allocate GPU tensor and upload
         auto out_entity = holoscan::gxf::Entity::New(&context);
-        auto out_tensor = static_cast<nvidia::gxf::Entity&>(out_entity)
-                              .add<nvidia::gxf::Tensor>("");
-        if (!out_tensor) {
-            HOLOSCAN_LOG_ERROR("Stream '{}': failed to add tensor to entity", cfg.name);
-            continue;
+
+        if (cfg.image_compression == 1 || cfg.image_compression == 2) {
+            // --- Compressed stream (H264/H265): emit as 1D host tensor ---
+            // The application should wire GXF VideoDecoderRequestOp/ResponseOp
+            // downstream to decode the bitstream into NV12 GPU frames.
+            nvidia::gxf::Shape shape({static_cast<int32_t>(frame_size)});
+            auto strides = nvidia::gxf::ComputeTrivialStrides(shape, sizeof(uint8_t));
+
+            auto out_tensor = static_cast<nvidia::gxf::Entity&>(out_entity)
+                                  .add<nvidia::gxf::Tensor>("");
+            if (!out_tensor) {
+                HOLOSCAN_LOG_ERROR("Stream '{}': failed to add tensor to entity",
+                                   cfg.name);
+                continue;
+            }
+
+            out_tensor.value()->reshapeCustom(
+                shape, nvidia::gxf::PrimitiveType::kUnsigned8,
+                sizeof(uint8_t), strides,
+                nvidia::gxf::MemoryStorageType::kHost, gxf_alloc);
+
+            std::memcpy(out_tensor.value()->pointer(), frame_data, frame_size);
+        } else {
+            // --- Raw stream: upload to GPU as HxWxC tensor ---
+            nvidia::gxf::Shape shape;
+            if (height > 0 && width > 0) {
+                int32_t channels = static_cast<int32_t>(
+                    static_cast<int64_t>(frame_size) / (height * width));
+                if (channels < 1) channels = 1;
+                shape = nvidia::gxf::Shape({height, width, channels});
+            } else {
+                shape = nvidia::gxf::Shape({static_cast<int32_t>(frame_size)});
+            }
+
+            auto strides = nvidia::gxf::ComputeTrivialStrides(shape, sizeof(uint8_t));
+
+            auto out_tensor = static_cast<nvidia::gxf::Entity&>(out_entity)
+                                  .add<nvidia::gxf::Tensor>("");
+            if (!out_tensor) {
+                HOLOSCAN_LOG_ERROR("Stream '{}': failed to add tensor to entity",
+                                   cfg.name);
+                continue;
+            }
+
+            out_tensor.value()->reshapeCustom(
+                shape, nvidia::gxf::PrimitiveType::kUnsigned8,
+                sizeof(uint8_t), strides,
+                nvidia::gxf::MemoryStorageType::kDevice, gxf_alloc);
+
+            HOLOSCAN_CUDA_CALL(cudaMemcpyAsync(
+                out_tensor.value()->pointer(),
+                frame_data, frame_size,
+                cudaMemcpyHostToDevice, upload_stream_));
+            HOLOSCAN_CUDA_CALL(cudaStreamSynchronize(upload_stream_));
         }
-
-        out_tensor.value()->reshapeCustom(
-            shape, nvidia::gxf::PrimitiveType::kUnsigned8,
-            sizeof(uint8_t), strides,
-            nvidia::gxf::MemoryStorageType::kDevice, gxf_alloc);
-
-        HOLOSCAN_CUDA_CALL(cudaMemcpyAsync(
-            out_tensor.value()->pointer(),
-            frame_data, frame_size,
-            cudaMemcpyHostToDevice, upload_stream_));
-        HOLOSCAN_CUDA_CALL(cudaStreamSynchronize(upload_stream_));
 
         op_output.emit(out_entity, cfg.name.c_str());
         state->frames_emitted.fetch_add(1, std::memory_order_relaxed);
