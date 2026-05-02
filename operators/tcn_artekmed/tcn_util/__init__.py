@@ -134,6 +134,10 @@ except ImportError:
 for _name, _cpp in _USE_CPP.items():
     _log.debug("%-45s %s", _name, "C++" if _cpp else "Python")
 
+
+
+from .RotateImage180Op import RotateImage180Op
+
 __all__ = ["StreamMergerOp", "StreamSplitterOp", "FlattenTensorOp",
            "DepthImageMaxDistanceOp", "DepthImageForegroundBackgroundMaskOp",
-           "DepthImageApplyMaskOp", "ConvertBgraToRgbaOp"]
+           "DepthImageApplyMaskOp", "ConvertBgraToRgbaOp", "RotateImage180Op"]

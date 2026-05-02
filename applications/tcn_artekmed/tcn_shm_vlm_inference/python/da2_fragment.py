@@ -171,8 +171,9 @@ class DA2PostprocessorOp(Operator):
 class DA2MetricProcessingSubgraph(Subgraph):
     """Subgraph containing the shm-receiver and backprojection pipeline."""
 
-    def __init__(self, fragment, name, kwargs):
+    def __init__(self, fragment, name, kwargs, convert_bgra=False):
         self.kwargs = kwargs
+        self.convert_bgra = convert_bgra
         super().__init__(fragment, name)
 
     def compose(self):
@@ -180,8 +181,6 @@ class DA2MetricProcessingSubgraph(Subgraph):
         app = self.fragment.application
 
         # @todo: do not use app.kwargs directly, but pass the relevant dictionary or subtree to the subgraph explicitly
-
-        col_conv = ConvertBgraToRgbaOp(self, name="color_converter_rgba")
 
         # format converter only supports rgba not bgra ..
         in_dtype = "rgba8888"
@@ -196,8 +195,9 @@ class DA2MetricProcessingSubgraph(Subgraph):
         )
 
         da2_inference_args = self.kwargs("da2_inference")
+        da2_inference_config = self.kwargs("da2_inference_config")
         da2_inference_args["model_path_map"] = {
-            "depth": self.kwargs.get("model_path")
+            "depth": da2_inference_config.get("model_path")
         }
 
         da2_inference = InferenceOp(
@@ -209,12 +209,16 @@ class DA2MetricProcessingSubgraph(Subgraph):
 
         da2_postprocessor = DA2PostprocessorOp(self, name="da2_postprocessor", allocator=pool)
 
-        self.add_flow(col_conv, da2_preprocessor, {("output", "source_video")})
+        if self.convert_bgra:
+            self.add_flow(col_conv, da2_preprocessor, {("output", "source_video")})
         self.add_flow(da2_preprocessor, da2_postprocessor, {("tensor", "input_image")})
         self.add_flow(da2_preprocessor, da2_inference, {("", "receivers")})
         self.add_flow(da2_inference, da2_postprocessor, {("transmitter", "input_depthmap")})
 
         # Expose the relevant ports
-        self.add_input_interface_port("input", col_conv, "input")
+        if self.convert_bgra:
+            self.add_input_interface_port("input", col_conv, "input")
+        else:
+            self.add_input_interface_port("input", da2_preprocessor, "source_video")
         self.add_output_interface_port("output_image", da2_postprocessor, "output_image")
         self.add_output_interface_port("output_specs", da2_postprocessor, "output_specs")

@@ -13,6 +13,7 @@ camera_stream_processing:
   device_id: 0
   buffer_size: 8
   enable_da2: False
+  enable_langsam: True
 
 
 # Depth Anything V2 Example
@@ -36,6 +37,22 @@ da2_inference:
   input_on_cuda: true
   is_engine_path: false
 
+# LangSAM (Grounding DINO + SAM2) Configuration
+langsam_inference:
+  sam_type: "sam2.1_hiera_small"
+  sam_ckpt_path: null
+  gdino_model_ckpt_path: null  # Set to null to download from HuggingFace, or provide local path
+  gdino_processor_ckpt_path: null  # Set to null to download from HuggingFace, or provide local path
+  box_threshold: 0.3
+  text_threshold: 0.25
+
+text_prompts:
+  prompts: ["table", "chair", "monitor", "computer", "mannequin"]
+
+langsam_postprocessor:
+  save_intermediate: false
+  verbose: false
+
 debug_output:
   enable_colorimage: True
   enable_depthimage: False
@@ -52,6 +69,11 @@ resources:
 holoviz:
   width: 518
   height: 518
+
+langsam_holoviz:
+  width: 1024
+  height: 1024
+  framerate: 30
 
 depth_holoviz:
   window_title: "Artekmed Depthimages"

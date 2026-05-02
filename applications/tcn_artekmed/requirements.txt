@@ -28,6 +28,7 @@ pycapnp >=2.2.0
 iceoryx2 == 0.8.1
 pycdr2 >= 1.0.0
 git+https://github.com/TUM-CAMP-NARVIS/artekmed_zenoh_python_client.git@master
+git+https://github.com/TUM-CAMP-NARVIS/tcn_slangpy_renderer.git@main
 
 #slint >= 1.14.1b1
 slangpy >= 0.38.1
