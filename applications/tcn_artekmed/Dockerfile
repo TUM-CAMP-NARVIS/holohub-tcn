@@ -147,7 +147,7 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 # Build and install iceoryx2 v0.8.1 C/C++ bindings (requires Rust toolchain)
 WORKDIR /tmp/dependencies
 RUN rm -Rf /tmp/dependencies/iceoryx2 && \
-    git clone --depth 1 --branch v0.8.1 https://github.com/eclipse-iceoryx/iceoryx2.git && \
+    git clone --depth 1 --branch v0.9.1 https://github.com/eclipse-iceoryx/iceoryx2.git && \
     cd iceoryx2 && \
     cargo generate-lockfile && \
     mkdir build && \
