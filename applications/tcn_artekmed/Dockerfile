@@ -144,10 +144,10 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
     . "$HOME/.cargo/env" && rustc --version && cargo --version
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Build and install iceoryx2 v0.8.1 C/C++ bindings (requires Rust toolchain)
+# Build and install iceoryx2 v0.9.2 C/C++ bindings (requires Rust toolchain)
 WORKDIR /tmp/dependencies
 RUN rm -Rf /tmp/dependencies/iceoryx2 && \
-    git clone --depth 1 --branch v0.9.1 https://github.com/eclipse-iceoryx/iceoryx2.git && \
+    git clone --depth 1 --branch v0.9.2 https://github.com/eclipse-iceoryx/iceoryx2.git && \
     cd iceoryx2 && \
     cargo generate-lockfile && \
     mkdir build && \
@@ -171,10 +171,10 @@ RUN rm -rf /tmp/dependencies/Fast-CDR && \
     cd /tmp/dependencies && \
     rm -rf Fast-CDR
 
-# Build and install zenoh-c + zenoh-cpp 1.3.4 (Zenoh C++ API)
+# Build and install zenoh-c + zenoh-cpp 1.9.0 (Zenoh C++ API)
 WORKDIR /tmp/dependencies
 RUN rm -rf /tmp/dependencies/zenoh-c && \
-    git clone --depth 1 --branch 1.3.4 https://github.com/eclipse-zenoh/zenoh-c.git && \
+    git clone --depth 1 --branch 1.9.0 https://github.com/eclipse-zenoh/zenoh-c.git && \
     cd zenoh-c && \
     mkdir build && \
     cd build && \
@@ -186,7 +186,7 @@ RUN rm -rf /tmp/dependencies/zenoh-c && \
 
 WORKDIR /tmp/dependencies
 RUN rm -rf /tmp/dependencies/zenoh-cpp && \
-    git clone --depth 1 --branch 1.3.4 https://github.com/eclipse-zenoh/zenoh-cpp.git && \
+    git clone --depth 1 --branch 1.9.0 https://github.com/eclipse-zenoh/zenoh-cpp.git && \
     cd zenoh-cpp && \
     mkdir build && \
     cd build && \
