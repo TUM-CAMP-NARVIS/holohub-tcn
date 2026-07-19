@@ -1,0 +1,115 @@
+application:
+  title: TCN Artekmed Shm Receiver
+  version: 1.0
+  inputFormats: []
+  outputFormats: ["screen"]
+
+shared_memory:
+  stream_name: "camera_streams"
+  parameter_rpc_name: "tcn_shm_receiver"
+  cycle_time_ms: 1
+
+camera_stream_processing:
+  device_id: 0
+  buffer_size: 8
+  enable_da2: False
+  enable_langsam: True
+
+
+# Depth Anything V2 Example
+da2_inference_config:
+  model_path: "/srv/models/active/depth_anything_v2/depth_anything_v2_vits.onnx"
+
+da2_preprocessor:
+  out_tensor_name: preprocessed
+  out_dtype: "float32"
+  resize_width: 518
+  resize_height: 518
+  scale_min: 0.0
+  scale_max: 1.0
+
+da2_inference:
+  backend: "trt"
+  pre_processor_map:
+    "depth": ["preprocessed"]
+  inference_map:
+    "depth": ["inference_output"]
+  input_on_cuda: true
+  is_engine_path: false
+
+# LangSAM (Grounding DINO + SAM2) Configuration
+langsam_inference:
+  sam_type: "sam2.1_hiera_small"
+  sam_ckpt_path: null
+  gdino_model_ckpt_path: null  # Set to null to download from HuggingFace, or provide local path
+  gdino_processor_ckpt_path: null  # Set to null to download from HuggingFace, or provide local path
+  box_threshold: 0.3
+  text_threshold: 0.25
+
+text_prompts:
+  prompts: ["table", "chair", "monitor", "computer", "mannequin"]
+
+langsam_postprocessor:
+  save_intermediate: false
+  verbose: false
+
+debug_output:
+  enable_colorimage: True
+  enable_depthimage: False
+  enable_weights: False
+  enable_pointcloud: True
+  enable_warped_color: True
+
+resources:
+  cpu: 24
+  gpu: 1
+  memory: 1Gi
+  gpuMemory: 1Gi
+
+holoviz:
+  width: 518
+  height: 518
+
+langsam_holoviz:
+  width: 1024
+  height: 1024
+  framerate: 30
+
+depth_holoviz:
+  window_title: "Artekmed Depthimages"
+  width: 800
+  height: 640
+  framerate: 60
+
+color_holoviz:
+  window_title: "Artekmed Colorimages"
+  width: 800
+  height: 640
+  framerate: 60
+
+points_holoviz:
+  window_title: "Artekmed Pointclouds"
+  width: 800
+  height: 640
+  framerate: 60
+
+weights_holoviz:
+  window_title: "Artekmed Deptimage Weights"
+  width: 800
+  height: 640
+  framerate: 60
+
+warped_color_holoviz:
+  window_title: "Artekmed Warped Colorimages"
+  width: 800
+  height: 640
+  framerate: 60
+
+pose_tree_config:
+  number_frames: 1024                # default: 1024
+  number_edges: 16384                # default: 16384
+  history_length: 1048576            # default: 1048576
+  default_number_edges: 16           # default: 16
+  default_history_length: 1024       # default: 1024
+  edges_chunk_size: 4                # default: 4
+  history_chunk_size: 64             # default: 64

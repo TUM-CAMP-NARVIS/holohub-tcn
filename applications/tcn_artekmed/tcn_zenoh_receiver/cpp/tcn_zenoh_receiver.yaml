@@ -1,0 +1,24 @@
+%YAML 1.2
+---
+application:
+  title: TCN Artekmed Zenoh Receiver (C++)
+  version: 1.0
+  inputFormats: []
+  outputFormats: []
+
+resources:
+  cpu: 8
+  gpu: 1
+  memory: 1Gi
+  gpuMemory: 1Gi
+
+zenoh:
+  topic_prefix: "tcn/loc/pcpd"
+  capture_node: "k4a_capture_multi"
+  zenoh_config_file: "/workspace/volumes/zenoh_config/zenoh_config.json5"
+  stream_types:
+    - "color"
+    # - "depth"
+
+pipeline:
+  device_id: 0

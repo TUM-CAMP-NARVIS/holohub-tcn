@@ -1,0 +1,6 @@
+{
+    "operator": {
+        "name": "TCN DepthImage Max Distance",
+        "description": "Running per-pixel maximum filter for depth images on the GPU."
+    }
+}

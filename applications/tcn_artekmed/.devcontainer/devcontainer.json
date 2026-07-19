@@ -1,0 +1,111 @@
+// For format details, see https://aka.ms/vscode-remote/devcontainer.json or
+// https://code.visualstudio.com/docs/remote/devcontainerjson-reference
+{
+    "name": "TCN Artekmed",
+    "initializeCommand": ".devcontainer/initialize-command.sh",
+    "postStartCommand": ".devcontainer/post-start-command.sh",
+    "build": {
+        "dockerfile": "../Dockerfile",
+        "target": "dev",
+        "context": "../../../",
+        "args": {
+            "BASE_IMAGE": "nvcr.io/nvidia/clara-holoscan/holoscan:v3.9.0-cuda13",
+            "WORKSPACE_DIR": "${containerWorkspaceFolder}",
+            "BUILDKIT_INLINE_CACHE": "1" // Enable Docker BuildKit cache
+        },
+        "options": [
+            "--progress=plain",
+            "--network=host",
+        ]
+    },
+    "runArgs": [
+        "--runtime=nvidia",
+        "--net=host",
+        "--cap-add=SYS_PTRACE",
+        "--security-opt=seccomp=unconfined",
+        "--ipc=host",
+        "--shm-size=16gb"
+    ],
+    "containerEnv": {
+        "DISPLAY": "${localEnv:DISPLAY}",
+        // Wayland support
+        "XDG_RUNTIME_DIR": "${localEnv:XDG_RUNTIME_DIR}",
+        "XDG_SESSION_TYPE": "${localEnv:XDG_SESSION_TYPE}",
+        "NVIDIA_DRIVER_CAPABILITIES": "all",
+        "HOLOSCAN_INPUT_PATH": "/opt/nvidia/holoscan/data",
+        "HOLOSCAN_ROOT": "/opt/nvidia/holoscan",
+        "WORKSPACE_DIR": "${containerWorkspaceFolder}",
+        "CUPY_CACHE_DIR": "/workspace/holohub/.cupy/kernel_cache",
+        // Set JIT compilation cache paths
+        //  https://developer.nvidia.com/blog/cuda-pro-tip-understand-fat-binaries-jit-caching/
+        "CUDA_CACHE_PATH": "${containerWorkspaceFolder}/.cache/ComputeCache",
+        //  https://raytracing-docs.nvidia.com/optix7/api/optix__host_8h.html#a59a60f5f600df0f9321b0a0b1090d76b
+        "OPTIX_CACHE_PATH": "${containerWorkspaceFolder}/.cache/OptixCache",
+        //  https://download.nvidia.com/XFree86/Linux-x86_64/460.67/README/openglenvvariables.html
+        "__GL_SHADER_DISK_CACHE_PATH": "${containerWorkspaceFolder}/.cache/GLCache"
+    },
+    "mounts": [
+        // model repository
+        "source=/srv/models,target=/srv/models,type=bind",
+        // icoryx2 support
+        "source=/tmp/iceoryx2,target=/tmp/iceoryx2,type=bind",
+        // Wayland support
+        "source=${localEnv:XDG_RUNTIME_DIR},target=${localEnv:XDG_RUNTIME_DIR},type=bind,consistency=cached",
+
+    ],
+    "workspaceFolder": "/workspace/holohub",
+    "workspaceMount": "source=${localWorkspaceFolder}/../../,target=${containerWorkspaceFolder},type=bind",
+    // Configure tool-specific properties.
+    "customizations": {
+        // Configure properties specific to VS Code.
+        // Configure properties specific to VS Code.
+        "vscode": {
+            // Set *default* container specific settings.json values on container create.
+            "settings": {
+                "terminal.integrated.defaultProfile.linux": "zsh",
+                "terminal.integrated.profiles.linux": {
+                    "fish": {
+                        "path": "/usr/bin/zsh"
+                    }
+                }
+            },
+            // Add the IDs of extensions you want installed when the container is created.
+            "extensions": [
+                "akiramiyakoda.cppincludeguard",
+                "benjamin-simmonds.pythoncpp-debug", // Python/C++ debugging
+                "charliermarsh.ruff",
+                "matepek.vscode-catch2-test-adapter",
+                "mine.cpplint",
+                "ms-azuretools.vscode-docker",
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "ms-vscode.cpptools-extension-pack",
+                "redhat.vscode-yaml",
+                "rioj7.command-variable",
+                "shardulm94.trailing-spaces",
+                "shd101wyy.markdown-preview-enhanced",
+                "stkb.rewrap"
+            ]
+        },
+        // and jetbrains ide
+        "jetbrains": {
+            "plugins": [
+                "com.jetbrains.ai.assistant",
+                "slanglsp",
+                "com.redhat.devtools.lsp4ij",
+                "dev.slint.ideaplugin"
+            ]
+        }
+    },
+    "remoteEnv": {
+        "PYTHONPATH": "/opt/nvidia/holoscan/python/lib:${containerEnv:PYTHONPATH}",
+        "HOLOHUB_DATA_DIR": "${containerWorkspaceFolder}/data"
+    },
+    // "initializeCommand": "${localWorkspaceFolder}/applications/tcn_artekmed/thirdparty/magicleap.sh",
+    // Use 'forwardPorts' to make a list of ports inside the container available locally.
+    // "forwardPorts": [],
+    // Use 'postCreateCommand' to run commands after the container is created.
+    // "postCreateCommand": "gcc -v",
+    // Comment out this line to run as root instead.
+    //"remoteUser": "holoscan"
+}

@@ -1,0 +1,6 @@
+{
+    "operator": {
+        "name": "TCN Zenoh Receiver",
+        "description": "Subscribes to Zenoh video streams, CDR-decodes payloads, and emits GPU tensors. Supports multi-stream discovery and event-driven scheduling."
+    }
+}

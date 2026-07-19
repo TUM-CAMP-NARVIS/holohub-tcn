@@ -1,0 +1,81 @@
+{
+	"application": {
+		"name": "tcn_zenoh_receiver",
+		"description": "TUM-CAMP-NARVIS Artekmed",
+		"authors": [
+			{
+				"name": "Ulrich Eck",
+				"affiliation": "TU Munich"
+			}
+		],
+		"language": "python",
+		"version": "0.1.0",
+		"changelog": {
+			"0.1.0": "Initial Release"
+		},
+		"dockerfile": "applications/tcn_artekmed/Dockerfile",
+		"holoscan_sdk": {
+			"minimum_required_version": "3.7.0",
+			"tested_versions": [
+				"3.7.0"
+			]
+		},
+		"platforms": ["x86_64", "aarch64"],
+		"tags": [
+			"Streaming",
+			"NVIDIA Video Codec",
+			"H.264",
+			"H.265",
+			"HEVC",
+			"Video"
+		],
+		"ranking": 1,
+		"requirements": {
+			"gpu": {
+				"type": "hardware",
+				"name": "gpu",
+				"description": "NVIDIA GPU with at least 8GB memory required for Isaac Sim"
+			},
+			"packages": [
+				{
+					"name": "NVIDIA Video Codec SDK",
+					"author": "NVIDIA",
+					"license": "Closed",
+					"version": "13.0.0",
+					"url": "https://developer.nvidia.com/video-codec-sdk"
+				},
+				{
+					"name": "FFmpeg",
+					"author": "FFmpeg contributors",
+					"license": "LGPL/GPL",
+					"version": "4.0+",
+					"url": "https://ffmpeg.org/"
+				}
+			]
+		},
+		"default_mode": "standard",
+		"modes": {
+			"standard": {
+				"description": "Standard mode for tcn_artekmed - development, testing, and basic usage",
+				"requirements": [],
+				"run": {
+					"command":
+            "python3 <holohub_app_source>/tcn_zenoh_receiver.py"
+          ,
+					"workdir": "holohub_bin"
+				}
+			},
+			"console": {
+				"description": "console",
+				"requirements": [],
+				"run": {
+					"command":
+            "/bin/bash"
+          ,
+					"workdir": "holohub_bin"
+				}
+			}
+
+		}
+	}
+}

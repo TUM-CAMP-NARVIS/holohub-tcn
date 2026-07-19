@@ -1,0 +1,13 @@
+import { Page } from "../components/page.slint";
+import { UText } from "@sleek-ui/widgets.slint";
+
+export component About inherits Page {
+    title: "About";
+    description:"This is the About page.";
+
+    UText {
+        wrap: word-wrap;
+        text: "This is a controller GUI for the TCN Artekmed Holoscan Applciation.";
+    }
+    Rectangle {}
+}

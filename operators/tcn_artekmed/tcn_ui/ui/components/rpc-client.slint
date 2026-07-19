@@ -1,0 +1,24 @@
+
+export struct ParameterSchema {
+    name: string,
+    type: string,
+    valid_entries: [string],
+}
+
+export struct Parameter {
+    name: string,
+    type: string,          // "int", "float", "bool", "string"
+    int_value: int,
+    float_value: float,
+    bool_value: bool,
+    string_value: string,
+}
+
+
+export global RpcClient {
+    pure callback check-connectivity() -> bool;
+    pure callback list-components() -> [string];
+    pure callback get-parameter-schema(string) -> [ParameterSchema];
+    pure callback get-parameter-values(string) -> [Parameter];
+    pure callback set-parameter-values(string, [Parameter]) -> bool;
+}

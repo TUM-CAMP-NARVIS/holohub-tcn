@@ -1,0 +1,131 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+
+#include <memory>
+#include <string>
+#include <variant>
+#include <vector>
+
+#include "holoscan/core/fragment.hpp"
+#include "holoscan/core/subgraph.hpp"
+#include "holoscan/core/operator.hpp"
+#include "holoscan/core/operator_spec.hpp"
+#include "holoscan/python/core/component_util.hpp"
+#include <holoscan/python/core/emitter_receiver_registry.hpp>
+
+#include "../shm_subscriber_op.hpp"
+#include "./shm_subscriber_op_pydoc.hpp"
+
+#include "../../../operator_util.hpp"
+using std::string_literals::operator""s;
+using pybind11::literals::operator""_a;
+
+#define STRINGIFY(x) #x
+#define MACRO_STRINGIFY(x) STRINGIFY(x)
+
+namespace py = pybind11;
+
+namespace tcn::ops {
+
+class PyTcnShmSubscriberOp : public TcnShmSubscriberOp {
+ public:
+    using TcnShmSubscriberOp::TcnShmSubscriberOp;
+
+    PyTcnShmSubscriberOp(
+        const std::variant<holoscan::Fragment*, holoscan::Subgraph*>& fragment_or_subgraph,
+        const py::args& args,
+        std::shared_ptr<holoscan::Allocator> allocator,
+        std::shared_ptr<holoscan::AsynchronousCondition> async_condition,
+        const std::string& stream_name = "",
+        int32_t cycle_time_ms = 1,
+        const std::string& name = "tcn_shm_subscriber")
+        : TcnShmSubscriberOp(
+              holoscan::ArgList{
+                  holoscan::Arg{"allocator", allocator},
+                  holoscan::Arg{"async_condition", async_condition},
+                  holoscan::Arg{"stream_name", stream_name},
+                  holoscan::Arg{"cycle_time_ms", cycle_time_ms}}) {
+        add_positional_condition_and_resource_args(this, args);
+        init_operator_base(this, fragment_or_subgraph, name);
+    }
+};
+
+PYBIND11_MODULE(_tcn_shm_subscriber, m) {
+    m.doc() = R"pbdoc(
+        Holoscan SDK TCN SHM Subscriber Python Bindings
+        -----------------------------------------------
+        .. currentmodule:: _tcn_shm_subscriber
+        .. autosummary::
+           :toctree: _generate
+    )pbdoc";
+
+#ifdef VERSION_INFO
+    m.attr("__version__") = MACRO_STRINGIFY(VERSION_INFO);
+#else
+    m.attr("__version__") = "dev";
+#endif
+
+    py::class_<TcnShmSubscriberOp,
+               PyTcnShmSubscriberOp,
+               holoscan::Operator,
+               std::shared_ptr<TcnShmSubscriberOp>>(
+        m,
+        "TcnShmSubscriberOp",
+        doc::TcnShmSubscriberOp::doc_TcnShmSubscriberOp)
+        .def(py::init<std::variant<holoscan::Fragment*, holoscan::Subgraph*>,
+                      const py::args&,
+                      std::shared_ptr<holoscan::Allocator>,
+                      std::shared_ptr<holoscan::AsynchronousCondition>,
+                      const std::string&,
+                      int32_t,
+                      const std::string&>(),
+             "fragment"_a,
+             "allocator"_a,
+             "async_condition"_a,
+             "stream_name"_a = ""s,
+             "cycle_time_ms"_a = 1,
+             "name"_a = "tcn_shm_subscriber"s,
+             doc::TcnShmSubscriberOp::doc_TcnShmSubscriberOp)
+        .def("initialize",
+             &TcnShmSubscriberOp::initialize,
+             doc::TcnShmSubscriberOp::doc_initialize)
+        .def("setup",
+             &TcnShmSubscriberOp::setup,
+             "spec"_a,
+             doc::TcnShmSubscriberOp::doc_setup)
+        .def("set_receiver",
+             &TcnShmSubscriberOp::set_receiver,
+             "receiver"_a,
+             "Set the SHM receiver instance");
+
+    // Expose ShmSynchronizedBufferReceiver for Python use
+    py::class_<tcn::shm::ShmSynchronizedBufferReceiver,
+               std::shared_ptr<tcn::shm::ShmSynchronizedBufferReceiver>>(
+        m, "ShmSynchronizedBufferReceiver",
+        doc::ShmSynchronizedBufferReceiver::doc_ShmSynchronizedBufferReceiver)
+        .def_static("discover_devices",
+                     &tcn::shm::ShmSynchronizedBufferReceiver::discover_devices,
+                     doc::ShmSynchronizedBufferReceiver::doc_discover_devices);
+
+    m.def("register_types", [](holoscan::EmitterReceiverRegistry& registry) {
+        HOLOSCAN_LOG_DEBUG("TCN SHM Subscriber - register types");
+    });
+}  // PYBIND11_MODULE NOLINT
+}  // namespace tcn::ops
