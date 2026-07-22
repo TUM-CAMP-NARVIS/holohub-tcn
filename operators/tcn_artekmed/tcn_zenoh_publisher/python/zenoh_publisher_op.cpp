@@ -17,6 +17,12 @@
 #include "holoscan/python/core/component_util.hpp"
 #include <holoscan/python/core/emitter_receiver_registry.hpp>
 
+// Pull in the full zenoh definitions before the operator header: the operator
+// holds a std::unique_ptr<zenoh::Publisher> whose (implicit) destructor is
+// instantiated in this translation unit, so zenoh::Publisher must be a
+// complete type here. Mirrors tcn_zenoh_receiver's python binding.
+#include <zenoh.hxx>
+
 #include "../zenoh_publisher_op.hpp"
 #include "./zenoh_publisher_op_pydoc.hpp"
 

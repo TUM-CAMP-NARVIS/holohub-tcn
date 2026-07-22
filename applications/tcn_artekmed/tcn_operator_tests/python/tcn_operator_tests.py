@@ -20,6 +20,7 @@ import sys
 import cupy as cp
 import holoscan as hs
 import numpy as np
+from holoscan.conditions import CountCondition
 from holoscan.core import Application, ConditionType, Operator, OperatorSpec
 from holoscan.resources import UnboundedAllocator
 
@@ -40,11 +41,19 @@ from holohub.tcn_stream_merger import TcnStreamMergerOp
 class SyntheticSourceOp(Operator):
     """Emits synthetic test tensors for a configurable number of frames."""
 
-    def __init__(self, fragment, *args, tensor_fn=None, max_frames=3, **kwargs):
+    def __init__(self, fragment, *args, tensor_fn=None, max_frames=3,
+                 count=None, recess_period=None, **kwargs):
         self._tensor_fn = tensor_fn
         self._max_frames = max_frames
         self._frame = 0
-        super().__init__(fragment, *args, **kwargs)
+        # Bound scheduling with a real CountCondition so the source deactivates
+        # after `max_frames` executions and the graph terminates. Passing bare
+        # `count=`/`recess_period=` kwargs (as the call sites do) is a no-op in
+        # Holoscan, which left the greedy scheduler spinning forever once the
+        # source stopped emitting. `recess_period` is absorbed for call-site
+        # compatibility but is not needed for termination.
+        n = count if count is not None else max_frames
+        super().__init__(fragment, CountCondition(fragment, count=n), *args, **kwargs)
 
     def setup(self, spec: OperatorSpec):
         spec.output("output")
@@ -61,14 +70,18 @@ class DualSourceOp(Operator):
     """Emits two synthetic tensor streams (depth + mask/background)."""
 
     def __init__(self, fragment, *args, tensor_fn_a=None, tensor_fn_b=None,
-                 port_a="port_a", port_b="port_b", max_frames=3, **kwargs):
+                 port_a="port_a", port_b="port_b", max_frames=3,
+                 count=None, recess_period=None, **kwargs):
         self._tensor_fn_a = tensor_fn_a
         self._tensor_fn_b = tensor_fn_b
         self._port_a = port_a
         self._port_b = port_b
         self._max_frames = max_frames
         self._frame = 0
-        super().__init__(fragment, *args, **kwargs)
+        # See SyntheticSourceOp: bound execution with a CountCondition so the
+        # graph terminates instead of the scheduler spinning forever.
+        n = count if count is not None else max_frames
+        super().__init__(fragment, CountCondition(fragment, count=n), *args, **kwargs)
 
     def setup(self, spec: OperatorSpec):
         spec.output(self._port_a)
@@ -87,11 +100,15 @@ class DualSourceOp(Operator):
 class MultiTensorSourceOp(Operator):
     """Emits a message with multiple named tensors (simulates multi-camera entity)."""
 
-    def __init__(self, fragment, *args, tensor_dict_fn=None, max_frames=3, **kwargs):
+    def __init__(self, fragment, *args, tensor_dict_fn=None, max_frames=3,
+                 count=None, recess_period=None, **kwargs):
         self._tensor_dict_fn = tensor_dict_fn
         self._max_frames = max_frames
         self._frame = 0
-        super().__init__(fragment, *args, **kwargs)
+        # See SyntheticSourceOp: bound execution with a CountCondition so the
+        # graph terminates instead of the scheduler spinning forever.
+        n = count if count is not None else max_frames
+        super().__init__(fragment, CountCondition(fragment, count=n), *args, **kwargs)
 
     def setup(self, spec: OperatorSpec):
         spec.output("output")

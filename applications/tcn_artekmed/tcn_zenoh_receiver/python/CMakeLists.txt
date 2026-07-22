@@ -20,8 +20,15 @@ find_package(holoscan 3.7.0 REQUIRED CONFIG
              PATHS "/opt/nvidia/holoscan" "/workspace/holoscan-sdk/install")
 
 # Enable the operators
-add_library(tcn_zenoh_receiver INTERFACE)
-target_link_libraries(tcn_zenoh_receiver INTERFACE
+# NOTE: this convenience target is named with an `_app` suffix to avoid
+# target-name collisions in the shared CMake tree when HOLOHUB_BUILD_PYTHON=ON.
+# The bare name `tcn_zenoh_receiver` is the operator library
+# (operators/tcn_artekmed/tcn_zenoh_receiver) and `tcn_zenoh_receiver_python`
+# is that operator's pybind11 module (created by pybind11_add_holohub_module).
+# This mirrors the cpp app's distinct `tcn_zenoh_receiver_cpp` target. The name
+# is not referenced elsewhere.
+add_library(tcn_zenoh_receiver_app INTERFACE)
+target_link_libraries(tcn_zenoh_receiver_app INTERFACE
     holoscan::core
     holoscan::ops::format_converter
     holoscan::ops::holoviz
