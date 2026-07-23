@@ -151,6 +151,12 @@ class App(hs.core.Application):
             elif channel["status"]["portType"] == "colorimage":
                 color_streams_config.append(channel)
 
+        fused_positions_size = 0
+        for ch in depth_streams_config:
+            fused_positions_size += ch["status"]["bufferInfo"]["width"] * ch["status"]["bufferInfo"]["height"] * 3 * 4  # sizeof(float) .. maybe use struct module here?
+
+        max_frame_size = max(max_frame_size, fused_positions_size)
+
         log.info(f"create cuda-stream pool with {num_channels} reserved streams on device {cuda_device_id}")
         cuda_stream_pool = CudaStreamPool(
             self,
