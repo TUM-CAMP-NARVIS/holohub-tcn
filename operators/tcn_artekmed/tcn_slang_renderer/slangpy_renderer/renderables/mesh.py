@@ -1,22 +1,39 @@
+"""
+Mesh renderable data class.
+"""
 import slangpy as spy
 import numpy as np
 import trimesh
 from PIL.Image import Image
 import threading
 
-from .renderable import Renderable
+from .base import Renderable
+
 
 class Mesh(Renderable):
+    """
+    Textured mesh renderable with vertices, normals, and texture coordinates.
+    """
 
     @staticmethod
     def from_obj(device: spy.Device, mesh_path: str):
+        """
+        Load mesh from OBJ file.
+
+        Args:
+            device: Slangpy device
+            mesh_path: Path to OBJ file
+
+        Returns:
+            Mesh instance
+        """
         mesh = trimesh.load_mesh(mesh_path)
         positions = mesh.vertices.astype("float32")
         normals = mesh.vertex_normals.astype("float32")
-        texcoords = mesh.visual.uv.astype("float32")  # type: ignore
+        texcoords = mesh.visual.uv.astype("float32")
         indices = mesh.faces.astype("uint16")
 
-        image : Image = mesh.visual.material.image  # type: ignore
+        image: Image = mesh.visual.material.image
         image_shape = list(image.size) + [1]
 
         image_data = (
@@ -32,11 +49,22 @@ class Mesh(Renderable):
                  device: spy.Device,
                  positions: np.ndarray,
                  indices: np.ndarray,
-                 normals: np.ndarray=None,
-                 texcoords: np.ndarray=None,
-                 image: np.ndarray=None,
-                 sync_gpu: bool=True):
+                 normals: np.ndarray = None,
+                 texcoords: np.ndarray = None,
+                 image: np.ndarray = None,
+                 sync_gpu: bool = True):
+        """
+        Initialize mesh.
 
+        Args:
+            device: Slangpy device
+            positions: Vertex positions (Nx3)
+            indices: Triangle indices (Mx3)
+            normals: Vertex normals (Nx3)
+            texcoords: Texture coordinates (Nx2)
+            image: Texture image (HxWxC)
+            sync_gpu: If True, immediately create GPU buffers
+        """
         super().__init__(device)
         self.buffer_lock = threading.Lock()
         self.renderer = None  # Will be set by MeshRenderer
@@ -110,13 +138,20 @@ class Mesh(Renderable):
     def is_dirty(self):
         return self._is_dirty
 
-    def update(self, positions: np.ndarray=None,
-               indices: np.ndarray=None,
-               normals: np.ndarray=None,
-               texcoords: np.ndarray=None,
-               image: np.ndarray=None):
+    def update(self, positions: np.ndarray = None,
+               indices: np.ndarray = None,
+               normals: np.ndarray = None,
+               texcoords: np.ndarray = None,
+               image: np.ndarray = None):
         """
         Thread-safe: Call this from any thread to stage data for the next frame.
+
+        Args:
+            positions: Updated vertex positions
+            indices: Updated triangle indices
+            normals: Updated vertex normals
+            texcoords: Updated texture coordinates
+            image: Updated texture image
         """
         with self.buffer_lock:
             if positions is not None:
@@ -203,6 +238,13 @@ class Mesh(Renderable):
                ):
         """
         Render this mesh using its associated renderer.
+
+        Args:
+            pass_encoder: Active render pass encoder
+            window_size: Window dimensions (width, height)
+            view_matrix: Camera view matrix (4x4)
+            proj_matrix: Camera projection matrix (4x4)
+            extra_args: Additional rendering parameters
         """
         if self.renderer is not None:
             self.renderer.render(

@@ -54,6 +54,10 @@ void TcnStreamSplitterOp::compute(holoscan::InputContext& op_input,
   }
   auto& input_entity = maybe_input_entity.value();
 
+  // Synchronizes the real upstream producer stream to this op's internal stream
+  // AND auto-configures all output ports to emit that (correctly-synced) stream.
+  cudaStream_t _stream = op_input.receive_cuda_stream("receivers");
+
   for (const auto& channel_name : channel_names_.get()) {
     // Get the tensor for this channel from the input entity (as GXF tensor)
     auto src_tensor = static_cast<nvidia::gxf::Entity&>(input_entity)
@@ -62,16 +66,6 @@ void TcnStreamSplitterOp::compute(holoscan::InputContext& op_input,
       throw std::runtime_error(
           "TcnStreamSplitterOp: input entity missing tensor '" + channel_name + "'.");
     }
-
-    // Allocate a dedicated CUDA stream for this channel
-    std::string stream_id = name() + "_" + channel_name;
-    auto maybe_stream = context.allocate_cuda_stream(stream_id);
-    if (!maybe_stream) {
-      throw std::runtime_error(
-          "TcnStreamSplitterOp: failed to allocate CUDA stream for channel '" +
-          channel_name + "'.");
-    }
-    cudaStream_t stream = maybe_stream.value();
 
     // Create output entity with the tensor (zero-copy via wrapMemory)
     auto out_entity = holoscan::gxf::Entity::New(&context);
@@ -102,7 +96,6 @@ void TcnStreamSplitterOp::compute(holoscan::InputContext& op_input,
           channel_name + "'.");
     }
 
-    op_output.set_cuda_stream(stream, channel_name.c_str());
     op_output.emit(out_entity, channel_name.c_str());
   }
 }

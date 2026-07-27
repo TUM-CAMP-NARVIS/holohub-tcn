@@ -197,7 +197,6 @@ void TcnDepthImageTemporalFilterOp::compute(holoscan::InputContext& op_input,
   temporal_filtering_u16_kernel<<<grid, block, 0, cuda_stream>>>(params);
 
   auto filtered_image_message = holoscan::gxf::Entity(std::move(filtered_image_entity));
-  // op_output.set_cuda_stream(cuda_stream, "output");
   op_output.emit(filtered_image_message, "output");
 
   current_frame_index_ = (current_frame_index_+1)%8;

@@ -2,7 +2,7 @@ import slangpy as spy
 import numpy as np
 from pyglm import glm
 
-from .mesh_data import Mesh
+from ..renderables.mesh import Mesh
 
 class MeshRenderer:
     def __init__(self, device: spy.Device, output_format: spy.Format):
@@ -47,6 +47,7 @@ class MeshRenderer:
                 "multisample_enable": False,
             },
             depth_stencil={
+                "format": spy.Format.d32_float,
                 "depth_test_enable": True,
                 "depth_write_enable": True,
                 "depth_func": spy.ComparisonFunc.less,
@@ -92,7 +93,7 @@ class MeshRenderer:
             for k, v in extra_args.items():
                 if k not in ['renderStaticColor',]:
                     if cursor.has_field(k):
-                        setattr(cursor, k, v)        
+                        setattr(cursor, k, v)
 
         if extra_args:
             for k, v in extra_args.items():

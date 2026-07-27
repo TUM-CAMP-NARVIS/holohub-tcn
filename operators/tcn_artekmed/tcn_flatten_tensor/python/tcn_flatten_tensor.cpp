@@ -50,6 +50,20 @@ class PyTcnFlattenTensorOp : public TcnFlattenTensorOp {
 
   PyTcnFlattenTensorOp(const std::variant<holoscan::Fragment*, holoscan::Subgraph*>& fragment_or_subgraph,
                        const py::args& args,
+                       std::shared_ptr<holoscan::Allocator> allocator,
+                       std::shared_ptr<holoscan::CudaStreamPool> cuda_stream_pool,
+                       const std::string& message_name = "",
+                       const std::string& name = "tcn_flatten_tensor")
+      : TcnFlattenTensorOp(holoscan::ArgList{holoscan::Arg{"message_name", message_name},
+                                             holoscan::Arg{"allocator", std::move(allocator)},
+                                             holoscan::Arg{"cuda_stream_pool",
+                                                           std::move(cuda_stream_pool)}}) {
+    add_positional_condition_and_resource_args(this, args);
+    init_operator_base(this, fragment_or_subgraph, name);
+  }
+
+  PyTcnFlattenTensorOp(const std::variant<holoscan::Fragment*, holoscan::Subgraph*>& fragment_or_subgraph,
+                       const py::args& args,
                        const std::string& message_name = "",
                        const std::string& name = "tcn_flatten_tensor")
       : TcnFlattenTensorOp(
@@ -83,9 +97,13 @@ PYBIND11_MODULE(_tcn_flatten_tensor, m) {
       doc::TcnFlattenTensorOp::doc_TcnFlattenTensorOp)
       .def(py::init<std::variant<holoscan::Fragment*, holoscan::Subgraph*>,
                     const py::args&,
+                    std::shared_ptr<holoscan::Allocator>,
+                    std::shared_ptr<holoscan::CudaStreamPool>,
                     const std::string&,
                     const std::string&>(),
            "fragment"_a,
+           "allocator"_a,
+           "cuda_stream_pool"_a,
            "message_name"_a = ""s,
            "name"_a = "tcn_flatten_tensor"s,
            doc::TcnFlattenTensorOp::doc_TcnFlattenTensorOp)

@@ -5,27 +5,24 @@ import logging
 import os
 from argparse import ArgumentParser
 import threading
+import math
 import iceoryx2 as iox2
 
 import numpy as np
 import cupy as cp
+import matplotlib
 import cv2
 
 import holoscan as hs
-# from holohub.tcn_depthimage_backprojection import TcnDepthImageBackprojectionOp
-# from holohub.tcn_depthimage_temporal_filter import TcnDepthImageTemporalFilterOp
-# from holohub.tcn_depthimage_weights import TcnDepthImageWeightsOp
-# from holohub.tcn_texture_sampler import TcnTextureSamplerOp
-# from holohub.tcn_depthimage_backprojection._tcn_depthimage_backprojection import CameraModel, DistortionType, \
-#     RigidTransform, CameraParameters, make_rigid_transform
-from operators.tcn_artekmed.tcn_shm_io import (ShmSubscriberOp, DeviceContextService, XYLookupTableSourceOp,
-                                               create_shm_subscriber)
-# from operators.tcn_artekmed.tcn_shm_io import ParameterRpcServer
-from operators.tcn_artekmed.tcn_util import (StreamSplitterOp, StreamMergerOp, FlattenTensorOp,
-                                             DepthImageMaxDistanceOp, DepthImageForegroundBackgroundMaskOp,
-                                             DepthImageApplyMaskOp, ConvertBgraToRgbaOp, RotateImage180Op )
+from holohub.tcn_shm_subscriber import TcnShmSubscriberOp as ShmSubscriberOp
+from holohub.tcn_device_context._tcn_device_context import DeviceContextService
+from holohub.tcn_shm_subscriber._tcn_shm_subscriber import discover_shm
+from holohub.tcn_stream_splitter import TcnStreamSplitterOp as StreamSplitterOp
+from holohub.tcn_convert_bgra_to_rgba import TcnConvertBgraToRgbaOp as ConvertBgraToRgbaOp
 
-from holoscan.conditions import CountCondition
+from operators.tcn_artekmed.tcn_util import RotateImage180Op
+
+from holoscan.conditions import AsynchronousCondition, CountCondition
 from holoscan.core import Operator, OperatorSpec, Tracker
 from holoscan.logger import LogLevel, set_log_level
 from holoscan.operators import HolovizOp
@@ -45,11 +42,82 @@ from holoscan.operators import (
 from tcnart.core.semantic_type import SemanticType
 from tcnart.core.semantic_type.model import ImageFormatTypes
 
+from da3_fragment import DA3MetricProcessingSubgraph, DA3PostprocessorOp
 from da2_fragment import DA2MetricProcessingSubgraph, DA2PostprocessorOp
 from langsam_fragment import LangSamProcessingSubgraph
 
 
 log = logging.getLogger(__name__)
+
+
+def create_tiled_input_specs(
+    tensor_names,
+    input_type=HolovizOp.InputType.COLOR,
+    semantic_types=None,
+    semantic_key=None,
+):
+    grid_size = int(math.ceil(math.sqrt(len(tensor_names)))) if tensor_names else 1
+    tile_size = 1.0 / grid_size
+
+    specs = []
+    for i, tensor_name in enumerate(tensor_names):
+        row = i // grid_size
+        col = i % grid_size
+
+        spec = HolovizOp.InputSpec(tensor_name, input_type)
+        view = HolovizOp.InputSpec.View()
+        view.offset_x = col * tile_size
+        view.offset_y = row * tile_size
+        view.width = tile_size
+        view.height = tile_size
+        spec.views = [view]
+
+        if semantic_types is not None:
+            key = semantic_key(tensor_name) if semantic_key is not None else tensor_name
+            st = semantic_types.get(key)
+            if st is not None:
+                if st.content_type.get_format_type() == ImageFormatTypes.Rgba:
+                    spec.image_format = holoviz._holoviz_str_to_image_format["r8g8b8a8_unorm"]
+                elif st.content_type.get_format_type() == ImageFormatTypes.Bgra:
+                    spec.image_format = holoviz._holoviz_str_to_image_format["b8g8r8a8_unorm"]
+                else:
+                    log.warning(f"Unsupported format type: {st.content_type.get_format_type()}")
+
+        specs.append(spec)
+
+    return specs
+
+
+
+
+class DepthColormapOp(Operator):
+    def __init__(self, fragment, *args, near=0.3, far=6.0, cmap="turbo", **kwargs):
+        self.near, self.far = near, far
+        lut = (matplotlib.colormaps[cmap](np.linspace(0, 1, 256))[:, :3] * 255).astype(np.uint8)
+        self.lut = cp.asarray(lut)                      # (256,3) on GPU
+        super().__init__(fragment, *args, **kwargs)
+
+    def setup(self, spec: OperatorSpec):
+        spec.input("in")
+        spec.output("out")
+
+    def compute(self, op_input, op_output, context):
+        msg = op_input.receive("in")
+        tensor = msg.get("image")
+        if tensor is None:
+            log.warning(f"da3 inference output is None {msg.keys()}")
+            return
+        log.info(f"{dir(tensor)} {type(tensor)}")
+        depth = cp.from_dlpack(tensor)
+        depth = cp.squeeze(depth).astype(cp.float32)
+
+        valid = depth > 0                                # 0 / sky / invalid
+        d = cp.clip((depth - self.near) / (self.far - self.near), 0.0, 1.0)
+        idx = (d * 255).astype(cp.uint8)
+        rgb = self.lut[idx]                              # [H,W,3] uint8
+        a = cp.where(valid, 255, 0).astype(cp.uint8)[..., None]
+        rgba = cp.concatenate([rgb, a], axis=-1)         # [H,W,4] uint8, RGBA
+        op_output.emit({"image": rgba, "display_text": msg.get("display_text")}, "out")
 
 
 class DummySinkOp(Operator):
@@ -61,7 +129,7 @@ class DummySinkOp(Operator):
 
     def compute(self, op_input, op_output, context):
         sig1 = op_input.receive("input")
-        # log.debug(f"DummySink received input {self.name}")
+        # log.info(f"DummySink received input {self.name}: {sig1}")
 
 
 
@@ -81,19 +149,14 @@ class App(hs.core.Application):
         shm_stream_name = shm_config.get("stream_name")
         cycle_time_ms = shm_config.get("cycle_time_ms")
 
-        node, shm_receiver = create_shm_subscriber()
-
-        log.info("Find cameras in shared memory")
-        camera_names = shm_receiver.discover_devices()
-        device_contexts = {}
-        for camera_name in camera_names:
-            log.info(f"Retrieving camera_info: {camera_name}")
-            ctx = shm_receiver.retrieve_device_context(camera_name)
-            if ctx is not None:
-                device_contexts[camera_name] = ctx
+        log.info("Discover contents in shared memory")
+        receiver_config = discover_shm(shm_stream_name)
+        shm_receiver = receiver_config["receiver"]
+        camera_names = receiver_config["camera_names"]
+        device_contexts = receiver_config["device_contexts"]
 
         # Register the ctx_service with the fragment
-        ctx_service = DeviceContextService(device_contexts)
+        ctx_service = DeviceContextService.create(device_contexts)
         self.register_service(ctx_service)
 
         # # create pose tree service for fragment
@@ -118,8 +181,7 @@ class App(hs.core.Application):
         #     pose_tree_config["edges"].append(("world_origin", depth_channel_name, convert_rigid_transform_to_pose3(ctx_service.get_depth_extrinsics(name))))
         #     pose_tree_config["edges"].append((color_channel_name, depth_channel_name, convert_rigid_transform_to_pose3(ctx_service.get_color_to_depth(name))))
 
-        log.info(f"Retrieve channel config for stream: {shm_stream_name}")
-        channels_config = shm_receiver.retrieve_channel_config(shm_stream_name)
+        channels_config = receiver_config["channels_config"]
         channel_semantic_types = {
             v['name']: SemanticType(v['status']['bufferInfo']['semanticType']) for v in channels_config['ports']
         }
@@ -138,6 +200,11 @@ class App(hs.core.Application):
 
             if channel["status"]["portType"] == "colorimage":
                 color_streams_config.append(channel)
+
+        color_output_specs = create_tiled_input_specs(
+            [channel["name"] for channel in color_streams_config],
+            semantic_types=channel_semantic_types,
+        )
 
         log.info(f"create cuda-stream pool with {num_channels} reserved streams on device {cuda_device_id}")
         cuda_stream_pool = CudaStreamPool(
@@ -161,12 +228,20 @@ class App(hs.core.Application):
         )
 
         log.info(f"create subscriber op {shm_stream_name}")
-        subscriber_op = ShmSubscriberOp(self, cuda_stream_pool, device_memory_pool, shm_receiver, shm_stream_name,
-                                        channels_config, pose_tree_config, cycle_time_ms, name="shm_subscriber")
+        shm_async_condition = AsynchronousCondition(self, name="shm_async_condition")
+        subscriber_op = ShmSubscriberOp(self, cuda_stream_pool,
+                                        allocator=device_memory_pool,
+                                        async_condition=shm_async_condition,
+                                        receiver=shm_receiver,
+                                        stream_name=shm_stream_name,
+                                        cycle_time_ms=cycle_time_ms,
+                                        name="shm_subscriber")
 
-        log.info("create stream_splitter op")
+        log.info(f"create stream_splitter op: {color_streams_config[:1]}")
         # XXX only one for now
-        split_op = StreamSplitterOp(self, cuda_stream_pool, [v["name"] for v in color_streams_config[:1]], name="stream_splitter")
+        split_op = StreamSplitterOp(self, cuda_stream_pool,
+                                    channel_names=[v["name"] for v in color_streams_config[:1]],
+                                    name="stream_splitter")
         self.add_flow(subscriber_op, split_op, {("color_outputs", "receivers")})
 
         current_config = color_streams_config[0]
@@ -176,7 +251,7 @@ class App(hs.core.Application):
         self.add_flow(subscriber_op, di_sink, {("depth_outputs", "input")})
 
 
-        config_rotate_image = True
+        config_rotate_image = False
         have_camera_consumer = False
 
         inference_input = (split_op, "camera01_colorimage")
@@ -191,38 +266,67 @@ class App(hs.core.Application):
         if channel_st.content_type.get_format_type() == ImageFormatTypes.Rgba:
             need_convert_bgra = False
         elif channel_st.content_type.get_format_type() == ImageFormatTypes.Bgra:
-            need_convert_bgra = True # camera_streams_config.get("enable_da2", False) or camera_streams_config.get("enable_langsam", False)
+            need_convert_bgra = True # camera_streams_config.get("enable_da3", False) or camera_streams_config.get("enable_langsam", False)
         else:
             log.warning(f"Unsupported format type: {channel_st.content_type.get_format_type()}")
 
         col_conv = None
         if need_convert_bgra:
             log.info("convert bgra to rgba enabled")
-            col_conv = ConvertBgraToRgbaOp(self, name="color_converter_rgba")
+            col_conv = ConvertBgraToRgbaOp(self,
+                                           allocator=device_memory_pool,
+                                           in_tensor_name="",
+                                           out_tensor_name="",
+                                           name="color_converter_rgba")
             self.add_flow(inference_input[0], col_conv, {(inference_input[1], "input")})
             inference_input = (col_conv, "output")
 
         if camera_streams_config.get("enable_da2", False):
-            da_pipeline = DA2MetricProcessingSubgraph(self, "camera01_da2_pipeline", self.kwargs)
+            da2_pipeline = DA2MetricProcessingSubgraph(self, "camera01_da2_pipeline", self.kwargs)
 
-            holoviz_args = self.kwargs("holoviz")
+            holoviz_args = self.kwargs("da2_holoviz")
 
             # Register mouse event callbacks
             holoviz = HolovizOp(
                 self,
                 allocator=device_memory_pool,
-                name="holoviz",
+                name="da2_holoviz",
                 window_title="DepthAnything v2",
                 **holoviz_args,
             )
 
-            self.add_flow(inference_input[0], da_pipeline, {(inference_input[1], "input")})
-            self.add_flow(da_pipeline, holoviz, {("output_image", "receivers")})
-            self.add_flow(da_pipeline, holoviz, {("output_specs", "input_specs")})
+            self.add_flow(inference_input[0], da2_pipeline, {(inference_input[1], "input")})
+            self.add_flow(da2_pipeline, holoviz, {("output_image", "receivers")})
+            self.add_flow(da2_pipeline, holoviz, {("output_specs", "input_specs")})
+            have_camera_consumer = True
+
+        if camera_streams_config.get("enable_da3", False):
+            da3_pipeline = DA3MetricProcessingSubgraph(self, "camera01_da3_pipeline", self.kwargs)
+            # dco = DepthColormapOp(self, name="da3_dco", near=0.3, far=10.0, cmap="turbo")
+
+            holoviz_args = self.kwargs("da3_holoviz")
+
+            # Register mouse event callbacks
+            holoviz = HolovizOp(
+                self,
+                allocator=device_memory_pool,
+                name="da3_holoviz",
+                window_title="DepthAnything v3",
+                tensors=[dict(name="image", type="color", opacity=1.0, priority=0)],
+                **holoviz_args,
+            )
+
+            self.add_flow(inference_input[0], da3_pipeline, {(inference_input[1], "input")})
+            # self.add_flow(da3_pipeline, dco, {("output_image", "in")})
+            self.add_flow(da3_pipeline, holoviz, {("output_image", "receivers")})
+            # self.add_flow(dco, holoviz, {("out", "receivers")})
+            self.add_flow(da3_pipeline, holoviz, {("output_specs", "input_specs")})
             have_camera_consumer = True
 
         if camera_streams_config.get("enable_langsam", False):
-            langsam_pipeline = LangSamProcessingSubgraph(self, "camera01_langsam_pipeline", self.kwargs)
+            langsam_pipeline = LangSamProcessingSubgraph(self, "camera01_langsam_pipeline",
+                                                         device_memory_pool,
+                                                         self.kwargs)
 
             holoviz_args = self.kwargs("langsam_holoviz")
 
@@ -240,14 +344,15 @@ class App(hs.core.Application):
 
         if not have_camera_consumer:
             cs_sink = DummySinkOp(self, name="camera_stream_sink")
-            self.add_flow(split_op, cs_sink, {("camera01_colorimage", "input")})
+            self.add_flow(inference_input[0], cs_sink, {(inference_input[1], "input")})
 
 
-        log.info("create color visualizer")
+        log.info(f"create color visualizer: {color_output_specs}")
 
         color_visualizer = HolovizOp(
             self,
             name="color_visualizer",
+            # tensors=color_output_specs,
             allocator=device_memory_pool,
             cuda_stream_pool=cuda_stream_pool,
             **self.kwargs("color_holoviz"),

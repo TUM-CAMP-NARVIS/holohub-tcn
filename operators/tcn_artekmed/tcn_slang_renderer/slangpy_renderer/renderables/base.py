@@ -1,9 +1,11 @@
+"""
+Base renderable class for all render-able objects in the scene.
+Provides common interface for managing 6D pose, visibility, and GPU synchronization.
+"""
 from abc import ABC, abstractmethod
 from typing import Optional
 import numpy as np
 import slangpy as spy
-from holoscan.pose_tree import Pose3
-from operators.tcn_artekmed.tcn_util.helpers import pose3_to_matrix4x4
 
 
 class Renderable(ABC):
@@ -31,9 +33,7 @@ class Renderable(ABC):
     def pose(self, value):
         """Set the 4x4 transformation matrix for this object."""
         # Handle glm.mat4x4 objects
-        if isinstance(value, Pose3):
-            self._pose = pose3_to_matrix4x4(value)
-        elif hasattr(value, 'to_list'):
+        if hasattr(value, 'to_list'):
             # Convert glm matrix to numpy array
             matrix_list = value.to_list()
             # glm uses column-major order, convert to row-major for numpy
@@ -63,7 +63,7 @@ class Renderable(ABC):
     def update(self, **kwargs):
         """
         Thread-safe method to stage data updates.
-        Called from any thread (e.g., Holoscan operator).
+        Called from any thread (e.g., data processing pipeline).
         """
         pass
 

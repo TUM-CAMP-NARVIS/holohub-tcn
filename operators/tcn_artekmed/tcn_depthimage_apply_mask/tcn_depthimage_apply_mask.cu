@@ -74,12 +74,8 @@ void TcnDepthImageApplyMaskOp::compute(holoscan::InputContext& op_input,
     }
 
     // Synchronize input streams
-    cudaStream_t depth_stream = op_input.receive_cuda_stream("depth_image", false, false);
-    cudaStream_t mask_stream = op_input.receive_cuda_stream("mask_image", false, false);
-    cudaStream_t out_stream = context.allocate_cuda_stream(
-        (std::string(name()) + "_apply_mask_stream").c_str()).value();
-    context.synchronize_streams(
-        std::vector<std::optional<cudaStream_t>>{depth_stream, mask_stream}, out_stream);
+    cudaStream_t cuda_stream = op_input.receive_cuda_stream("depth_image", false, false);
+    op_input.receive_cuda_stream("mask_image", false, false);
 
     const auto& shape = depth_tensor->shape();
     std::vector<int32_t> shape_dims;
@@ -100,7 +96,7 @@ void TcnDepthImageApplyMaskOp::compute(holoscan::InputContext& op_input,
     if (buffer_num_elements_ != num_elements) {
         buffer_num_elements_ = num_elements;
         if (!tcn::allocate_tensor<uint16_t>(
-                allocator.value(), out_stream, gxf_shape,
+                allocator.value(), cuda_stream, gxf_shape,
                 nvidia::gxf::MemoryStorageType::kDevice,
                 out_buffer_, true)) {
             throw std::runtime_error("Failed to allocate output buffer.");
@@ -117,7 +113,7 @@ void TcnDepthImageApplyMaskOp::compute(holoscan::InputContext& op_input,
     // Launch masking kernel
     const int threads = 256;
     const int blocks = (num_elements + threads - 1) / threads;
-    apply_mask_kernel<<<blocks, threads, 0, out_stream>>>(
+    apply_mask_kernel<<<blocks, threads, 0, cuda_stream>>>(
         depth_ptr, mask_ptr, out_ptr, invert_mask_.get(), num_elements);
 
     // Emit
@@ -129,7 +125,7 @@ void TcnDepthImageApplyMaskOp::compute(holoscan::InputContext& op_input,
 
     nvidia::gxf::Handle<nvidia::gxf::Tensor> out_gxf_tensor = nullptr;
     if (!tcn::allocate_named_tensor<uint16_t>(
-            allocator.value(), out_stream, out_entity,
+            allocator.value(), cuda_stream, out_entity,
             gxf_shape,
             nvidia::gxf::MemoryStorageType::kDevice,
             out_tensor_name_.get(), out_gxf_tensor)) {
@@ -145,10 +141,9 @@ void TcnDepthImageApplyMaskOp::compute(holoscan::InputContext& op_input,
     HOLOSCAN_CUDA_CALL(cudaMemcpyAsync(
         maybe_emit_data.value(), out_ptr,
         num_elements * sizeof(uint16_t),
-        cudaMemcpyDeviceToDevice, out_stream));
+        cudaMemcpyDeviceToDevice, cuda_stream));
 
     auto out_message = holoscan::gxf::Entity(std::move(out_entity));
-    op_output.set_cuda_stream(out_stream, "output");
     op_output.emit(out_message, "output");
 }
 

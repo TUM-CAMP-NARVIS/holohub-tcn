@@ -76,23 +76,14 @@ void TcnTextureSamplerOp::compute(holoscan::InputContext& op_input,
   }
 
   auto color_t = maybe_color_t_entity.value().get<holoscan::Tensor>(in_color_tensor_name_.get().c_str());
-  cudaStream_t color_cuda_stream = op_input.receive_cuda_stream("color_image", true, false);
+  cudaStream_t cuda_stream = op_input.receive_cuda_stream("color_image", true, false);
 
   auto maybe_texcoords_entity = op_input.receive<holoscan::gxf::Entity>("texcoords");
   if (!maybe_texcoords_entity) {
     throw std::runtime_error("Failed to read input entity");
   }
   auto texcoord_t = maybe_texcoords_entity.value().get<holoscan::Tensor>(in_texcoord_tensor_name_.get().c_str());
-  cudaStream_t texcoords_cuda_stream = op_input.receive_cuda_stream("color_image", true, false);
-
-  auto maybe_output_cuda_stream = context.allocate_cuda_stream();
-  if (!maybe_output_cuda_stream) {
-    throw std::runtime_error("Failed to allocate cuda stream.");
-  }
-
-  // synch streams for incoming ports
-  cudaStream_t output_cuda_stream = maybe_output_cuda_stream.value();
-  context.synchronize_streams({color_cuda_stream, texcoords_cuda_stream}, output_cuda_stream);
+  op_input.receive_cuda_stream("texcoords", true, false);
 
   const auto& color_shape = color_t->shape();
   assert(color_shape[2] == 4); // for now we require a 4 component input.
@@ -123,7 +114,7 @@ void TcnTextureSamplerOp::compute(holoscan::InputContext& op_input,
   out_buffer_entity = std::move(maybe_out_buffer_entity.value());
 
   if (!tcn::allocate_named_tensor<uint8_t>(allocator.value(),
-                                         output_cuda_stream,
+                                         cuda_stream,
                                          out_buffer_entity,
                                          nvidia::gxf::Shape{{H, W, 4}},
                                          nvidia::gxf::MemoryStorageType::kDevice,
@@ -161,10 +152,9 @@ void TcnTextureSamplerOp::compute(holoscan::InputContext& op_input,
 
   const dim3 block(16, 16);
   const dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
-  texture_sampler_rgba_kernel<<<grid, block, 0, output_cuda_stream>>>(params);
+  texture_sampler_rgba_kernel<<<grid, block, 0, cuda_stream>>>(params);
 
   auto out_buffer_message = holoscan::gxf::Entity(std::move(out_buffer_entity));
-  op_output.set_cuda_stream(output_cuda_stream, "output");
   op_output.emit(out_buffer_message, "output");
 
 }

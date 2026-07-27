@@ -46,6 +46,54 @@ constexpr const char* doc_camera_names = R"doc(
 Get list of registered camera names.
 )doc";
 
+constexpr const char* doc_get_camera_name_from_port_name = R"doc(
+Extract the camera name from a port name such as ``camera0_depth``.
+)doc";
+
+constexpr const char* doc_get_depth_camera_model = R"doc(
+Get the depth camera model for a given camera.
+
+Returns ``None`` if the camera is not registered.
+)doc";
+
+constexpr const char* doc_get_color_camera_model = R"doc(
+Get the color camera model for a given camera.
+
+Returns ``None`` if the camera is not registered.
+)doc";
+
+constexpr const char* doc_get_xy_table_intrinsics = R"doc(
+Get XY lookup-table intrinsics for a given camera.
+
+Returns a ``pyxylt.IntrinsicParameters`` instance or ``None`` if the camera
+is not registered.
+)doc";
+
+constexpr const char* doc_get_xy_table = R"doc(
+Generate the XY lookup table for a given camera.
+
+Returns a NumPy array of shape ``(height, width, 2)`` or ``None`` if the
+camera is not registered.
+)doc";
+
+constexpr const char* doc_get_depth_extrinsics = R"doc(
+Get the depth camera extrinsics for a given camera.
+
+Returns ``None`` if the camera is not registered.
+)doc";
+
+constexpr const char* doc_get_color_to_depth = R"doc(
+Get the color-to-depth transform for a given camera.
+
+Returns ``None`` if the camera is not registered.
+)doc";
+
+constexpr const char* doc_get_color_to_depth_inv = R"doc(
+Get the inverse color-to-depth transform for a given camera.
+
+Returns ``None`` if the camera is not registered.
+)doc";
+
 }  // namespace DeviceContextService
 
 namespace XYLookupTableSourceOp {

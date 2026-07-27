@@ -1,0 +1,51 @@
+application:
+  title: TCN Artekmed Shm Backprojection Test
+  version: 1.0
+  inputFormats: []
+  outputFormats: ["screen"]
+
+shared_memory:
+  stream_name: "camera_streams"
+  parameter_rpc_name: "tcn_shm_receiver"
+  cycle_time_ms: 1
+
+camera_stream_processing:
+  device_id: 0
+  buffer_size: 8
+  enable_temporal_filter: True
+  enable_background_substract: False
+  enable_compute_weights: True
+  enable_warp_colorimage: True
+
+depthimage_temporal_filter:
+  alpha: 0.15
+  delta: 30
+  persistence: 3
+
+depthimage_backprojection:
+  depth_units_per_meter: 1000.0
+  near_limit_m: 0.01
+  far_limit_m: 10.0
+
+rmm_allocator:
+
+resources:
+  cpu: 24
+  gpu: 1
+  memory: 1Gi
+  gpuMemory: 1Gi
+
+color_holoviz:
+  window_title: "Artekmed Colorimages"
+  width: 800
+  height: 640
+  framerate: 60
+
+pose_tree_config:
+  number_frames: 1024                # default: 1024
+  number_edges: 16384                # default: 16384
+  history_length: 1048576            # default: 1048576
+  default_number_edges: 16           # default: 16
+  default_history_length: 1024       # default: 1024
+  edges_chunk_size: 4                # default: 4
+  history_chunk_size: 64             # default: 64

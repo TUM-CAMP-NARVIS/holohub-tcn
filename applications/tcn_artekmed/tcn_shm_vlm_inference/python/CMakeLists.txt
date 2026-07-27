@@ -25,8 +25,9 @@ target_link_libraries(tcn_shm_vlm_inference INTERFACE
     holoscan::core
     holoscan::ops::format_converter
     holoscan::ops::holoviz
-    holoscan::ops::tcn_depthimage_backprojection
-    holoscan::ops::tcn_depthimage_temporal_filter
-    holoscan::ops::tcn_depthimage_weights
-    holoscan::ops::tcn_texture_sampler
+    holoscan::ops::tcn_stream_splitter
+    holoscan::ops::tcn_shm_serde
+    holoscan::ops::tcn_shm_subscriber
+    holoscan::ops::tcn_device_context
+    holoscan::ops::tcn_convert_bgra_to_rgba
 )

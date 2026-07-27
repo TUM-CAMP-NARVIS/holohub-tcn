@@ -171,13 +171,15 @@ class DA2PostprocessorOp(Operator):
 class DA2MetricProcessingSubgraph(Subgraph):
     """Subgraph containing the shm-receiver and backprojection pipeline."""
 
-    def __init__(self, fragment, name, kwargs, convert_bgra=False):
+    def __init__(self, fragment, name, kwargs):
         self.kwargs = kwargs
-        self.convert_bgra = convert_bgra
         super().__init__(fragment, name)
 
+    def _make_name(self, name):
+        return f"{self.name}_{name}"
+
     def compose(self):
-        log.info("Compose subgraph: DA3MetricProcessing")
+        log.info("Compose subgraph: DA2MetricProcessing")
         app = self.fragment.application
 
         # @todo: do not use app.kwargs directly, but pass the relevant dictionary or subtree to the subgraph explicitly
@@ -188,7 +190,7 @@ class DA2MetricProcessingSubgraph(Subgraph):
         da2_preprocessor_args = self.kwargs("da2_preprocessor")
         da2_preprocessor = FormatConverterOp(
         self,
-            name="da2_preprocessor",
+            name=self._make_name("da2_preprocessor"),
             pool=pool,
             in_dtype=in_dtype,
             **da2_preprocessor_args,
@@ -197,28 +199,23 @@ class DA2MetricProcessingSubgraph(Subgraph):
         da2_inference_args = self.kwargs("da2_inference")
         da2_inference_config = self.kwargs("da2_inference_config")
         da2_inference_args["model_path_map"] = {
-            "depth": da2_inference_config.get("model_path")
+            "depth_v2": da2_inference_config.get("model_path")
         }
 
         da2_inference = InferenceOp(
             self,
-            name="da2_inference",
+            name=self._make_name("da2_inference"),
             allocator=pool,
         **da2_inference_args,
         )
 
-        da2_postprocessor = DA2PostprocessorOp(self, name="da2_postprocessor", allocator=pool)
+        da2_postprocessor = DA2PostprocessorOp(self, name=self._make_name("da2_postprocessor"), allocator=pool)
 
-        if self.convert_bgra:
-            self.add_flow(col_conv, da2_preprocessor, {("output", "source_video")})
         self.add_flow(da2_preprocessor, da2_postprocessor, {("tensor", "input_image")})
         self.add_flow(da2_preprocessor, da2_inference, {("", "receivers")})
         self.add_flow(da2_inference, da2_postprocessor, {("transmitter", "input_depthmap")})
 
         # Expose the relevant ports
-        if self.convert_bgra:
-            self.add_input_interface_port("input", col_conv, "input")
-        else:
-            self.add_input_interface_port("input", da2_preprocessor, "source_video")
+        self.add_input_interface_port("input", da2_preprocessor, "source_video")
         self.add_output_interface_port("output_image", da2_postprocessor, "output_image")
         self.add_output_interface_port("output_specs", da2_postprocessor, "output_specs")

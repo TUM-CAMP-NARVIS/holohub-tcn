@@ -1,29 +1,31 @@
+"""
+Colored mesh renderable data class (e.g., for axes, wireframes).
+"""
 import slangpy as spy
 import numpy as np
 import threading
 
-from .renderable import Renderable
+from .base import Renderable
 
 
 class ColoredMesh(Renderable):
     """
-    Color Mesh visualization .
-    Renders colored line segments forming a coordinate system indicator.
+    Colored mesh visualization (e.g., coordinate axes, wireframes).
+    Renders colored line segments or triangles.
     """
 
     @staticmethod
     def create_axis3d(device: spy.Device, scale: float = 1.0):
         """
-        Create a reference frame with the given scale.
+        Create a 3D coordinate axis with the given scale.
 
         Args:
             device: Slang device
             scale: Scale factor for the axes (default: 1.0)
 
         Returns:
-            ReferenceFrame instance
+            ColoredMesh instance representing XYZ axes
         """
-
         # Static geometry data for the reference frame
         # Indices for line segments (9 lines total)
         INDICES = np.array([
@@ -81,7 +83,6 @@ class ColoredMesh(Renderable):
             [0.0, 0.0, 1.0]
         ], dtype=np.float32)
 
-
         positions = VERTICES_POSITION * scale
         colors = VERTICES_COLOR.copy()
         indices = INDICES.copy()
@@ -95,18 +96,18 @@ class ColoredMesh(Renderable):
                  indices: np.ndarray,
                  sync_gpu: bool = False):
         """
-        Initialize a reference frame renderable.
+        Initialize a colored mesh renderable.
 
         Args:
             device: Slang device
             positions: Vertex positions (Nx3)
             colors: Vertex colors (Nx3)
-            indices: Line indices (Mx2 for M lines)
+            indices: Line/triangle indices
             sync_gpu: If True, create GPU buffers immediately
         """
         super().__init__(device)
         self.buffer_lock = threading.Lock()
-        self.renderer = None  # Will be set by ReferenceFrameRenderer
+        self.renderer = None  # Will be set by ColoredMeshRenderer
 
         # Pending updates storage
         self._pending_data = {
@@ -167,7 +168,7 @@ class ColoredMesh(Renderable):
         Args:
             positions: Updated vertex positions (Nx3)
             colors: Updated vertex colors (Nx3)
-            indices: Updated line indices
+            indices: Updated line/triangle indices
         """
         with self.buffer_lock:
             if positions is not None:
@@ -227,26 +228,27 @@ class ColoredMesh(Renderable):
     def render(self,
                pass_encoder: spy.RenderPassEncoder,
                window_size: tuple[int, int],
-               output_texture: spy.Texture,
-               depth_texture: spy.Texture,
                view_matrix: np.ndarray,
                proj_matrix: np.ndarray,
-               clear_color: list = None,
                extra_args: dict = None,
                ):
         """
-        Render this reference frame using its associated renderer.
+        Render this colored mesh using its associated renderer.
+
+        Args:
+            pass_encoder: Active render pass encoder
+            window_size: Window dimensions (width, height)
+            view_matrix: Camera view matrix (4x4)
+            proj_matrix: Camera projection matrix (4x4)
+            extra_args: Additional rendering parameters
         """
         if self.renderer is not None:
             self.renderer.render(
                 pass_encoder,
                 self,
                 window_size,
-                output_texture,
-                depth_texture,
                 view_matrix,
                 proj_matrix,
                 self.pose,
-                clear_color,
                 extra_args,
             )

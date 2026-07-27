@@ -20,11 +20,12 @@ from holoscan.schedulers import EventBasedScheduler, GreedyScheduler
 from holoscan.resources import CudaStreamPool, BlockMemoryPool, MemoryStorageType, RMMAllocator
 from holoscan.pose_tree import PoseTreeManager, SO3, Pose3
 
-from operators.tcn_artekmed.tcn_processing import ShmSimpleBackprojectionSubgraph
-from operators.tcn_artekmed.tcn_slang_renderer.pointcloud_data import Pointcloud
+from operators.tcn_artekmed.tcn_processing import ShmSimpleBackprojectionSubgraph, ShmConnection
+from holohub.tcn_shm_subscriber._tcn_shm_subscriber import discover_shm
+from operators.tcn_artekmed.tcn_slang_renderer.slangpy_renderer.renderables import Pointcloud, Mesh, ColoredMesh
 
 from operators.tcn_artekmed.tcn_util.helpers import pose3_to_matrix4x4
-from operators.tcn_artekmed.tcn_slang_renderer import TcnSlangRenderOp, SlangWindow
+from operators.tcn_artekmed.tcn_slang_renderer import TcnSlangRenderOp
 
 #from graph_visualizer import visualize_holoscan_graph
 
@@ -91,24 +92,58 @@ class SingleGofPlayer(Operator):
 
 class App(hs.core.Application):
 
-    def __init__(self, record_type=None, source=None):
+    def __init__(self, record_type=None):
         super().__init__()
         self.record_type = record_type
-        self.source = source
 
     def compose(self):
 
         print("Starting TCN RenderTest")
         stop_cond = BooleanCondition(self, name="stop_cond")
 
-        camera_streams = None
-        if self.source == "single_gof":
-            pcond = PeriodicCondition(self, 1000, name="pcond")
-            camera_streams = SingleGofPlayer(self, pcond, name="sgof_plr", storage_directory="/tmp/sgof_rec")
-        elif self.source == "live":
-            camera_streams = ShmSimpleBackprojectionSubgraph(self, "sbs", fuse_buffers=False)
-        else:
-            raise ValueError(f"Invalid source: {self.source}")
+
+        # read configuration
+        camera_streams_config = self.kwargs("camera_stream_processing")
+        cuda_device_id = camera_streams_config.get("device_id", 0)
+        block_memory_buffer_size = camera_streams_config.get("buffer_size", 8)
+
+        shm_config = self.kwargs("shared_memory")
+        shm_stream_name = shm_config.get("stream_name")
+        cycle_time_ms = shm_config.get("cycle_time_ms")
+
+        connection = ShmConnection(shm_stream_name, cycle_time_ms)
+        if not connection.connect_shm():
+            raise RuntimeError("could not connect to shm")
+
+        max_frame_size = connection.get_max_tensor_size()
+        num_channels = connection.get_num_streams()
+
+        log.info(f"create cuda-stream pool with {num_channels} reserved streams on device {cuda_device_id}")
+        cuda_stream_pool = CudaStreamPool(
+            self,
+            name="cuda_stream_pool",
+            dev_id=cuda_device_id,
+            stream_flags=0,
+            stream_priority=0,
+            reserved_size=num_channels,
+            max_size=256,
+        )
+
+        log.info(f"create device-memory pool with {max_frame_size} bytes, {num_channels * block_memory_buffer_size} blocks on device {cuda_device_id}")
+        device_memory_pool = BlockMemoryPool(
+            self,
+            name="shm_subscriber_device_pool",
+            storage_type=MemoryStorageType.DEVICE,
+            block_size=max_frame_size,
+            num_blocks=num_channels * block_memory_buffer_size,
+            dev_id=cuda_device_id
+        )
+
+        camera_streams = ShmSimpleBackprojectionSubgraph(self, "sbs",
+                                                         stream_pool=cuda_stream_pool,
+                                                         allocator=device_memory_pool,
+                                                         shm_connection=connection,
+                                                         fuse_buffers=False)
 
         # # @todo: create renderables config interface once stabilized
         renderables = {
@@ -124,42 +159,42 @@ class App(hs.core.Application):
                     ("camera01_texcoords", "texcoords"),
                 ]
             },
-            # "camera02_pointcloud": {
-            #     "entity_type": "pointcloud",
-            #     "entity_args": None,
-            #     "renderer": "colored_pointcloud",
-            #     "priority": 0,
-            #     "pose": None,
-            #     "input_mappings": [
-            #         ("camera02_colorimage", "image"),
-            #         ("camera02_positions", "positions"),
-            #         ("camera02_texcoords", "texcoords"),
-            #     ]
-            # },
-            # "camera03_pointcloud": {
-            #     "entity_type": "pointcloud",
-            #     "entity_args": None,
-            #     "renderer": "colored_pointcloud",
-            #     "priority": 0,
-            #     "pose": None,
-            #     "input_mappings": [
-            #         ("camera03_colorimage", "image"),
-            #         ("camera03_positions", "positions"),
-            #         ("camera03_texcoords", "texcoords"),
-            #     ]
-            # },
-            # "camera04_pointcloud": {
-            #     "entity_type": "pointcloud",
-            #     "entity_args": None,
-            #     "renderer": "colored_pointcloud",
-            #     "priority": 0,
-            #     "pose": None,
-            #     "input_mappings": [
-            #         ("camera04_colorimage", "image"),
-            #         ("camera04_positions", "positions"),
-            #         ("camera04_texcoords", "texcoords"),
-            #     ]
-            # },
+            "camera02_pointcloud": {
+                "entity_type": "pointcloud",
+                "entity_args": None,
+                "renderer": "colored_pointcloud",
+                "priority": 0,
+                "pose": None,
+                "input_mappings": [
+                    ("camera02_colorimage", "image"),
+                    ("camera02_positions", "positions"),
+                    ("camera02_texcoords", "texcoords"),
+                ]
+            },
+            "camera03_pointcloud": {
+                "entity_type": "pointcloud",
+                "entity_args": None,
+                "renderer": "colored_pointcloud",
+                "priority": 0,
+                "pose": None,
+                "input_mappings": [
+                    ("camera03_colorimage", "image"),
+                    ("camera03_positions", "positions"),
+                    ("camera03_texcoords", "texcoords"),
+                ]
+            },
+            "camera04_pointcloud": {
+                "entity_type": "pointcloud",
+                "entity_args": None,
+                "renderer": "colored_pointcloud",
+                "priority": 0,
+                "pose": None,
+                "input_mappings": [
+                    ("camera04_colorimage", "image"),
+                    ("camera04_positions", "positions"),
+                    ("camera04_texcoords", "texcoords"),
+                ]
+            },
             # # "camera04_colorimage_origin": {
             #     "entity_type": "colored_mesh",
             #     "entity_args": ["axis3d",],
@@ -173,19 +208,14 @@ class App(hs.core.Application):
 
         slang = TcnSlangRenderOp(self, stop_cond, name="Slang", renderables=json.dumps(renderables))
 
-        if self.source == "single_gof":
-            self.add_flow(camera_streams, slang, {
-                ("output", "input"),
-            })
-        elif self.source == "live":
-            self.add_flow(camera_streams, slang, {
-                ("color_outputs", "input"),
-                ("depth_outputs", "input"),
-                ("position_outputs", "input"),
-                ("texcoord_outputs", "input"),
-            })
+        self.add_flow(camera_streams, slang, {
+            ("color_outputs", "input"),
+            ("depth_outputs", "input"),
+            ("position_outputs", "input"),
+            ("texcoord_outputs", "input"),
+        })
 
-        if self.record_type == "input" and self.source == "live":
+        if self.record_type == "input":
             ccond = CountCondition(self, count=1, name="ccond")
             sgof_rec = SingleGofRecorder(self, ccond, name="sgof_rec", storage_directory="/tmp/sgof_rec")
             self.add_flow(camera_streams, sgof_rec, {
@@ -200,82 +230,6 @@ class App(hs.core.Application):
         # Visualize the application graph
         #output_path = Path(__file__).parent / "holoscan_graph.gexf"
         #visualize_holoscan_graph(self, output_file=str(output_path), show=False)
-
-
-
-def slangwindow_debug(storage_directory):
-    logging.basicConfig(level=logging.DEBUG)
-    md_file = os.path.join(storage_directory, "metadata.json")
-    if not os.path.isfile(md_file):
-        log.error(f"No metadata file found at {md_file}")
-        return
-
-    with open(md_file, "r") as f:
-        metadata = json.load(f)
-
-    render_context = {}
-    for m in metadata:
-        tensor_name = m["name"]
-        tensor_shape = m["shape"]
-        tensor_file = os.path.join(storage_directory, f"{tensor_name}.npy")
-        tensor = np.load(tensor_file)
-        cu_tensor = cp.asarray(tensor)
-        render_context[tensor_name] = cu_tensor
-
-    renderables = {
-        # "camera01_pointcloud": {
-        #     "entity_type": "pointcloud",
-        #     "entity_args": None,
-        #     "renderer": "colored_pointcloud",
-        #     "priority": 0,
-        #     "pose": None,
-        #     "input_mappings": [
-        #         ("camera01_colorimage", "image"),
-        #         ("camera01_positions", "positions"),
-        #         ("camera01_texcoords", "texcoords"),
-        #     ]
-        # },
-    }
-    window = SlangWindow(1024, 768, "TCN RenderTest Debug")
-
-    def extract_inputs(ctx, mappings):
-        kwargs = {}
-        if mappings is None:
-            return kwargs
-
-        for port_name, buffer_name in mappings:
-            buffer = ctx.get(port_name)
-
-            # XXX why is this needed!
-            # first attempt to forward a cupy array and do the d2d copy in renderable-update
-            if getattr(buffer, "device", None) is not None:
-                # buffer = cp.asnumpy(buffer)
-                buffer = cp.asarray(buffer)
-
-            if buffer is not None:
-                # @FIXME: this downloads the buffer potentially being already on the device in cuda memory.
-                # a more sophisticated resource sharing cuda-vulkan interop should be used and is available in slang
-                kwargs[buffer_name] = buffer
-            else:
-                log.warning(f"TcnSlangRenderOp: missing input buffer for {port_name}")
-        return kwargs
-
-    for name, config in renderables.items():  # XX consider priorities here
-        renderable = window.get_renderable(name)
-        if renderable is None:
-            log.info(f"TcnSlangRenderOp: create renderable: {name}: {config}")
-            # XXX make renderer configurable
-            if config["entity_type"] == "pointcloud":
-                kwargs = extract_inputs(render_context, config["input_mappings"])
-                renderable = Pointcloud(device=window.get_device(), **kwargs)
-                window.add_renderable(name, renderable)
-            else:
-                log.warning(f"TcnSlangRenderOp: unsupported entity type: {config['entity_type']}")
-        else:
-            kwargs = extract_inputs(render_context, config["input_mappings"])
-            renderable.update(**kwargs)
-
-    window.run()
 
 
 def main():
@@ -295,18 +249,6 @@ def main():
         default="none",
         help="The stream to record (default: %(default)s).",
     )
-    parser.add_argument(
-        "-s",
-        "--source",
-        choices=[
-            "live",
-            "single_gof",
-        ],
-        default="live",
-        help=(
-            "Source of data streams (default: %(default)s)."
-        ),
-    )
 
     args = parser.parse_args()
 
@@ -320,17 +262,17 @@ def main():
     configure_debug = True
 
     if configure_debug:
-        logging.basicConfig(level=logging.INFO)
+        logging.basicConfig(level=logging.DEBUG)
         set_log_level(LogLevel.INFO)
         iox2.set_log_level(iox2.LogLevel.Info)
     else:
         logging.basicConfig(level=logging.INFO)
         set_log_level(LogLevel.INFO)
 
-    app = App(source=args.source, record_type=args.record_type)
+    app = App(record_type=args.record_type)
     app.config(config_file)
 
-    if False:
+    if True:
         scheduler = GreedyScheduler(app, name="gs", stop_on_deadlock=True)
     else:
         scheduler = EventBasedScheduler(app, worker_thread_number=24, name="ebs")
@@ -348,5 +290,4 @@ def main():
 
 
 if __name__ == "__main__":
-    #main()
-    slangwindow_debug("/tmp/sgof_rec")
+    main()

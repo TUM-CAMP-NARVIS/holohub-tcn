@@ -88,7 +88,7 @@ void TcnStreamMergerOp::compute(holoscan::InputContext& op_input,
     nvidia::gxf::Handle<nvidia::gxf::Tensor> tensor;
   };
   std::vector<InputData> inputs;
-  std::vector<std::optional<cudaStream_t>> input_streams;
+  cudaStream_t cuda_stream = nullptr;
 
   // Keep input entities alive until we emit (tensors reference their memory)
   std::vector<holoscan::gxf::Entity> input_entities;
@@ -101,9 +101,10 @@ void TcnStreamMergerOp::compute(holoscan::InputContext& op_input,
     }
     auto entity = std::move(maybe_entity.value());
 
-    cudaStream_t port_stream = op_input.receive_cuda_stream(port_name.c_str(), false, false);
-    if (port_stream) {
-      input_streams.push_back(port_stream);
+    if (cuda_stream == nullptr) {
+        cuda_stream = op_input.receive_cuda_stream(port_name.c_str(), false, false);
+    } else {
+        op_input.receive_cuda_stream(port_name.c_str(), false, false);
     }
 
     auto tensor = static_cast<nvidia::gxf::Entity&>(entity)
@@ -115,17 +116,6 @@ void TcnStreamMergerOp::compute(holoscan::InputContext& op_input,
     }
     inputs.push_back({port_name, tensor.value()});
     input_entities.push_back(std::move(entity));
-  }
-
-  // Synchronize input streams and allocate output stream
-  cudaStream_t output_stream = 0;
-  if (!input_streams.empty()) {
-    auto maybe_stream = context.allocate_cuda_stream(name());
-    if (!maybe_stream) {
-      throw std::runtime_error("TcnStreamMergerOp: failed to allocate output CUDA stream.");
-    }
-    output_stream = maybe_stream.value();
-    context.synchronize_streams(input_streams, output_stream);
   }
 
   // Create output entity
@@ -214,7 +204,7 @@ void TcnStreamMergerOp::compute(holoscan::InputContext& op_input,
         size_t dst_offset = row * dst_row_bytes + row_elem_offset * depth * elem_size;
         size_t src_offset = row * src_row_bytes;
         cudaMemcpyAsync(out_ptr + dst_offset, src_ptr + src_offset,
-                        src_row_bytes, cudaMemcpyDeviceToDevice, output_stream);
+                        src_row_bytes, cudaMemcpyDeviceToDevice, cuda_stream);
       }
       row_elem_offset += src_width;
     }
@@ -253,9 +243,6 @@ void TcnStreamMergerOp::compute(holoscan::InputContext& op_input,
     }
   }
 
-  if (output_stream) {
-    op_output.set_cuda_stream(output_stream, "output");
-  }
   op_output.emit(out_entity, "output");
 }
 

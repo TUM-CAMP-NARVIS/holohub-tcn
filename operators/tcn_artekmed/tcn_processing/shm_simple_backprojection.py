@@ -3,24 +3,30 @@ import pathlib
 from typing import Any, List
 import logging
 import numpy as np
+import math
 
 from holoscan.core import Subgraph
-from holoscan.conditions import CountCondition
+from holoscan.conditions import AsynchronousCondition, CountCondition
 from holoscan.pose_tree import PoseTreeManager, SO3, Pose3
 from holoscan.resources import CudaStreamPool
 from holoscan.resources import BlockMemoryPool, MemoryStorageType
+from holoscan.operators import HolovizOp
+from holoscan.operators import holoviz
 
 from holohub.tcn_depthimage_backprojection import TcnDepthImageBackprojectionOp
 from holohub.tcn_depthimage_temporal_filter import TcnDepthImageTemporalFilterOp
-from holohub.tcn_texture_sampler import TcnTextureSamplerOp
+from holohub.tcn_shm_subscriber import TcnShmSubscriberOp as ShmSubscriberOp
+from holohub.tcn_shm_subscriber._tcn_shm_subscriber import ShmSynchronizedBufferReceiver
+from holohub.tcn_device_context import XYLookupTableSourceOp
+from holohub.tcn_device_context._tcn_device_context import DeviceContextService
 from holohub.tcn_depthimage_backprojection._tcn_depthimage_backprojection import CameraModel, DistortionType, \
     RigidTransform, CameraParameters, make_rigid_transform
-from operators.tcn_artekmed.tcn_shm_io import (ShmSubscriberOp, DeviceContextService, XYLookupTableSourceOp,
-                                               create_shm_subscriber)
-# from operators.tcn_artekmed.tcn_shm_io import ParameterRpcServer
-from operators.tcn_artekmed.tcn_util import (StreamSplitterOp, StreamMergerOp, FlattenTensorOp,
-                                             DepthImageMaxDistanceOp, DepthImageForegroundBackgroundMaskOp,
-                                             DepthImageApplyMaskOp )
+from holohub.tcn_stream_splitter import TcnStreamSplitterOp as StreamSplitterOp
+from holohub.tcn_stream_merger import TcnStreamMergerOp as StreamMergerOp
+from holohub.tcn_shm_subscriber._tcn_shm_subscriber import discover_shm
+
+from tcnart.core.semantic_type import SemanticType
+from tcnart.core.semantic_type.model import ImageFormatTypes
 
 log = logging.getLogger(__name__)
 
@@ -31,48 +37,178 @@ def convert_rigid_transform_to_pose3(input: RigidTransform) -> Pose3:
     return Pose3(r, input.translation)
 
 
+def create_tiled_input_specs(
+    tensor_names,
+    input_type=HolovizOp.InputType.COLOR,
+    semantic_types=None,
+    semantic_key=None,
+):
+    grid_size = int(math.ceil(math.sqrt(len(tensor_names)))) if tensor_names else 1
+    tile_size = 1.0 / grid_size
+
+    specs = []
+    for i, tensor_name in enumerate(tensor_names):
+        row = i // grid_size
+        col = i % grid_size
+
+        spec = HolovizOp.InputSpec(tensor_name, input_type)
+        view = HolovizOp.InputSpec.View()
+        view.offset_x = col * tile_size
+        view.offset_y = row * tile_size
+        view.width = tile_size
+        view.height = tile_size
+        spec.views = [view]
+
+        if semantic_types is not None:
+            key = semantic_key(tensor_name) if semantic_key is not None else tensor_name
+            st = semantic_types.get(key)
+            if st is not None:
+                if st.content_type.get_format_type() == ImageFormatTypes.Rgba:
+                    spec.image_format = holoviz._holoviz_str_to_image_format["r8g8b8a8_unorm"]
+                elif st.content_type.get_format_type() == ImageFormatTypes.Bgra:
+                    spec.image_format = holoviz._holoviz_str_to_image_format["b8g8r8a8_unorm"]
+                else:
+                    log.warning(f"Unsupported format type: {st.content_type.get_format_type()}")
+
+        specs.append(spec)
+
+    return specs
+
+
+
+class ShmConnection:
+
+    def __init__(self, stream_name: str, cycle_time_ms: int):
+        self.shm_stream_name = stream_name
+        self.cycle_time_ms = cycle_time_ms
+        self.receiver_config = None
+
+    def connect_shm(self):
+        # create SHM Receiver
+        log.info("Discover contents in shared memory")
+        try:
+            self.receiver_config = discover_shm(self.shm_stream_name)
+            return True
+        except Exception as e:
+            log.error(e)
+            return False
+
+    def get_num_streams(self):
+        if self.receiver_config is None:
+            raise RuntimeError("need to connect to shm first")
+        channels_config = self.receiver_config["channels_config"]
+        return len(channels_config["ports"])
+
+    def get_camera_names(self):
+        if self.receiver_config is None:
+            raise RuntimeError("need to connect to shm first")
+        channels_config = self.receiver_config["channels_config"]
+        return channels_config["camera_names"]
+
+    def get_device_contexts(self):
+        if self.receiver_config is None:
+            raise RuntimeError("need to connect to shm first")
+        channels_config = self.receiver_config["channels_config"]
+        return channels_config["device_contexts"]
+
+    def get_max_tensor_size(self, fuse_buffers=False):
+        if self.receiver_config is None:
+            raise RuntimeError("need to connect to shm first")
+        channels_config = self.receiver_config["channels_config"]
+
+        depth_streams_config = []
+        color_streams_config = []
+        max_frame_size = 0
+
+        for channel in channels_config["ports"]:
+            max_frame_size = max(max_frame_size, channel["status"]["bufferInfo"]["frameSize"])
+            if channel["status"]["portType"] == "depthimage":
+                depth_streams_config.append(channel)
+            elif channel["status"]["portType"] == "colorimage":
+                color_streams_config.append(channel)
+
+        fused_positions_size = 0
+        if fuse_buffers:
+            for ch in depth_streams_config:
+                fused_positions_size += ch["status"]["bufferInfo"]["width"] * ch["status"]["bufferInfo"]["height"] * 3 * 4  # sizeof(float) .. maybe use struct module here?
+
+        max_frame_size = max(max_frame_size, fused_positions_size)
+        return max_frame_size
+
+
+    def get_output_specs(self):
+        if self.receiver_config is None:
+            raise RuntimeError("need to connect to shm first")
+        channels_config = self.receiver_config["channels_config"]
+
+        channel_semantic_types = {
+            v['name']: SemanticType(v['status']['bufferInfo']['semanticType']) for v in channels_config['ports']
+        }
+
+        depth_streams_config = []
+        color_streams_config = []
+
+        for channel in channels_config["ports"]:
+            if channel["status"]["portType"] == "depthimage":
+                depth_streams_config.append(channel)
+            elif channel["status"]["portType"] == "colorimage":
+                color_streams_config.append(channel)
+
+        color_output_specs = create_tiled_input_specs(
+            [channel["name"] for channel in color_streams_config],
+            semantic_types=channel_semantic_types,
+        )
+        depth_output_specs = create_tiled_input_specs(
+            [channel["name"] for channel in depth_streams_config],
+        )
+        return {"color_output_specs": color_output_specs,
+                "depth_output_specs": depth_output_specs
+                }
+
+
 class ShmSimpleBackprojectionSubgraph(Subgraph):
     """Subgraph containing the shm-receiver and backprojection pipeline."""
 
-    def __init__(self, fragment, name, fuse_buffers=False, use_extrinsics=True):
+    def __init__(self, fragment, name,
+                 stream_pool = None,
+                 allocator = None,
+                 shm_connection: ShmConnection = None,
+                 fuse_buffers=False,
+                 use_extrinsics=True):
+        self.cuda_stream_pool = stream_pool
+        self.allocator = allocator
+        self.shm_connection = shm_connection
         self.fuse_buffers = fuse_buffers
         self.use_extrinsics = use_extrinsics
         super().__init__(fragment, name)
+
+
 
     def compose(self):
         log.info("Compose subgraph: ShmSimpleBackprojection")
         app = self.fragment.application
 
-        # @todo: do not use app.kwargs directly, but pass the relevant dictionary or subtree to the subgraph explicitly
+        if self.shm_connection is None:
+            raise RuntimeError("needs a shm_connection")
+        if self.shm_connection.receiver_config is None:
+            raise RuntimeError("shm connection needs to be open")
+
+        receiver_config = self.shm_connection.receiver_config
+
+        shm_stream_name = self.shm_connection.shm_stream_name
+        cycle_time_ms = self.shm_connection.cycle_time_ms
 
         # read configuration
         camera_streams_config = app.kwargs("camera_stream_processing")
         cuda_device_id = camera_streams_config.get("device_id", 0)
-        block_memory_buffer_size = camera_streams_config.get("buffer_size", 8)
 
-        shm_config = app.kwargs("shared_memory")
-        shm_stream_name = shm_config.get("stream_name")
-        cycle_time_ms = shm_config.get("cycle_time_ms")
-
-        # create SHM Receiver
-        log.info("Create SHM Receiver")
-        node, shm_receiver = create_shm_subscriber()
-
-        # @todo: for composability, services should be created outside and
-        # populated from within the subgraphs
-
-        log.info("Find cameras in shared memory")
-        camera_names = shm_receiver.discover_devices()
-        device_contexts = {}
-        for camera_name in camera_names:
-            log.info(f"Retrieving camera_info: {camera_name}")
-            ctx = shm_receiver.retrieve_device_context(camera_name)
-            if ctx is not None:
-                device_contexts[camera_name] = ctx
+        shm_receiver = receiver_config["receiver"]
+        camera_names = receiver_config["camera_names"]
+        device_contexts = receiver_config["device_contexts"]
 
         # Register the ctx_service with the fragment
         log.info("Register DeviceContextService")
-        ctx_service = DeviceContextService(device_contexts)
+        ctx_service = DeviceContextService.create(device_contexts)
         app.register_service(ctx_service)
 
         # # create pose tree service for fragment
@@ -114,8 +250,7 @@ class ShmSimpleBackprojectionSubgraph(Subgraph):
         #     pts.tree.set(color_channel_name, depth_channel_name, 0,
         #                  convert_rigid_transform_to_pose3(ctx_service.get_color_to_depth(name)))
 
-        log.info(f"Retrieve channel config for stream: {shm_stream_name}")
-        channels_config = shm_receiver.retrieve_channel_config(shm_stream_name)
+        channels_config = receiver_config["channels_config"]
 
         depth_streams_config = []
         color_streams_config = []
@@ -129,33 +264,21 @@ class ShmSimpleBackprojectionSubgraph(Subgraph):
             elif channel["status"]["portType"] == "colorimage":
                 color_streams_config.append(channel)
 
-        log.info(f"create cuda-stream pool with {num_channels} reserved streams on device {cuda_device_id}")
-        cuda_stream_pool = CudaStreamPool(
-            self,
-            name="cuda_stream_pool",
-            dev_id=cuda_device_id,
-            stream_flags=0,
-            stream_priority=0,
-            reserved_size=num_channels,
-            max_size=256,
-        )
-
-        log.info(f"create device-memory pool with {max_frame_size} bytes, {num_channels * block_memory_buffer_size} blocks on device {cuda_device_id}")
-        device_memory_pool = BlockMemoryPool(
-            self,
-            name="shm_subscriber_device_pool",
-            storage_type=MemoryStorageType.DEVICE,
-            block_size=max_frame_size,
-            num_blocks=num_channels * block_memory_buffer_size,
-            dev_id=cuda_device_id
-        )
 
         log.info(f"create subscriber op {shm_stream_name}")
-        subscriber_op = ShmSubscriberOp(self, cuda_stream_pool, device_memory_pool, shm_receiver, shm_stream_name,
-                                        channels_config, pose_tree_config, cycle_time_ms, name="shm_subscriber")
+        shm_async_condition = AsynchronousCondition(self, name="shm_async_condition")
+        subscriber_op = ShmSubscriberOp(self, self.cuda_stream_pool,
+                                        allocator=self.allocator,
+                                        async_condition=shm_async_condition,
+                                        receiver=shm_receiver,
+                                        stream_name=shm_stream_name,
+                                        cycle_time_ms=cycle_time_ms,
+                                        name="shm_subscriber")
 
         log.info("create stream_splitter op")
-        split_op = StreamSplitterOp(self, cuda_stream_pool, [v["name"] for v in depth_streams_config], name="stream_splitter")
+        split_op = StreamSplitterOp(self, self.cuda_stream_pool,
+                                    channel_names=[v["name"] for v in depth_streams_config],
+                                    name="stream_splitter")
         self.add_flow(subscriber_op, split_op, {("depth_outputs", "receivers")})
 
         log.info("define per depthimage processing pipeline")
@@ -172,8 +295,8 @@ class ShmSimpleBackprojectionSubgraph(Subgraph):
             if camera_streams_config.get("enable_temporal_filter", False):
                 ditf_op = TcnDepthImageTemporalFilterOp(
                     self,
-                    cuda_stream_pool,
-                    allocator=device_memory_pool,
+                    self.cuda_stream_pool,
+                    allocator=self.allocator,
                     in_tensor_name="",
                     out_tensor_name="",
                     cuda_device_ordinal=cuda_device_id,
@@ -189,15 +312,17 @@ class ShmSimpleBackprojectionSubgraph(Subgraph):
             log.info(f"create xylookuptable source: {camera_name}")
             xylt_op = XYLookupTableSourceOp(self,
                                             CountCondition(self, count=1),
+                                            allocator=self.allocator,
                                             name=f"xylt_loader_{camera_name}",
                                             camera_name=camera_name,
                                             )
+            xylt_op.set_device_context_service(ctx_service)
 
             log.info(f"create backprojection: {camera_name}")
             bp_op = TcnDepthImageBackprojectionOp(
                 self,
-                cuda_stream_pool,
-                allocator=device_memory_pool,
+                self.cuda_stream_pool,
+                allocator=self.allocator,
                 color_image_width=color_params.dimensions.x,
                 color_image_height=color_params.dimensions.y,
                 color_params=ctx_service.get_color_camera_model(camera_name),
@@ -226,17 +351,23 @@ class ShmSimpleBackprojectionSubgraph(Subgraph):
         # merge Pointclouds
         position_merge_inputs = list({list(v[1])[0][1] for v in position_merge_connections})
         log.info(f"Merge Position Streams: {position_merge_inputs}")
-        position_merge_op = StreamMergerOp(self, cuda_stream_pool, position_merge_inputs,
-                                           "output", "positions",
-                                           self.fuse_buffers, name="point_fusion")
+        position_merge_op = StreamMergerOp(self, self.cuda_stream_pool,
+                                           input_port_names=position_merge_inputs,
+                                           input_message_name="output",
+                                           output_message_name="positions",
+                                           fuse_buffers=self.fuse_buffers,
+                                           name="point_fusion")
         for op, conn in position_merge_connections:
             self.add_flow(op, position_merge_op, conn)
 
         texcoord_merge_inputs = list({list(v[1])[0][1] for v in texcoord_merge_connections})
         log.info(f"Merge Texcoord Streams: {texcoord_merge_inputs}")
-        texcoord_merge_op = StreamMergerOp(self, cuda_stream_pool, texcoord_merge_inputs,
-                                           "output", "texcoords",
-                                           self.fuse_buffers, name="texcoord_fusion")
+        texcoord_merge_op = StreamMergerOp(self, self.cuda_stream_pool,
+                                           input_port_names=texcoord_merge_inputs,
+                                           input_message_name="output",
+                                           output_message_name="texcoords",
+                                           fuse_buffers=self.fuse_buffers,
+                                           name="texcoord_fusion")
         for op, conn in texcoord_merge_connections:
             self.add_flow(op, texcoord_merge_op, conn)
 

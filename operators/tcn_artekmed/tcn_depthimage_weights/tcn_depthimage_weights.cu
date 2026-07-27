@@ -163,7 +163,6 @@ void TcnDepthImageWeightsOp::compute(holoscan::InputContext& op_input,
   compute_weights_u16_kernel<<<grid, block, 0, cuda_stream>>>(params);
 
   auto weights_buffer_message = holoscan::gxf::Entity(std::move(weights_buffer_entity));
-  // op_output.set_cuda_stream(cuda_stream, "output");
   op_output.emit(weights_buffer_message, "output");
 
 }

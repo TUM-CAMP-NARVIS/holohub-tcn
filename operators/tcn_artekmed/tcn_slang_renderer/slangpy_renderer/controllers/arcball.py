@@ -1,23 +1,11 @@
 """
-ArcBall Camera Controller for Holoscan applications.
+ArcBall Camera Controller - Pure numpy implementation without Holoscan dependencies.
 
-Based on the Magnum ArcBall implementation, adapted to use Holoscan's
-Pose3 and SO3 components from the pose_tree module.
-
-Original implementation:
-- Magnum Graphics Library (https://magnum.graphics/)
-- Modified by Ulrich Eck (ulrich.eck@tum.de)
-
-This Python adaptation uses:
-- holoscan.pose_tree.Pose3 for camera transformations
-- holoscan.pose_tree.SO3 for rotations (quaternions)
-- numpy for vector/matrix operations
+Based on the Magnum ArcBall implementation, adapted to use pure numpy for all operations.
 """
 
 import numpy as np
 from typing import Tuple, Optional
-from holoscan.pose_tree import Pose3, SO3
-from operators.tcn_artekmed.tcn_util.helpers import pose3_to_matrix4x4
 import logging
 
 log = logging.getLogger(__name__)
@@ -58,22 +46,22 @@ class ArcBall:
 
         # Target transformations (where camera is moving to)
         self._target_position = np.zeros(3, dtype=np.float32)
-        self._target_rotation : SO3 = SO3()
+        self._target_rotation = np.array([0, 0, 0, 1], dtype=np.float32)  # quaternion [x, y, z, w]
         self._target_zooming = 0.0
 
         # Current transformations (interpolated)
         self._current_position = np.zeros(3, dtype=np.float32)
-        self._current_rotation : SO3 = SO3()
+        self._current_rotation = np.array([0, 0, 0, 1], dtype=np.float32)
         self._current_zooming = 0.0
 
         # Initial transformations (for reset)
         self._position_t0 = np.zeros(3, dtype=np.float32)
-        self._rotation_t0 : SO3 = SO3()
+        self._rotation_t0 = np.array([0, 0, 0, 1], dtype=np.float32)
         self._zooming_t0 = 0.0
 
         # View transformations
-        self._view : Pose3 = Pose3()
-        self._inverse_view : Pose3 = Pose3()
+        self._view_matrix = np.eye(4, dtype=np.float32)
+        self._inverse_view_matrix = np.eye(4, dtype=np.float32)
 
         # Initialize camera parameters
         self.set_view_parameters(camera_position, view_center, up_dir)
@@ -107,18 +95,18 @@ class ArcBall:
         # Create rotation matrix (column vectors) Left-Handed CS
         rotation_matrix = np.column_stack([x_axis, y_axis, -z_axis])
 
-        # Convert rotation matrix to quaternion using SO3
-        self._target_rotation = self._matrix_to_so3(rotation_matrix.T)
+        # Convert rotation matrix to quaternion
+        self._target_rotation = self._matrix_to_quaternion(rotation_matrix.T)
         self._target_position = -view_center
         self._target_zooming = -np.linalg.norm(direction)
 
         # Initialize current and initial states
         self._current_position = self._target_position.copy()
-        self._current_rotation = SO3.from_quaternion(self._target_rotation.quaternion)
+        self._current_rotation = self._target_rotation.copy()
         self._current_zooming = self._target_zooming
 
         self._position_t0 = self._target_position.copy()
-        self._rotation_t0 = SO3.from_quaternion(self._target_rotation.quaternion)
+        self._rotation_t0 = self._target_rotation.copy()
         self._zooming_t0 = self._target_zooming
 
         self._update_internal_transformations()
@@ -126,7 +114,7 @@ class ArcBall:
     def reset(self):
         """Reset camera to initial position, view center, and up direction."""
         self._target_position = self._position_t0.copy()
-        self._target_rotation = SO3.from_quaternion(self._rotation_t0.quaternion)
+        self._target_rotation = self._rotation_t0.copy()
         self._target_zooming = self._zooming_t0
 
     def reshape(self, window_size: Tuple[int, int]):
@@ -165,7 +153,6 @@ class ArcBall:
         Args:
             mouse_pos: Current screen coordinates (x, y)
         """
-        # log.info(f"Rotating camera with mouse position: {mouse_pos}")
         mouse_pos_ndc = self._screen_coord_to_ndc(mouse_pos)
 
         current_q = self._ndc_to_arcball(mouse_pos_ndc)
@@ -173,15 +160,13 @@ class ArcBall:
         self._prev_mouse_pos_ndc = mouse_pos_ndc
 
         # Compose rotations: current * prev * target
-        # Convert to SO3 for composition
         q_rotation = self._quaternion_multiply(
             self._quaternion_multiply(current_q, prev_q),
-            self._target_rotation.quaternion
+            self._target_rotation
         )
         q_rotation = q_rotation / np.linalg.norm(q_rotation)
-        # log.info(f"Rotating camera: {q_rotation}, current_q: {current_q}, prev_q: {prev_q}")
 
-        self._target_rotation = SO3.from_quaternion(q_rotation)
+        self._target_rotation = q_rotation
 
     def translate(self, mouse_pos: Tuple[int, int]):
         """
@@ -190,7 +175,6 @@ class ArcBall:
         Args:
             mouse_pos: Current screen coordinates (x, y)
         """
-        # log.info(f"Translating camera with mouse position: {mouse_pos}")
         mouse_pos_ndc = self._screen_coord_to_ndc(mouse_pos)
         translation_ndc = mouse_pos_ndc - self._prev_mouse_pos_ndc
         self._prev_mouse_pos_ndc = mouse_pos_ndc
@@ -215,8 +199,9 @@ class ArcBall:
         ], dtype=np.float32)
 
         # Apply inverse view rotation to get world-space translation
-        rotation_matrix = self._inverse_view.rotation.matrix()
-        translation_world = rotation_matrix @ translation_world
+        rotation_matrix = self._quaternion_to_matrix(self._current_rotation)
+        inv_rotation = rotation_matrix.T  # Transpose for inverse of rotation matrix
+        translation_world = inv_rotation @ translation_world
 
         self._target_position += translation_world
 
@@ -238,7 +223,7 @@ class ArcBall:
         """
         # Compute differences
         diff_position = self._target_position - self._current_position
-        diff_rotation_q = self._target_rotation.quaternion - self._current_rotation.quaternion
+        diff_rotation_q = self._target_rotation - self._current_rotation
         diff_zooming = self._target_zooming - self._current_zooming
 
         d_position = np.dot(diff_position, diff_position)
@@ -252,7 +237,7 @@ class ArcBall:
         # Nearly done: jump directly to target
         if d_position < 1.0e-6 and d_rotation < 1.0e-6 and d_zooming < 1.0e-6:
             self._current_position = self._target_position.copy()
-            self._current_rotation = SO3.from_quaternion(self._target_rotation.quaternion)
+            self._current_rotation = self._target_rotation.copy()
             self._current_zooming = self._target_zooming
         else:
             # Interpolate between current and target
@@ -260,8 +245,8 @@ class ArcBall:
             self._current_position = self._lerp(self._current_position, self._target_position, t)
             self._current_zooming = self._lerp(self._current_zooming, self._target_zooming, t)
             self._current_rotation = self._slerp(
-                self._current_rotation.quaternion,
-                self._target_rotation.quaternion,
+                self._current_rotation,
+                self._target_rotation,
                 t
             )
 
@@ -272,47 +257,34 @@ class ArcBall:
         """Return distance from camera position to view center."""
         return abs(self._target_zooming)
 
-    @property
-    def view(self) -> Pose3:
-        """Get camera's view transformation as Pose3."""
-        return self._view
-
-    @property
-    def transformation(self) -> Pose3:
-        """Get camera's transformation (inverse view) as Pose3."""
-        return self._inverse_view
-
     def view_matrix(self) -> np.ndarray:
         """Get camera's view matrix (4x4)."""
-        # log.info(self._inverse_view)
-        return pose3_to_matrix4x4(self._view)
+        return self._view_matrix.copy()
 
     def inverse_view_matrix(self) -> np.ndarray:
         """Get camera's inverse view matrix (4x4)."""
-        return pose3_to_matrix4x4(self._inverse_view)
-
-    def transformation_matrix(self) -> np.ndarray:
-        """Get camera's transformation matrix (4x4)."""
-        return pose3_to_matrix4x4(self._inverse_view)
+        return self._inverse_view_matrix.copy()
 
     # Private helper methods
 
     def _update_internal_transformations(self):
         """Update the internal view and inverse view transformations."""
         # Build view transformation: T(zoom) * R(rotation) * T(position)
-        # Using Pose3 composition
 
-        zoom_translation = np.array([0, 0, self._current_zooming], dtype=np.float32)
+        # Create translation matrices
+        t_position = np.eye(4, dtype=np.float32)
+        t_position[:3, 3] = self._current_position
 
-        # Create poses for composition
-        t_zoom = Pose3.from_translation(zoom_translation)
-        r_rotation = Pose3(self._current_rotation, np.zeros(3, dtype=np.float32))
-        t_position = Pose3.from_translation(self._current_position)
+        t_zoom = np.eye(4, dtype=np.float32)
+        t_zoom[2, 3] = self._current_zooming
 
-        # Compose: view = t_zoom * r_rotation * t_position
-        self._view = t_zoom @ r_rotation @ t_position
-        self._inverse_view = self._view.inverse()
-        log.debug(f"Updated view transformation: {self._view}")
+        # Create rotation matrix from quaternion
+        r_rotation = np.eye(4, dtype=np.float32)
+        r_rotation[:3, :3] = self._quaternion_to_matrix(self._current_rotation)
+
+        # Compose: view = t_zoom @ r_rotation @ t_position
+        self._view_matrix = t_zoom @ r_rotation @ t_position
+        self._inverse_view_matrix = np.linalg.inv(self._view_matrix)
 
     def _screen_coord_to_ndc(self, mouse_pos: Tuple[int, int]) -> np.ndarray:
         """
@@ -349,19 +321,70 @@ class ArcBall:
         proj = p / np.linalg.norm(p)
         return np.array([proj[0], proj[1], 0.0, 0.0], dtype=np.float32)
 
-    def _matrix_to_so3(self, rotation_matrix: np.ndarray) -> SO3:
+    def _matrix_to_quaternion(self, rotation_matrix: np.ndarray) -> np.ndarray:
         """
-        Convert a 3x3 rotation matrix to SO3.
+        Convert a 3x3 rotation matrix to quaternion [x, y, z, w].
 
         Args:
             rotation_matrix: 3x3 rotation matrix
 
         Returns:
-            SO3 rotation
+            Quaternion [x, y, z, w]
         """
-        # Convert to quaternion using standard algorithm
-        # Based on: https://www.euclideanspace.com/maths/geometry/rotations/conversions/matrixToQuaternion/
-        return SO3.from_matrix(rotation_matrix)
+        m = rotation_matrix
+        trace = m[0, 0] + m[1, 1] + m[2, 2]
+
+        if trace > 0:
+            s = 0.5 / np.sqrt(trace + 1.0)
+            w = 0.25 / s
+            x = (m[2, 1] - m[1, 2]) * s
+            y = (m[0, 2] - m[2, 0]) * s
+            z = (m[1, 0] - m[0, 1]) * s
+        elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+            s = 2.0 * np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2])
+            w = (m[2, 1] - m[1, 2]) / s
+            x = 0.25 * s
+            y = (m[0, 1] + m[1, 0]) / s
+            z = (m[0, 2] + m[2, 0]) / s
+        elif m[1, 1] > m[2, 2]:
+            s = 2.0 * np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2])
+            w = (m[0, 2] - m[2, 0]) / s
+            x = (m[0, 1] + m[1, 0]) / s
+            y = 0.25 * s
+            z = (m[1, 2] + m[2, 1]) / s
+        else:
+            s = 2.0 * np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1])
+            w = (m[1, 0] - m[0, 1]) / s
+            x = (m[0, 2] + m[2, 0]) / s
+            y = (m[1, 2] + m[2, 1]) / s
+            z = 0.25 * s
+
+        return np.array([x, y, z, w], dtype=np.float32)
+
+    def _quaternion_to_matrix(self, q: np.ndarray) -> np.ndarray:
+        """
+        Convert quaternion to 3x3 rotation matrix.
+
+        Args:
+            q: Quaternion [x, y, z, w]
+
+        Returns:
+            3x3 rotation matrix
+        """
+        x, y, z, w = q
+
+        m = np.zeros((3, 3), dtype=np.float32)
+        m[0, 0] = 1 - 2*y*y - 2*z*z
+        m[0, 1] = 2*x*y - 2*z*w
+        m[0, 2] = 2*x*z + 2*y*w
+        m[1, 0] = 2*x*y + 2*z*w
+        m[1, 1] = 1 - 2*x*x - 2*z*z
+        m[1, 2] = 2*y*z - 2*x*w
+        m[2, 0] = 2*x*z - 2*y*w
+        m[2, 1] = 2*y*z + 2*x*w
+        m[2, 2] = 1 - 2*x*x - 2*y*y
+
+        return m
 
     @staticmethod
     def _quaternion_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
@@ -391,7 +414,7 @@ class ArcBall:
         return a * (1.0 - t) + b * t
 
     @staticmethod
-    def _slerp(q1: np.ndarray, q2: np.ndarray, t: float) -> SO3:
+    def _slerp(q1: np.ndarray, q2: np.ndarray, t: float) -> np.ndarray:
         """
         Spherical linear interpolation between two quaternions (shortest path).
 
@@ -401,7 +424,7 @@ class ArcBall:
             t: Interpolation parameter [0, 1]
 
         Returns:
-            Interpolated SO3 rotation
+            Interpolated quaternion
         """
         # Normalize inputs
         q1 = q1 / np.linalg.norm(q1)
@@ -419,7 +442,7 @@ class ArcBall:
         if dot > 0.9995:
             result = q1 + t * (q2 - q1)
             result = result / np.linalg.norm(result)
-            return SO3.from_quaternion(result)
+            return result
 
         # Standard slerp
         dot = np.clip(dot, -1.0, 1.0)
@@ -431,4 +454,4 @@ class ArcBall:
 
         result = w1 * q1 + w2 * q2
         result = result / np.linalg.norm(result)
-        return SO3.from_quaternion(result)
+        return result

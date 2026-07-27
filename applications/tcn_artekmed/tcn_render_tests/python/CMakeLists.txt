@@ -25,6 +25,10 @@ target_link_libraries(tcn_render_tests INTERFACE
     holoscan::core
     holoscan::ops::format_converter
     holoscan::ops::holoviz
+    holoscan::ops::tcn_shm_subscriber
+    holoscan::ops::tcn_device_context
+    holoscan::ops::tcn_stream_splitter
+    holoscan::ops::tcn_stream_merger
     holoscan::ops::tcn_depthimage_backprojection
     holoscan::ops::tcn_depthimage_temporal_filter
     holoscan::ops::tcn_texture_sampler

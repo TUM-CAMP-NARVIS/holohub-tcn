@@ -4,7 +4,8 @@
 import logging
 import os
 from argparse import ArgumentParser
-import threading
+import math
+
 import iceoryx2 as iox2
 
 import numpy as np
@@ -15,14 +16,25 @@ from holohub.tcn_depthimage_weights import TcnDepthImageWeightsOp
 from holohub.tcn_texture_sampler import TcnTextureSamplerOp
 from holohub.tcn_depthimage_backprojection._tcn_depthimage_backprojection import CameraModel, DistortionType, \
     RigidTransform, CameraParameters, make_rigid_transform
-from operators.tcn_artekmed.tcn_shm_io import (ShmSubscriberOp, DeviceContextService, XYLookupTableSourceOp,
-                                               create_shm_subscriber)
-# from operators.tcn_artekmed.tcn_shm_io import ParameterRpcServer
-from operators.tcn_artekmed.tcn_util import (StreamSplitterOp, StreamMergerOp, FlattenTensorOp,
-                                             DepthImageMaxDistanceOp, DepthImageForegroundBackgroundMaskOp,
-                                             DepthImageApplyMaskOp )
 
-from holoscan.conditions import CountCondition
+from holohub.tcn_shm_subscriber import TcnShmSubscriberOp as ShmSubscriberOp
+from holohub.tcn_shm_subscriber._tcn_shm_subscriber import discover_shm
+from holohub.tcn_device_context import XYLookupTableSourceOp
+from holohub.tcn_device_context._tcn_device_context import DeviceContextService
+from holohub.tcn_stream_splitter import TcnStreamSplitterOp as StreamSplitterOp
+from holohub.tcn_stream_merger import TcnStreamMergerOp as StreamMergerOp
+from holohub.tcn_flatten_tensor import TcnFlattenTensorOp as FlattenTensorOp
+from holohub.tcn_depthimage_max_distance import TcnDepthImageMaxDistanceOp
+from holohub.tcn_depthimage_fgbg_mask import TcnDepthImageFgbgMaskOp as DepthImageForegroundBackgroundMaskOp
+from holohub.tcn_depthimage_apply_mask import TcnDepthImageApplyMaskOp as DepthImageApplyMaskOp
+# from operators.tcn_artekmed.tcn_shm_io import (ShmSubscriberOp, DeviceContextService, XYLookupTableSourceOp,
+#                                                create_shm_subscriber)
+# from operators.tcn_artekmed.tcn_shm_io import ParameterRpcServer
+# from operators.tcn_artekmed.tcn_util import (StreamSplitterOp, StreamMergerOp, FlattenTensorOp,
+#                                              DepthImageMaxDistanceOp, DepthImageForegroundBackgroundMaskOp,
+#                                              DepthImageApplyMaskOp )
+
+from holoscan.conditions import AsynchronousCondition, CountCondition
 from holoscan.core import Operator, OperatorSpec, Tracker
 from holoscan.logger import LogLevel, set_log_level
 from holoscan.operators import HolovizOp
@@ -52,6 +64,44 @@ def convert_rigid_transform_to_pose3(input: RigidTransform) -> Pose3:
     return Pose3(r, input.translation)
 
 
+def create_tiled_input_specs(
+    tensor_names,
+    input_type=HolovizOp.InputType.COLOR,
+    semantic_types=None,
+    semantic_key=None,
+):
+    grid_size = int(math.ceil(math.sqrt(len(tensor_names)))) if tensor_names else 1
+    tile_size = 1.0 / grid_size
+
+    specs = []
+    for i, tensor_name in enumerate(tensor_names):
+        row = i // grid_size
+        col = i % grid_size
+
+        spec = HolovizOp.InputSpec(tensor_name, input_type)
+        view = HolovizOp.InputSpec.View()
+        view.offset_x = col * tile_size
+        view.offset_y = row * tile_size
+        view.width = tile_size
+        view.height = tile_size
+        spec.views = [view]
+
+        if semantic_types is not None:
+            key = semantic_key(tensor_name) if semantic_key is not None else tensor_name
+            st = semantic_types.get(key)
+            if st is not None:
+                if st.content_type.get_format_type() == ImageFormatTypes.Rgba:
+                    spec.image_format = holoviz._holoviz_str_to_image_format["r8g8b8a8_unorm"]
+                elif st.content_type.get_format_type() == ImageFormatTypes.Bgra:
+                    spec.image_format = holoviz._holoviz_str_to_image_format["b8g8r8a8_unorm"]
+                else:
+                    log.warning(f"Unsupported format type: {st.content_type.get_format_type()}")
+
+        specs.append(spec)
+
+    return specs
+
+
 
 class DummySinkOp(Operator):
     def __init__(self, *args, **kwargs):
@@ -76,8 +126,6 @@ class PointCloudDummySinkOp(Operator):
     def compute(self, op_input, op_output, context):
         sig1 = op_input.receive("positions")
         sig2 = op_input.receive("texcoords")
-        # print("received positions and texcoords")
-        import pdb;pdb.set_trace()
 
 class App(hs.core.Application):
     def compose(self):
@@ -95,19 +143,15 @@ class App(hs.core.Application):
         shm_stream_name = shm_config.get("stream_name")
         cycle_time_ms = shm_config.get("cycle_time_ms")
 
-        node, shm_receiver = create_shm_subscriber()
-
-        log.info("Find cameras in shared memory")
-        camera_names = shm_receiver.discover_devices()
-        device_contexts = {}
-        for camera_name in camera_names:
-            log.info(f"Retrieving camera_info: {camera_name}")
-            ctx = shm_receiver.retrieve_device_context(camera_name)
-            if ctx is not None:
-                device_contexts[camera_name] = ctx
+        log.info("Discover contents in shared memory")
+        receiver_config = discover_shm(shm_stream_name)
+        shm_receiver = receiver_config["receiver"]
+        camera_names = receiver_config["camera_names"]
+        device_contexts = receiver_config["device_contexts"]
+        channels_config = receiver_config["channels_config"]
 
         # Register the ctx_service with the fragment
-        ctx_service = DeviceContextService(device_contexts)
+        ctx_service = DeviceContextService.create(device_contexts)
         self.register_service(ctx_service)
 
         # # create pose tree service for fragment
@@ -134,7 +178,6 @@ class App(hs.core.Application):
         #     pose_tree_config["edges"].append((color_channel_name, depth_channel_name, convert_rigid_transform_to_pose3(ctx_service.get_color_to_depth(name))))
 
         log.info(f"Retrieve channel config for stream: {shm_stream_name}")
-        channels_config = shm_receiver.retrieve_channel_config(shm_stream_name)
         channel_semantic_types = {
             v['name']: SemanticType(v['status']['bufferInfo']['semanticType']) for v in channels_config['ports']
         }
@@ -150,6 +193,14 @@ class App(hs.core.Application):
                 depth_streams_config.append(channel)
             elif channel["status"]["portType"] == "colorimage":
                 color_streams_config.append(channel)
+
+        color_output_specs = create_tiled_input_specs(
+            [channel["name"] for channel in color_streams_config],
+            semantic_types=channel_semantic_types,
+        )
+        depth_output_specs = create_tiled_input_specs(
+            [channel["name"] for channel in depth_streams_config],
+        )
 
         fused_positions_size = 0
         for ch in depth_streams_config:
@@ -179,11 +230,19 @@ class App(hs.core.Application):
         )
 
         log.info(f"create subscriber op {shm_stream_name}")
-        subscriber_op = ShmSubscriberOp(self, cuda_stream_pool, device_memory_pool, shm_receiver,
-                                        shm_stream_name, channels_config, pose_tree_config, 10, name="shm_subscriber")
+        shm_async_condition = AsynchronousCondition(self, name="shm_async_condition")
+        subscriber_op = ShmSubscriberOp(self, cuda_stream_pool,
+                                        allocator=device_memory_pool,
+                                        async_condition=shm_async_condition,
+                                        receiver=shm_receiver,
+                                        stream_name=shm_stream_name,
+                                        cycle_time_ms=10,
+                                        name="shm_subscriber")
 
         log.info("create stream_splitter op")
-        split_op = StreamSplitterOp(self, cuda_stream_pool, [v["name"] for v in depth_streams_config], name="stream_splitter")
+        split_op = StreamSplitterOp(self, cuda_stream_pool,
+                                    channel_names=[v["name"] for v in depth_streams_config],
+                                    name="stream_splitter")
         log.debug("Flow: subscriber_op -> split_op (depth_outputs -> receivers)")
         self.add_flow(subscriber_op, split_op, {("depth_outputs", "receivers")})
 
@@ -216,34 +275,7 @@ class App(hs.core.Application):
         weights_visualizer = None
         if debug_output_config.get("enable_weights", False):
             log.info("create weights debug-view")
-            # configure weights debug viewer
-            num_weights = len(camera_names)
-            # Determine grid size (e.g., 2 for 2x2, 3 for 3x3)
-            weights_grid_size = int(np.ceil(np.sqrt(num_weights))) if num_weights > 0 else 1
-            weights_tile_size = 1.0 / weights_grid_size
-
-            weights_output_specs = []
-            for i, camera_name in enumerate(camera_names):
-                # Compute row and column index
-                row = i // weights_grid_size
-                col = i % weights_grid_size
-
-                # Compute normalized offsets (0.0 to 1.0)
-                # Note: Holoviz usually uses (x, y) for offsets
-                offset_x = col * weights_tile_size
-                offset_y = row * weights_tile_size
-
-                spec = HolovizOp.InputSpec(camera_name, HolovizOp.InputType.COLOR)
-                views = []
-                view = HolovizOp.InputSpec.View()
-                view.offset_x = offset_x
-                view.offset_y = offset_y
-                view.width = weights_tile_size
-                view.height = weights_tile_size
-                views.append(view)
-                spec.views = views
-                #spec.color = [1.0, 0.0, 0.0, 1.0]
-                weights_output_specs.append(spec)
+            weights_output_specs = create_tiled_input_specs(camera_names)
 
             weights_visualizer = HolovizOp(
                 self,
@@ -257,40 +289,11 @@ class App(hs.core.Application):
         warped_color_visualizer = None
         if debug_output_config.get("enable_warped_color", False):
             log.info("create warped_color debug-view")
-            # configure warped_color debug viewer
-            num_warped_color = len(camera_names)
-            # Determine grid size (e.g., 2 for 2x2, 3 for 3x3)
-            warped_color_grid_size = int(np.ceil(np.sqrt(num_warped_color))) if num_warped_color > 0 else 1
-            warped_color_tile_size = 1.0 / warped_color_grid_size
-
-            warped_color_output_specs = []
-            for i, camera_name in enumerate(camera_names):
-                # Compute row and column index
-                row = i // warped_color_grid_size
-                col = i % warped_color_grid_size
-
-                # Compute normalized offsets (0.0 to 1.0)
-                # Note: Holoviz usually uses (x, y) for offsets
-                offset_x = col * warped_color_tile_size
-                offset_y = row * warped_color_tile_size
-
-                spec = HolovizOp.InputSpec(camera_name, HolovizOp.InputType.COLOR)
-                views = []
-                view = HolovizOp.InputSpec.View()
-                view.offset_x = offset_x
-                view.offset_y = offset_y
-                view.width = warped_color_tile_size
-                view.height = warped_color_tile_size
-                views.append(view)
-                spec.views = views
-                st = channel_semantic_types[f"{camera_name}_colorimage"]
-                if st.content_type.get_format_type() == ImageFormatTypes.Rgba:
-                    spec.image_format = holoviz._holoviz_str_to_image_format["r8g8b8a8_unorm"]
-                elif st.content_type.get_format_type() == ImageFormatTypes.Bgra:
-                    spec.image_format = holoviz._holoviz_str_to_image_format["b8g8r8a8_unorm"]
-                else:
-                    log.warning(f"Unsupported format type: {st.content_type.get_format_type()}")
-                warped_color_output_specs.append(spec)
+            warped_color_output_specs = create_tiled_input_specs(
+                camera_names,
+                semantic_types=channel_semantic_types,
+                semantic_key=lambda camera_name: f"{camera_name}_colorimage",
+            )
 
             warped_color_visualizer = HolovizOp(
                 self,
@@ -384,11 +387,14 @@ class App(hs.core.Application):
 
 
             log.info(f"create xylookuptable source: {camera_name}")
+            xylt_count_cond = CountCondition(self, count=1)
             xylt_op = XYLookupTableSourceOp(self,
-                                            CountCondition(self, count=1),
+                                            xylt_count_cond,
+                                            allocator=device_memory_pool,
                                             name=f"xylt_loader_{camera_name}",
                                             camera_name=camera_name,
                                             )
+            xylt_op.set_device_context_service(ctx_service) # shouldn't this be done via service lookukp?
             sink_ops.append(xylt_op)
 
             log.info(f"create backprojection: {camera_name}")
@@ -496,16 +502,22 @@ class App(hs.core.Application):
         # merge Pointclouds
         merge_inputs = list({list(v[1])[0][1] for v in position_merge_connections})
         log.info(f"Merge Position Streams: {merge_inputs}")
-        position_merge_op = StreamMergerOp(self, cuda_stream_pool, merge_inputs, "output", "positions", True, allocator=device_memory_pool, name="point_fusion")
+        position_merge_op = StreamMergerOp(self, cuda_stream_pool,
+                                           input_port_names=merge_inputs,
+                                           input_message_name="output",
+                                           output_message_name="positions",
+                                           fuse_buffers=True,
+                                           allocator=device_memory_pool,
+                                           name="point_fusion")
         for op, conn in position_merge_connections:
             log.debug(f"Flow: {op.name} -> position_merge_op [point_fusion] {conn}")
             self.add_flow(op, position_merge_op, conn)
 
         flt_op = FlattenTensorOp(
             self,
-            cuda_stream_pool,
             message_name="positions",
             allocator=device_memory_pool,
+            cuda_stream_pool=cuda_stream_pool,
             name=f"flatten_pointcloud",
         )
         log.debug("Flow: position_merge_op [point_fusion] -> flt_op [flatten_pointcloud] (output -> input)")
@@ -537,6 +549,7 @@ class App(hs.core.Application):
             color_visualizer = HolovizOp(
                 self,
                 name="color_visualizer",
+                tensors=color_output_specs,
                 allocator=device_memory_pool,
                 cuda_stream_pool=cuda_stream_pool,
                 **self.kwargs("color_holoviz"),
@@ -544,8 +557,6 @@ class App(hs.core.Application):
 
             log.debug("Flow: subscriber_op -> color_visualizer (color_outputs -> receivers)")
             self.add_flow(subscriber_op, color_visualizer, {("color_outputs", "receivers")})
-            log.debug("Flow: subscriber_op -> color_visualizer (color_output_specs -> input_specs)")
-            self.add_flow(subscriber_op, color_visualizer, {("color_output_specs", "input_specs")})
         else:
             # need a consumer for color_images
             ci_sink = DummySinkOp(self, name="color_image_sink")
@@ -557,6 +568,7 @@ class App(hs.core.Application):
             depth_visualizer = HolovizOp(
                 self,
                 name="depth_visualizer",
+                tensors=depth_output_specs,
                 allocator=device_memory_pool,
                 cuda_stream_pool=cuda_stream_pool,
                 **self.kwargs("depth_holoviz"),
@@ -564,8 +576,6 @@ class App(hs.core.Application):
 
             log.debug("Flow: subscriber_op -> depth_visualizer (depth_outputs -> receivers)")
             self.add_flow(subscriber_op, depth_visualizer, {("depth_outputs", "receivers")})
-            log.debug("Flow: subscriber_op -> depth_visualizer (depth_output_specs -> input_specs)")
-            self.add_flow(subscriber_op, depth_visualizer, {("depth_output_specs", "input_specs")})
 
 
         # rpc_service_name = shm_config.get("parameter_rpc_name", "holohub")

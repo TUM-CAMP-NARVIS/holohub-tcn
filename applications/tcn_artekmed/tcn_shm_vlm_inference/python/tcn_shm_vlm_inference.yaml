@@ -12,8 +12,9 @@ shared_memory:
 camera_stream_processing:
   device_id: 0
   buffer_size: 8
-  enable_da2: False
-  enable_langsam: True
+  enable_da2: True
+  enable_da3: True
+  enable_langsam: False
 
 
 # Depth Anything V2 Example
@@ -31,9 +32,33 @@ da2_preprocessor:
 da2_inference:
   backend: "trt"
   pre_processor_map:
-    "depth": ["preprocessed"]
+    "depth_v2": ["preprocessed"]
   inference_map:
-    "depth": ["inference_output"]
+    "depth_v2": ["inference_output"]
+  input_on_cuda: true
+  is_engine_path: false
+
+# Depth Anything V3 Example
+da3_inference_config:
+  model_path: "/srv/models/active/depth_anything_v3/4010e39f3634a45bc60553321fb49fb760bd594e.onnx"
+  # Metric depth display range in meters (colorized: near -> red, far -> blue)
+  depth_near: 0.3
+  depth_far: 10.0
+
+da3_preprocessor:
+  out_tensor_name: preprocessed
+  out_dtype: "float32"
+  resize_width: 518
+  resize_height: 518
+  scale_min: 0.0
+  scale_max: 1.0
+
+da3_inference:
+  backend: "trt"
+  pre_processor_map:
+    "depth_v3": ["preprocessed"]
+  inference_map:
+    "depth_v3": ["inference_output"]
   input_on_cuda: true
   is_engine_path: false
 
@@ -67,6 +92,14 @@ resources:
   gpuMemory: 1Gi
 
 holoviz:
+  width: 518
+  height: 518
+
+da2_holoviz:
+  width: 518
+  height: 518
+
+da3_holoviz:
   width: 518
   height: 518
 

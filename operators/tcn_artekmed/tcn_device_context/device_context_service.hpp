@@ -25,6 +25,8 @@
 
 #include <gxf/multimedia/camera.hpp>
 
+#include <holoscan/core/fragment_service.hpp>
+
 #include "../common/datatypes.hpp"
 #include "../tcn_shm_subscriber/shm_synchronized_buffer_receiver.hpp"
 
@@ -45,7 +47,7 @@ namespace tcn::ops {
  * this is a plain C++ class since Holoscan C++ SDK does not expose
  * a fragment service base class.
  */
-class DeviceContextService {
+class DeviceContextService : public holoscan::DefaultFragmentService {
 public:
     DeviceContextService() = default;
 

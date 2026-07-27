@@ -300,6 +300,7 @@ std::vector<ChannelPortInfo> ShmSynchronizedBufferReceiver::retrieve_channel_con
                 info.height = buffer_info.getHeight();
                 info.bits_per_element = buffer_info.getBitsPerElement();
                 info.frame_size = buffer_info.getFrameSize();
+                info.semantic_type = buffer_info.getSemanticType();
 
                 auto pt = status.getPortType();
                 if (pt == artekmed::schema::CameraPortType::DEPTHIMAGE) {

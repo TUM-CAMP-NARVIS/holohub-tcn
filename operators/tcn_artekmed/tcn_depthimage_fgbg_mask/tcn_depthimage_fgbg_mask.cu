@@ -81,12 +81,8 @@ void TcnDepthImageFgbgMaskOp::compute(holoscan::InputContext& op_input,
     }
 
     // Synchronize input streams
-    cudaStream_t depth_stream = op_input.receive_cuda_stream("depth_image", false, false);
-    cudaStream_t bg_stream = op_input.receive_cuda_stream("background_image", false, false);
-    cudaStream_t out_stream = context.allocate_cuda_stream(
-        (std::string(name()) + "_fgbg_mask_stream").c_str()).value();
-    context.synchronize_streams(
-        std::vector<std::optional<cudaStream_t>>{depth_stream, bg_stream}, out_stream);
+    cudaStream_t cuda_stream = op_input.receive_cuda_stream("depth_image", false, false);
+    op_input.receive_cuda_stream("background_image", false, false);
 
     const auto& shape = depth_tensor->shape();
     std::vector<int32_t> shape_dims;
@@ -108,13 +104,13 @@ void TcnDepthImageFgbgMaskOp::compute(holoscan::InputContext& op_input,
         buffer_num_elements_ = num_elements;
 
         if (!tcn::allocate_tensor<uint8_t>(
-                allocator.value(), out_stream, gxf_shape,
+                allocator.value(), cuda_stream, gxf_shape,
                 nvidia::gxf::MemoryStorageType::kDevice,
                 fg_buffer_, true)) {
             throw std::runtime_error("Failed to allocate fg_buffer.");
         }
         if (!tcn::allocate_tensor<uint8_t>(
-                allocator.value(), out_stream, gxf_shape,
+                allocator.value(), cuda_stream, gxf_shape,
                 nvidia::gxf::MemoryStorageType::kDevice,
                 bg_buffer_, true)) {
             throw std::runtime_error("Failed to allocate bg_buffer.");
@@ -133,7 +129,7 @@ void TcnDepthImageFgbgMaskOp::compute(holoscan::InputContext& op_input,
     // Launch fgbg mask kernel
     const int threads = 256;
     const int blocks = (num_elements + threads - 1) / threads;
-    fgbg_mask_kernel<<<blocks, threads, 0, out_stream>>>(
+    fgbg_mask_kernel<<<blocks, threads, 0, cuda_stream>>>(
         depth_ptr, bg_ptr, fg_ptr, bg_out_ptr, sensitivity_.get(), num_elements);
 
     // Emit foreground mask
@@ -146,7 +142,7 @@ void TcnDepthImageFgbgMaskOp::compute(holoscan::InputContext& op_input,
 
         nvidia::gxf::Handle<nvidia::gxf::Tensor> fg_gxf_tensor = nullptr;
         if (!tcn::allocate_named_tensor<uint8_t>(
-                allocator.value(), out_stream, fg_entity, gxf_shape,
+                allocator.value(), cuda_stream, fg_entity, gxf_shape,
                 nvidia::gxf::MemoryStorageType::kDevice, ""s, fg_gxf_tensor)) {
             throw std::runtime_error("Failed to allocate foreground output tensor.");
         }
@@ -155,11 +151,11 @@ void TcnDepthImageFgbgMaskOp::compute(holoscan::InputContext& op_input,
             HOLOSCAN_CUDA_CALL(cudaMemcpyAsync(
                 maybe_fg_emit.value(), fg_ptr,
                 num_elements * sizeof(uint8_t),
-                cudaMemcpyDeviceToDevice, out_stream));
+                cudaMemcpyDeviceToDevice, cuda_stream));
         }
 
         auto fg_message = holoscan::gxf::Entity(std::move(fg_entity));
-        op_output.set_cuda_stream(out_stream, "foreground_mask");
+        op_output.set_cuda_stream(cuda_stream, "foreground_mask");
         op_output.emit(fg_message, "foreground_mask");
     }
 
@@ -173,7 +169,7 @@ void TcnDepthImageFgbgMaskOp::compute(holoscan::InputContext& op_input,
 
         nvidia::gxf::Handle<nvidia::gxf::Tensor> bg_gxf_tensor = nullptr;
         if (!tcn::allocate_named_tensor<uint8_t>(
-                allocator.value(), out_stream, bg_entity, gxf_shape,
+                allocator.value(), cuda_stream, bg_entity, gxf_shape,
                 nvidia::gxf::MemoryStorageType::kDevice, ""s, bg_gxf_tensor)) {
             throw std::runtime_error("Failed to allocate background output tensor.");
         }
@@ -182,11 +178,10 @@ void TcnDepthImageFgbgMaskOp::compute(holoscan::InputContext& op_input,
             HOLOSCAN_CUDA_CALL(cudaMemcpyAsync(
                 maybe_bg_emit.value(), bg_out_ptr,
                 num_elements * sizeof(uint8_t),
-                cudaMemcpyDeviceToDevice, out_stream));
+                cudaMemcpyDeviceToDevice, cuda_stream));
         }
 
         auto bg_message = holoscan::gxf::Entity(std::move(bg_entity));
-        op_output.set_cuda_stream(out_stream, "background_mask");
         op_output.emit(bg_message, "background_mask");
     }
 }

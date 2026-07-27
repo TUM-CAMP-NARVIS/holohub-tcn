@@ -15,12 +15,13 @@ struct VertexInput {
 
 struct VertexOutput {
     float4 pos : SV_Position;
+    //float PSize : SV_PointSize;
     //float3 normal : TEXCOORD2;
     float2 uv : TEXCOORD0;
-    float PSize : SV_PointSize;
     uint vid: TEXCOORD1;
     float vpz : TEXCOORD2;
 };
+
 
 [shader("vertex")]
 VertexOutput vertex_main(VertexInput input, uint vid: SV_VertexID) {
@@ -30,7 +31,7 @@ VertexOutput vertex_main(VertexInput input, uint vid: SV_VertexID) {
     float4 worldPos = mul(model, pos);
     float4 viewPos = mul(view, worldPos);
     out.pos = mul(proj, viewPos);
-    out.PSize = pointSize;
+//    out.PSize = pointSize;
     out.vid = vid;
     out.vpz = viewPos.z / -9.;
 
@@ -40,6 +41,7 @@ VertexOutput vertex_main(VertexInput input, uint vid: SV_VertexID) {
     //out.normal = worldNormal;
 
     out.uv = input.uv;
+
     return out;
 }
 

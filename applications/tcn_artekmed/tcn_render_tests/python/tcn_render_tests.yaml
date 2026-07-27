@@ -22,7 +22,7 @@ depthimage_temporal_filter:
 depthimage_backprojection:
   depth_units_per_meter: 1000.0
   near_limit_m: 0.01
-  far_limit_m: 10.0
+  far_limit_m: 50.0
 
 debug_output:
   enable_colorimage: True

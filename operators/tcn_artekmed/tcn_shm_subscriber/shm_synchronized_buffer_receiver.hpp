@@ -58,6 +58,7 @@ struct ChannelPortInfo {
     uint32_t height = 0;
     uint32_t bits_per_element = 0;
     uint64_t frame_size = 0;
+    uint64_t semantic_type = 0;
 };
 
 /// Callback type for receive_frame: receives the stream header and decoded buffer descriptor.

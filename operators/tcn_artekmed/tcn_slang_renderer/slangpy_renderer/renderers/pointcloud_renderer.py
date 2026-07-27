@@ -2,7 +2,7 @@ import slangpy as spy
 import numpy as np
 import logging
 
-from .pointcloud_data import Pointcloud
+from ..renderables.pointcloud import Pointcloud
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +37,7 @@ class PointcloudRenderer:
             ),
             primitive_topology=spy.PrimitiveTopology.point_list,
             depth_stencil={
+                "format": spy.Format.d32_float,
                 "depth_test_enable": True,
                 "depth_write_enable": True,
                 "depth_func": spy.ComparisonFunc.less,

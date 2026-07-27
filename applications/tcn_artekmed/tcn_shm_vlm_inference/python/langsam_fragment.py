@@ -13,15 +13,18 @@ log = logging.getLogger(__name__)
 class LangSamProcessingSubgraph(Subgraph):
     """Subgraph containing LangSAM inference pipeline (Grounding DINO + SAM2)"""
 
-    def __init__(self, fragment, name, kwargs):
+    def __init__(self, fragment, name, allocator, kwargs):
         self.kwargs = kwargs
+        self.allocator = allocator
         super().__init__(fragment, name)
 
     def compose(self):
         log.info("Compose subgraph: LangSamProcessing")
 
         # Color format converter (BGRA to RGBA)
-        col_conv = ConvertBgraToRgbaOp(self, name="color_converter_rgba")
+        col_conv = ConvertBgraToRgbaOp(self,
+                                       name="color_converter_rgba",
+                                       allocator=self.allocator)
 
         # Allocator for operators
         pool = UnboundedAllocator(self, name="pool")

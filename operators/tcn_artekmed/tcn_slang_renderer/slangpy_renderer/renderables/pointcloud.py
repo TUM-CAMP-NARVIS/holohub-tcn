@@ -1,30 +1,42 @@
+"""
+Pointcloud renderable data class.
+"""
 import slangpy as spy
 import numpy as np
-import cupy as cp
 import trimesh
 from PIL.Image import Image
 import threading
 
-from operators.tcn_artekmed.tcn_util.helpers import copy_cupy_array_into_slangpy_buffer
-from .renderable import Renderable
+from .base import Renderable
+
 
 class Pointcloud(Renderable):
     """
     Pointcloud data representation for rendering.
+    Supports dynamic updates from streaming data pipelines.
     """
 
     @staticmethod
-    def from_ply(device: spy.Device, ply_path: str, image_path: str=None):
+    def from_ply(device: spy.Device, ply_path: str, image_path: str = None):
+        """
+        Load pointcloud from PLY file.
+
+        Args:
+            device: Slangpy device
+            ply_path: Path to PLY file
+            image_path: Optional path to texture image
+
+        Returns:
+            Pointcloud instance
+        """
         pointcloud = trimesh.load_mesh(ply_path)
         positions = pointcloud.vertices.astype("float32")
         normals = None
         texcoords = None
-        # normals = pointcloud.vertex_normals.astype("float32")
-        # texcoords = pointcloud.visual.uv.astype("float32")  # type: ignore
 
         image_data = None
         if image_path is not None:
-            image : Image = Image.open(image_path)  # type: ignore
+            image: Image = Image.open(image_path)
             image_shape = list(image.size) + [4]
 
             image_data = (
@@ -43,15 +55,25 @@ class Pointcloud(Renderable):
 
     def __init__(self,
                  device: spy.Device,
-                 positions: np.ndarray=None,
-                 normals: np.ndarray=None,
-                 texcoords: np.ndarray=None,
-                 image: np.ndarray=None,
-                 sync_gpu: bool=False):
+                 positions: np.ndarray = None,
+                 normals: np.ndarray = None,
+                 texcoords: np.ndarray = None,
+                 image: np.ndarray = None,
+                 sync_gpu: bool = False):
+        """
+        Initialize pointcloud.
 
+        Args:
+            device: Slangpy device
+            positions: Vertex positions (NxMx3 or Nx3)
+            normals: Vertex normals (NxMx3 or Nx3)
+            texcoords: Texture coordinates (NxMx2 or Nx2)
+            image: Texture image (HxWxC)
+            sync_gpu: If True, immediately sync to GPU
+        """
         super().__init__(device)
         self.buffer_lock = threading.Lock()
-        self.renderer = None  # Will be set by PointcloudRenderer
+        self.renderer = None  # Will be set by renderer
         self.vertices = positions  # Store for vertex count
 
         # Pending updates storage
@@ -76,7 +98,6 @@ class Pointcloud(Renderable):
         if sync_gpu:
             self.sync_gpu()
 
-
     @property
     def has_vertices(self):
         return self.position_buffer is not None
@@ -97,13 +118,18 @@ class Pointcloud(Renderable):
     def is_dirty(self):
         return self._is_dirty
 
-
-    def update(self, positions: np.ndarray=None,
-               normals: np.ndarray=None,
-               texcoords: np.ndarray=None,
-               image: np.ndarray=None):
+    def update(self, positions: np.ndarray = None,
+               normals: np.ndarray = None,
+               texcoords: np.ndarray = None,
+               image: np.ndarray = None):
         """
         Thread-safe: Call this from any thread to stage data for the next frame.
+
+        Args:
+            positions: Updated vertex positions
+            normals: Updated vertex normals
+            texcoords: Updated texture coordinates
+            image: Updated texture image
         """
         with self.buffer_lock:
             if positions is not None:
@@ -116,12 +142,13 @@ class Pointcloud(Renderable):
                 self._pending_data['image'] = image
             self._is_dirty = True
 
-
     def sync_gpu(self, command_encoder=None):
         """
         Call this once per frame from the main rendering thread
         before dispatching shaders.
         """
+        from ..utils.cuda_helpers import copy_cupy_array_into_slangpy_buffer
+
         with self.buffer_lock:
             if self.is_dirty:
                 # Re-use your existing logic but applied to the staged data
@@ -133,7 +160,6 @@ class Pointcloud(Renderable):
                             size=data.nbytes,
                             usage=spy.BufferUsage.vertex_buffer | spy.BufferUsage.shader_resource | spy.BufferUsage.shared,
                         )
-                    #self.position_buffer.copy_from_numpy(data)
                     copy_cupy_array_into_slangpy_buffer(data, self.position_buffer, data.shape)
                     self._pending_data['positions'] = None
 
@@ -144,7 +170,6 @@ class Pointcloud(Renderable):
                             size=data.nbytes,
                             usage=spy.BufferUsage.vertex_buffer | spy.BufferUsage.shader_resource | spy.BufferUsage.shared,
                         )
-                    # self.normal_buffer.copy_from_numpy(data)
                     copy_cupy_array_into_slangpy_buffer(data, self.normal_buffer, data.shape)
                     self._pending_data['normals'] = None
 
@@ -155,14 +180,12 @@ class Pointcloud(Renderable):
                             size=data.nbytes,
                             usage=spy.BufferUsage.vertex_buffer | spy.BufferUsage.shader_resource | spy.BufferUsage.shared,
                         )
-                    # self.uv_buffer.copy_from_numpy(data)
                     copy_cupy_array_into_slangpy_buffer(data, self.uv_buffer, data.shape)
                     self._pending_data['texcoords'] = None
 
                 if self._pending_data['image'] is not None:
                     image = self._pending_data['image']
                     if self.texture is None or self.texture.array_length != image.nbytes:
-                        # xx which pixel_format RGBA or BGRA?
                         desc = spy.TextureDesc(dict(
                             width=image.shape[1],
                             height=image.shape[0],
@@ -171,31 +194,17 @@ class Pointcloud(Renderable):
                             type=spy.TextureType.texture_2d,
                             mip_count=1,
                             sample_count=1,
-                            #array_length=image.nbytes,
-                            # memory_type??
                         ))
                         self.texture = self.device.create_texture(desc)
-                        # self.texture_upload_buffer = self.device.create_buffer(
-                        #     size=image.nbytes,
-                        #     usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access
-                        # )
-                    # self.update_rgba32_texture_kernel.dispatch(thread_count=[image.shape[1], image.shape[0], 1],
-                    #                                            vars={
-                    #                                                "sourceBuffer": image,
-                    #                                                "width": image.shape[1],
-                    #                                                "height": image.shape[0],
-                    #                                                "textureHandle": self.texture,
-                    #                                            },
-                    #                                            command_encoder=command_encoder,
-                    #                                            )
 
-                    # @fixme: for now go via CPU memory until a clean method is found to copy date into the texture from cuda memory
-                    host_image = cp.asnumpy(image)
+                    # Copy via CPU — handle both cupy and numpy arrays
+                    if hasattr(image, "get"):
+                        # CuPy array — convert to numpy
+                        host_image = image.get()
+                    else:
+                        host_image = np.asarray(image)
                     self.texture.copy_from_numpy(host_image)
 
-                    # loader = spy.TextureLoader(self.device)
-                    # image = cp.asnumpy(self._pending_data['image'])
-                    # self.texture = loader.load_texture(spy.Bitmap(image))
                     self._pending_data['image'] = None
 
                 self._is_dirty = False
@@ -208,7 +217,15 @@ class Pointcloud(Renderable):
                extra_args: dict = None):
         """
         Render this pointcloud using its associated renderer.
+
+        Args:
+            pass_encoder: Active render pass encoder
+            window_size: Window dimensions (width, height)
+            view_matrix: Camera view matrix (4x4)
+            proj_matrix: Camera projection matrix (4x4)
+            extra_args: Additional rendering parameters
         """
+        extra_args = extra_args or {}
         extra_args["depthWidth"] = self.vertices.shape[1]
         extra_args["depthHeight"] = self.vertices.shape[0]
 

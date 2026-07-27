@@ -1,0 +1,6 @@
+{
+    "operator": {
+        "name": "TCN Device Context",
+        "description": "Manages RGBD Device Contexts and XY Table Lookups."
+    }
+}

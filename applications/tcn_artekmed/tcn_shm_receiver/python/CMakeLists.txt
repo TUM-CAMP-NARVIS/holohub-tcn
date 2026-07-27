@@ -25,9 +25,18 @@ target_link_libraries(tcn_shm_receiver INTERFACE
     holoscan::core
     holoscan::ops::format_converter
     holoscan::ops::holoviz
+
+    holoscan::ops::tcn_shm_subscriber
+    holoscan::ops::tcn_device_context
+    holoscan::ops::tcn_stream_splitter
+    holoscan::ops::tcn_stream_merger
+    holoscan::ops::tcn_flatten_tensor
     holoscan::ops::tcn_depthimage_backprojection
     holoscan::ops::tcn_depthimage_temporal_filter
     holoscan::ops::tcn_depthimage_weights
     holoscan::ops::tcn_texture_sampler
+    holoscan::ops::tcn_depthimage_max_distance
+    holoscan::ops::tcn_depthimage_fgbg_mask
+    holoscan::ops::tcn_depthimage_apply_mask
     #holoscan::ops::slang_shader
 )
