@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Host-runnable unit tests for the pure multi-camera LangSAM helpers.
+
+Imports from ``langsam_helpers`` (numpy-only) rather than ``langsam_common`` so they run on
+a host without cupy/torch/sam2. Compatible with pytest; also runnable via the __main__ block.
+"""
+
+import os
+import sys
+
+import numpy as np
+
+# Make the app's python/ dir importable regardless of how the tests are launched.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from langsam_helpers import (
+    resolve_workers,
+    class_id_map,
+    class_id_for_label,
+    build_label_map,
+)
+
+ALL = ["camera01_colorimage", "camera02_colorimage", "camera03_colorimage"]
+
+
+def test_empty_config_defaults_to_single_gpu0_worker():
+    assert resolve_workers(None, ALL) == [{"device": 0, "cameras": ALL}]
+    assert resolve_workers({}, ALL) == [{"device": 0, "cameras": ALL}]
+    assert resolve_workers({"workers": []}, ALL) == [{"device": 0, "cameras": ALL}]
+
+
+def test_explicit_workers_preserved_and_device_coerced():
+    cfg = {"workers": [
+        {"device": "0", "cameras": ["camera01_colorimage"]},
+        {"device": 1, "cameras": ["camera02_colorimage", "camera03_colorimage"]},
+    ]}
+    assert resolve_workers(cfg, ALL) == [
+        {"device": 0, "cameras": ["camera01_colorimage"]},
+        {"device": 1, "cameras": ["camera02_colorimage", "camera03_colorimage"]},
+    ]
+
+
+def test_class_id_map_is_one_based():
+    assert class_id_map(["floor", "person", "robot"]) == {"floor": 1, "person": 2, "robot": 3}
+
+
+def test_class_id_for_label_exact_substring_and_unknown():
+    cmap = class_id_map(["floor", "person", "robot"])
+    assert class_id_for_label("Floor", cmap) == 1       # case-insensitive exact
+    assert class_id_for_label("a person", cmap) == 2    # substring (prompt in label)
+    assert class_id_for_label("lamp", cmap) == 0        # unknown -> background
+
+
+def test_build_label_map_higher_score_wins_overlap():
+    cmap = class_id_map(["floor", "person"])
+    H = W = 4
+    m_floor = np.zeros((H, W), bool); m_floor[0:3, 0:3] = True    # floor, low score
+    m_person = np.zeros((H, W), bool); m_person[1:4, 1:4] = True  # person, high score
+    masks = np.stack([m_floor, m_person])
+    lm = build_label_map(masks, ["floor", "person"], np.array([0.5, 0.9]), cmap, H, W, xp=np)
+    assert lm.dtype == np.uint8
+    assert lm[0, 0] == 1       # floor only
+    assert lm[3, 3] == 2       # person only
+    assert lm[2, 2] == 2       # overlap -> higher score (person) wins
+    assert lm[3, 0] == 0       # background
+
+
+def test_build_label_map_empty_is_all_background():
+    cmap = class_id_map(["floor"])
+    lm = build_label_map(np.empty((0, 4, 4)), [], np.array([]), cmap, 4, 4, xp=np)
+    assert lm.shape == (4, 4) and int(lm.max()) == 0
+
+
+def test_build_label_map_skips_unknown_labels():
+    cmap = class_id_map(["floor"])
+    H = W = 3
+    mask = np.ones((1, H, W), bool)
+    lm = build_label_map(mask, ["lamp"], np.array([0.9]), cmap, H, W, xp=np)  # lamp unknown
+    assert int(lm.max()) == 0  # nothing painted
+
+
+if __name__ == "__main__":
+    # Plain-python runner for hosts without pytest.
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    failed = 0
+    for fn in fns:
+        try:
+            fn()
+            print(f"PASS {fn.__name__}")
+        except AssertionError as e:
+            failed += 1
+            print(f"FAIL {fn.__name__}: {e!r}")
+    print(f"\n{len(fns) - failed}/{len(fns)} passed")
+    raise SystemExit(1 if failed else 0)

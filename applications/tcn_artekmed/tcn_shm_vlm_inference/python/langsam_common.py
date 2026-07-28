@@ -22,6 +22,14 @@ from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
+# Pure helpers live in a numpy-only module so they unit-test on the host.
+from langsam_helpers import (  # noqa: F401
+    resolve_workers,
+    class_id_map,
+    class_id_for_label,
+    build_label_map,
+)
+
 SAM_MODELS = {
     "sam2.1_hiera_tiny": {
         "url": "file:///srv/models/active/sam2/sam2.1_hiera_tiny.pt",
