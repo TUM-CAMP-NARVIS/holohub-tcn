@@ -423,6 +423,36 @@ class GDINO:
             target_sizes=[orig_hw],
         )
 
+    def predict_gpu_batch(self, images_gpu, texts_prompt, box_threshold, text_threshold, orig_hw):
+        """Batched GPU detection. images_gpu: list of (H, W, C>=3) uint8 CUDA tensors, all
+        the same spatial size. Returns one HF post-processed result dict per image."""
+        enc = self._encode_text(texts_prompt)
+        pixel_values = torch.cat([self._preprocess_image_gpu(im) for im in images_gpu], dim=0)
+        n = pixel_values.shape[0]
+        input_ids = enc.input_ids.repeat(n, 1)
+        attention_mask = enc.attention_mask.repeat(n, 1)
+        tti = enc.get("token_type_ids")
+        token_type_ids = tti.repeat(n, 1) if tti is not None else None
+        use_amp = self.device is not None and self.device.type == "cuda"
+        with torch.no_grad(), torch.autocast(
+            device_type=self.device.type if self.device is not None else "cpu",
+            dtype=torch.bfloat16,
+            enabled=use_amp,
+        ):
+            outputs = self.model(
+                pixel_values=pixel_values,
+                input_ids=input_ids,
+                token_type_ids=token_type_ids,
+                attention_mask=attention_mask,
+            )
+        return self.processor.post_process_grounded_object_detection(
+            outputs,
+            input_ids,
+            box_threshold,
+            text_threshold=text_threshold,
+            target_sizes=[orig_hw] * n,
+        )
+
 
 
 
