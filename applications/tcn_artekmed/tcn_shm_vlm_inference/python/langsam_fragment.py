@@ -18,12 +18,15 @@ class LangSamProcessingSubgraph(Subgraph):
         self.allocator = allocator
         super().__init__(fragment, name)
 
+    def _make_name(self, name):
+        return f"{self.name}_{name}"
+
     def compose(self):
         log.info("Compose subgraph: LangSamProcessing")
 
         # Color format converter (BGRA to RGBA)
         col_conv = ConvertBgraToRgbaOp(self,
-                                       name="color_converter_rgba",
+                                       name=self._make_name("color_converter_rgba"),
                                        allocator=self.allocator)
 
         # Allocator for operators
@@ -33,7 +36,7 @@ class LangSamProcessingSubgraph(Subgraph):
         text_prompt_args = self.kwargs("text_prompts")
         text_prompt_publisher = TextPromptPublisher(
             self,
-            name="text_prompt_publisher",
+            name=self._make_name("text_prompt_publisher"),
             **text_prompt_args,
         )
 
@@ -41,15 +44,17 @@ class LangSamProcessingSubgraph(Subgraph):
         langsam_args = self.kwargs("langsam_inference")
         langsam_inference = LangSAM2Operator(
             self,
-            name="langsam_inference",
+            name=self._make_name("langsam_inference"),
             **langsam_args,
         )
 
-        # LangSAM postprocessor for visualization
+        # LangSAM postprocessor for visualization. Pass the same prompt list so the
+        # postprocessor can assign a stable color per class (seeded from prompt order).
         langsam_postprocessor_args = self.kwargs("langsam_postprocessor")
         langsam_postprocessor = LangSamPostprocessorOp(
             self,
-            name="langsam_postprocessor",
+            name=("langsam_postprocessor"),
+            prompts=text_prompt_args.get("prompts"),
             **langsam_postprocessor_args,
         )
 

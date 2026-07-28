@@ -25,12 +25,20 @@ log = logging.getLogger(__name__)
 class DA3PostprocessorOp(Operator):
     """Operator that does postprocessing before sending resulting image to Holoviz"""
 
-    def __init__(self, *args, depth_near=0.3, depth_far=10.0, **kwargs):
+    def __init__(self, *args, depth_near=0.3, depth_far=10.0,
+                 metric_focal=None, metric_scale_factor=300.0, **kwargs):
         # Metric depth display range in meters. Depth is colorized against this fixed
         # range (not per-frame min/max) so colors stay stable and metric-meaningful.
-        # DA3 outputs true (metric) depth: near = small value, far = large value.
+        # DA3 outputs focal-normalized depth: near = small value, far = large value.
         self.depth_near = depth_near
         self.depth_far = depth_far
+        # Metric conversion (DA3 apply_metric_scaling convention):
+        #   metric_depth[m] = raw_depth * (focal / scale_factor)
+        # where `focal` = (fx + fy) / 2 in pixels at the model input resolution and
+        # `scale_factor` is the model's canonical constant (300.0). If metric_focal is
+        # None, the raw output is used as-is (no camera intrinsics available).
+        self.metric_focal = metric_focal
+        self.metric_scale_factor = metric_scale_factor
         super().__init__(*args, **kwargs)
         #
         self.image_dim = 518
@@ -40,6 +48,9 @@ class DA3PostprocessorOp(Operator):
         self.current_display_mode = self.display_modes[self.idx]
         # In interactive mode, how much of the original video to show
         self.ratio = 0.5
+        # Throttle for the per-frame metric depth min/max log (used to tune depth_near/far).
+        self._frame_count = 0
+        self._log_every = 30
 
     def setup(self, spec: OperatorSpec):
         """
@@ -102,11 +113,19 @@ class DA3PostprocessorOp(Operator):
     def framebuffer_size_callback(self, *args):
         self.framebuffer_size = args[0]
 
+    def to_metric(self, depth_map):
+        # Convert the model's focal-normalized output to metric depth in meters using the
+        # camera focal length. If no focal is available, return the raw output unchanged.
+        if self.metric_focal is not None:
+            return depth_map * (self.metric_focal / self.metric_scale_factor)
+        return depth_map
+
     def normalize(self, depth_map):
         # Colorize metric depth against the fixed [depth_near, depth_far] range (meters).
+        metric = self.to_metric(depth_map)
         # Output feeds COLORMAP_JET (0 -> blue, 255 -> red), so map:
         #   near depth -> 255 -> red,  far depth -> 0 -> blue.
-        normalized = (depth_map - self.depth_near) / (self.depth_far - self.depth_near)
+        normalized = (metric - self.depth_near) / (self.depth_far - self.depth_near)
         normalized = cp.clip(normalized, 0.0, 1.0)
         return 255 - (normalized * 255)
 
@@ -119,6 +138,17 @@ class DA3PostprocessorOp(Operator):
         inference_output = cp.asarray(in_message.get("inference_output")).squeeze()
 
         image = cp.asarray(in_image.get("preprocessed"))
+
+        # Log per-frame metric depth min/max/mean to help tune depth_near/depth_far.
+        self._frame_count += 1
+        if self._frame_count % self._log_every == 0:
+            metric = self.to_metric(inference_output)
+            units = "m" if self.metric_focal is not None else "raw"
+            log.info(
+                f"DA3 metric depth [{units}]: min={float(cp.min(metric)):.3f} "
+                f"max={float(cp.max(metric)):.3f} mean={float(cp.mean(metric)):.3f} "
+                f"(display range near={self.depth_near} far={self.depth_far})"
+            )
 
         if self.current_display_mode == "original":
             # Display the original image
@@ -179,12 +209,42 @@ class DA3PostprocessorOp(Operator):
 class DA3MetricProcessingSubgraph(Subgraph):
     """Subgraph containing the shm-receiver and backprojection pipeline."""
 
-    def __init__(self, fragment, name, kwargs):
+    def __init__(self, fragment, name, kwargs, device_context=None):
         self.kwargs = kwargs
+        self.device_context = device_context
         super().__init__(fragment, name)
 
     def _make_name(self, name):
         return f"{self.name}_{name}"
+
+    def _compute_metric_focal(self, proc_w, proc_h):
+        """Focal length (px) of the color camera scaled to the model input resolution.
+
+        Returns None when no device_context is available, in which case the
+        postprocessor falls back to using the raw (focal-normalized) output.
+        """
+        if self.device_context is None:
+            log.warning("DA3: no device_context provided; metric scaling disabled (raw depth)")
+            return None
+        try:
+            color = self.device_context["calibration"]["colorCameraParameters"]
+            fx = float(color["fovX"])  # focal_length.x in px (original color resolution)
+            fy = float(color["fovY"])  # focal_length.y in px
+            color_w = float(color["width"])
+            color_h = float(color["height"])
+        except (KeyError, TypeError, ValueError) as e:
+            log.warning(f"DA3: could not read color intrinsics from device_context ({e}); "
+                        "metric scaling disabled (raw depth)")
+            return None
+
+        fx_scaled = fx * (proc_w / color_w)
+        fy_scaled = fy * (proc_h / color_h)
+        focal = (fx_scaled + fy_scaled) / 2.0
+        log.info(
+            f"DA3 metric scaling: focal={focal:.2f}px @ {int(proc_w)}x{int(proc_h)} "
+            f"(color fx={fx:.1f}, fy={fy:.1f} @ {int(color_w)}x{int(color_h)})"
+        )
+        return focal
 
     def compose(self):
         log.info("Compose subgraph: DA3MetricProcessing")
@@ -217,12 +277,22 @@ class DA3MetricProcessingSubgraph(Subgraph):
         **da3_inference_args,
         )
 
+        # Derive the focal length (in pixels) at the model input resolution so the
+        # postprocessor can convert the model's focal-normalized output to metric depth.
+        # FormatConverterOp resizes the color frame to resize_width x resize_height (a plain
+        # squash), so the effective focal per axis scales by (proc / original) dimension.
+        proc_w = float(da3_preprocessor_args.get("resize_width", 518))
+        proc_h = float(da3_preprocessor_args.get("resize_height", 518))
+        metric_focal = self._compute_metric_focal(proc_w, proc_h)
+
         da3_postprocessor = DA3PostprocessorOp(
             self,
             name=self._make_name("da3_postprocessor"),
             allocator=pool,
             depth_near=da3_inference_config.get("depth_near", 0.3),
             depth_far=da3_inference_config.get("depth_far", 10.0),
+            metric_focal=metric_focal,
+            metric_scale_factor=da3_inference_config.get("metric_scale_factor", 300.0),
         )
 
         self.add_flow(da3_preprocessor, da3_postprocessor, {("tensor", "input_image")})

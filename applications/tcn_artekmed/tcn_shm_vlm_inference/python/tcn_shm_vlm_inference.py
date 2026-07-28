@@ -255,6 +255,7 @@ class App(hs.core.Application):
         have_camera_consumer = False
 
         inference_input = (split_op, "camera01_colorimage")
+        camera_device_context = device_contexts["camera01"]
 
         if config_rotate_image:
             log.info("rotate image enabled")
@@ -301,7 +302,8 @@ class App(hs.core.Application):
             have_camera_consumer = True
 
         if camera_streams_config.get("enable_da3", False):
-            da3_pipeline = DA3MetricProcessingSubgraph(self, "camera01_da3_pipeline", self.kwargs)
+            da3_pipeline = DA3MetricProcessingSubgraph(self, "camera01_da3_pipeline", self.kwargs,
+                                                       device_context=camera_device_context)
             # dco = DepthColormapOp(self, name="da3_dco", near=0.3, far=10.0, cmap="turbo")
 
             holoviz_args = self.kwargs("da3_holoviz")

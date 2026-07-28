@@ -19,6 +19,7 @@ import gc
 import cupy as cp
 import cupyx.scipy.ndimage
 import holoscan as hs
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from holoscan.core import Operator, OperatorSpec
@@ -344,23 +345,29 @@ class LangSAM2Operator(Operator):
                 self.sam.predictor._orig_hw = None
                 self.sam.predictor._is_image_set = False
 
-        # Convert results to CuPy tensors for output
-        # For single image case, extract the first result
+        # Convert results for output. For the single-image case, use the first result.
         result = all_results[0]
 
-        # Create output message with the result
-        out_message = Entity(context)
+        # Emit a plain dict (not an Entity) so we can carry the per-detection string
+        # labels alongside the numeric tensors -- an Entity/tensor can't hold strings,
+        # and the labels are what let the postprocessor assign a stable color per class.
+        out_message = {}
 
-        # Convert numpy arrays to CuPy tensors
-        # Note: Skip "labels" as it contains strings which CuPy doesn't support
         for key in ["boxes", "scores"]:
             if key in result and len(result[key]) > 0:
-                out_message.add(hs.as_tensor(cp.asarray(result[key])), key)
+                out_message[key] = cp.asarray(result[key])
 
         # Add masks and mask_scores if available
         if len(result["masks"]) > 0:
-            out_message.add(hs.as_tensor(cp.asarray(result["masks"])), "masks")
-            out_message.add(hs.as_tensor(cp.asarray(result["mask_scores"])), "mask_scores")
+            out_message["masks"] = cp.asarray(result["masks"])
+            out_message["mask_scores"] = cp.asarray(result["mask_scores"])
+
+        # Per-detection class labels (strings), aligned with boxes/masks order.
+        # transformers >=4.51 renames this to "text_labels"; fall back to "labels".
+        raw_labels = result.get("text_labels", result.get("labels", []))
+        if hasattr(raw_labels, "tolist"):
+            raw_labels = raw_labels.tolist()
+        out_message["labels"] = [str(label) for label in raw_labels]
 
         op_output.emit(out_message, "out")
 
@@ -383,6 +390,8 @@ class LangSamPostprocessorOp(Operator):
         *args,
         save_intermediate=False,
         verbose=False,
+        mask_alpha=180,
+        prompts=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -390,6 +399,70 @@ class LangSamPostprocessorOp(Operator):
         self.counter = 0
         self.painter = CupyArrayPainter()
         self.save_intermediate = save_intermediate
+        # Opacity applied to every mask when compositing onto the RGBA output.
+        self.mask_alpha = mask_alpha
+        # Qualitative palette (tab20 -> 20 distinct colors). A given class always maps to
+        # the same palette slot, so colors stay stable across frames (per class, not per
+        # detection order).
+        palette = plt.get_cmap("tab20")(np.linspace(0, 1, 20))[:, :3] * 255
+        self.palette = cp.asarray(palette, dtype=cp.uint8)  # (20, 3)
+        # Persistent class -> palette-index map. Seeded from the configured prompt order so
+        # colors are deterministic across runs; labels not in the prompts get the next free
+        # slot the first time they are seen and keep it for the rest of the session.
+        self._label_to_idx = {}
+        for prompt in (prompts or []):
+            self._register_label(prompt)
+
+    @staticmethod
+    def _normalize_label(label):
+        return str(label).strip().lower()
+
+    def _register_label(self, label):
+        key = self._normalize_label(label)
+        if key and key not in self._label_to_idx:
+            self._label_to_idx[key] = len(self._label_to_idx)
+        return self._label_to_idx.get(key, 0)
+
+    def _color_index_for_label(self, label):
+        """Stable palette index for a class label (exact, then substring, then new slot)."""
+        key = self._normalize_label(label)
+        if key in self._label_to_idx:
+            return self._label_to_idx[key]
+        # GDINO may return a partial phrase (e.g. "computer monitor" vs prompt "monitor").
+        for known, idx in self._label_to_idx.items():
+            if known and (known in key or key in known):
+                return idx
+        # Unknown label: assign and remember the next free slot.
+        return self._register_label(label)
+
+    def _composite_masks(self, masks, labels=None):
+        """Composite all detection masks into a single (H, W, 4) RGBA image.
+
+        Each instance is colored by its class label (stable across frames); where masks
+        overlap the later (lower-scoring) instance is drawn on top. Background stays
+        transparent. `masks` is a cupy array of shape (N, H, W), (N, 1, H, W) or (H, W).
+        """
+        if masks.ndim == 4:
+            # (N, num_masks_per_detection, H, W) -> (N, H, W): SAM ran multimask_output=False
+            masks = masks[:, 0]
+        if masks.ndim == 2:
+            masks = masks[None, ...]
+
+        num_instances, h, w = masks.shape
+        rgba = cp.zeros((h, w, 4), dtype=cp.uint8)
+        for i in range(num_instances):
+            m = masks[i] > 0.5
+            if labels is not None and i < len(labels):
+                color_idx = self._color_index_for_label(labels[i])
+            else:
+                color_idx = i  # no label available -> fall back to per-instance color
+            color = self.palette[color_idx % self.palette.shape[0]]
+            rgba[m, 0:3] = color
+            rgba[m, 3] = self.mask_alpha
+        if self.verbose:
+            print(f"Composited {num_instances} mask(s) into {rgba.shape} RGBA; "
+                  f"labels={list(labels) if labels is not None else None}")
+        return rgba
 
     def setup(self, spec: OperatorSpec):
         """
@@ -409,6 +482,8 @@ class LangSamPostprocessorOp(Operator):
             mask_scores = cp.asarray(in_message.get("mask_scores"))
             boxes = cp.asarray(in_message.get("boxes"))
             scores = cp.asarray(in_message.get("scores"))
+            # Per-detection class labels (strings), aligned with masks; used for coloring.
+            labels = in_message.get("labels") or []
         except Exception as e:
             if self.verbose:
                 print(f"Error extracting data from input message: {e}")
@@ -436,35 +511,10 @@ class LangSamPostprocessorOp(Operator):
                 verbose=self.verbose,
             )
 
-        # Find the best mask based on mask scores
-        if len(mask_scores.shape) > 1:
-            # Multiple masks per detection
-            best_mask_idx = cp.argmax(mask_scores[:, 0])
-        else:
-            # Single mask score per detection
-            best_mask_idx = cp.argmax(mask_scores)
-
-        # Extract the best mask
-        if len(masks.shape) == 4:
-            # Shape: (num_detections, num_masks_per_detection, H, W)
-            best_mask = masks[best_mask_idx, 0]
-        elif len(masks.shape) == 3:
-            # Shape: (num_detections, H, W)
-            best_mask = masks[best_mask_idx]
-        else:
-            # Shape: (H, W)
-            best_mask = masks
-
-        if self.verbose:
-            print(f"Selected mask shape: {best_mask.shape}")
-
-        # Convert binary mask to RGBA for visualization
-        # Ensure mask is 2D
-        if len(best_mask.shape) > 2:
-            best_mask = cp.squeeze(best_mask)
-
-        # Convert to RGBA using the painter
-        rgba_mask = self.painter.to_rgba(best_mask)
+        # Composite ALL detected masks into one RGBA image, each instance in a distinct
+        # color. (Previously this selected only the single argmax-scoring mask, which is
+        # why just one object showed up and it flipped between objects frame-to-frame.)
+        rgba_mask = self._composite_masks(masks, labels)
 
         # Make array contiguous
         rgba_mask = cp.ascontiguousarray(rgba_mask)

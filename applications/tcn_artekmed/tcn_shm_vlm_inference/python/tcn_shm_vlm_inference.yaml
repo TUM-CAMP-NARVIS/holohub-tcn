@@ -12,9 +12,9 @@ shared_memory:
 camera_stream_processing:
   device_id: 0
   buffer_size: 8
-  enable_da2: True
-  enable_da3: True
-  enable_langsam: False
+  enable_da2: False
+  enable_da3: False
+  enable_langsam: True
 
 
 # Depth Anything V2 Example
@@ -72,7 +72,7 @@ langsam_inference:
   text_threshold: 0.25
 
 text_prompts:
-  prompts: ["table", "chair", "monitor", "computer", "mannequin"]
+  prompts: ["floor", "person", "robot", "furniture", "lamp"]
 
 langsam_postprocessor:
   save_intermediate: false
