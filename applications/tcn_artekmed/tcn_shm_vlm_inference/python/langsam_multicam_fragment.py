@@ -1,0 +1,233 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Multi-camera LangSAM: batched Grounding DINO + SAM2 over all color cameras, split across
+GPUs, emitting a composite entity of per-camera uint8 class-label maps plus a tiled view.
+
+See docs/specs/2026-07-28-langsam-multicam-design.md.
+"""
+
+import logging
+import math
+
+import cupy as cp
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import holoscan as hs
+from holoscan.core import Operator, OperatorSpec, Subgraph, IOSpec
+from holoscan.operators import HolovizOp
+
+from langsam_common import SAM, GDINO, resolve_workers, class_id_map, build_label_map
+
+log = logging.getLogger(__name__)
+
+
+def _mask_name(cam_port):
+    """`camera01_colorimage` -> `camera01_mask`."""
+    return cam_port.replace("_colorimage", "") + "_mask"
+
+
+class LangSamBatchOp(Operator):
+    """Batched LangSAM over a subset of cameras on one GPU.
+
+    In:  `color_input` (the full color_outputs entity, named GPU tensors).
+    Out: `masks` (dict of `<cam>_mask` -> cupy uint8 (H,W) label maps on `device`).
+    """
+
+    def __init__(self, fragment, *args, cameras, device, langsam_cfg, prompts, **kwargs):
+        self.cameras = list(cameras)
+        self.device = device if isinstance(device, torch.device) else torch.device(f"cuda:{int(device)}")
+        self.prompts = list(prompts)
+        self._cmap = class_id_map(self.prompts)
+        self.box_threshold = float(langsam_cfg.get("box_threshold", 0.3))
+        self.text_threshold = float(langsam_cfg.get("text_threshold", 0.25))
+        super().__init__(fragment, *args, **kwargs)
+        with torch.cuda.device(self.device):
+            self.sam = SAM(
+                langsam_cfg.get("sam_type", "sam2.1_hiera_tiny"),
+                langsam_cfg.get("sam_ckpt_path"),
+                device=self.device,
+                compile_model=bool(langsam_cfg.get("sam_compile", False)),
+            )
+            self.sam.build_model()
+            self.gdino = GDINO(
+                model_ckpt_path=langsam_cfg.get("gdino_model_ckpt_path"),
+                processor_ckpt_path=langsam_cfg.get("gdino_processor_ckpt_path"),
+                device=self.device,
+                model_id=langsam_cfg.get("gdino_model_id", "IDEA-Research/grounding-dino-tiny"),
+                input_size=langsam_cfg.get("gdino_input_size"),
+                compile_model=bool(langsam_cfg.get("gdino_compile", False)),
+            )
+            self.gdino.build_model()
+
+    def setup(self, spec: OperatorSpec):
+        spec.input("color_input")
+        spec.output("masks")
+
+    def _to_numpy_result(self, r):
+        """Convert one HF GDINO result dict: boxes -> numpy float32, labels -> list[str]."""
+        boxes = r.get("boxes")
+        if hasattr(boxes, "numpy"):
+            boxes = boxes.detach().float().cpu().numpy()
+        labels = r.get("text_labels", r.get("labels", []))
+        if hasattr(labels, "tolist"):
+            labels = labels.tolist()
+        return boxes, [str(x) for x in labels]
+
+    def compute(self, op_input, op_output, context):
+        msg = op_input.receive("color_input")
+        out = {}
+        with torch.cuda.device(self.device), cp.cuda.Device(self.device.index):
+            rgb_gpu, rgb_np, names, hw = [], [], [], None
+            for cam in self.cameras:
+                t = msg.get(cam)
+                if t is None:
+                    log.warning(f"LangSamBatchOp[{self.device}]: missing tensor '{cam}'")
+                    continue
+                img = torch.from_dlpack(cp.asarray(t))               # (H,W,4) BGRA uint8, cuda:0
+                img = img.to(self.device)[..., [2, 1, 0]].contiguous()  # -> RGB on this device
+                rgb_gpu.append(img)
+                rgb_np.append(img.cpu().numpy())                     # host copy for SAM's numpy API
+                names.append(cam)
+                hw = (int(img.shape[0]), int(img.shape[1]))
+
+            if not rgb_gpu:
+                op_output.emit(out, "masks")
+                return
+
+            # --- Batched Grounding DINO over all this worker's cameras ---
+            gres = self.gdino.predict_gpu_batch(
+                rgb_gpu, self.prompts, self.box_threshold, self.text_threshold, hw)
+
+            # Partition: only cameras with >=1 detection go to SAM; others are all-background.
+            sam_np, sam_boxes, sam_labels, sam_idx = [], [], [], []
+            for i, r in enumerate(gres):
+                boxes, labels = self._to_numpy_result(r)
+                if boxes is not None and len(boxes) > 0:
+                    sam_np.append(rgb_np[i])
+                    sam_boxes.append(boxes)
+                    sam_labels.append(labels)
+                    sam_idx.append(i)
+
+            label_maps = {i: build_label_map(None, [], None, self._cmap, hw[0], hw[1], xp=cp)
+                          for i in range(len(names))}
+
+            if sam_np:
+                masks, mscores, _ = self.sam.predict_batch_gpu(sam_np, xyxy=sam_boxes, timing=False)
+                for k, i in enumerate(sam_idx):
+                    label_maps[i] = build_label_map(
+                        masks[k], sam_labels[k], mscores[k], self._cmap, hw[0], hw[1], xp=cp)
+
+            for i, cam in enumerate(names):
+                out[_mask_name(cam)] = hs.as_tensor(cp.ascontiguousarray(label_maps[i]))
+        op_output.emit(out, "masks")
+
+
+class MaskCollectorOp(Operator):
+    """Merge per-worker label-map dicts into one composite dict, all consolidated on GPU 0."""
+
+    def setup(self, spec: OperatorSpec):
+        spec.input("receivers", size=IOSpec.ANY_SIZE)
+        spec.output("masks")
+
+    def compute(self, op_input, op_output, context):
+        messages = op_input.receive("receivers")     # tuple of per-worker dicts
+        out = {}
+        with cp.cuda.Device(0):
+            for msg in messages:
+                if msg is None:
+                    continue
+                for name in list(msg.keys()):
+                    arr = cp.asarray(msg.get(name))
+                    if arr.device.id != 0:            # cross-GPU -> consolidate on GPU 0
+                        t = torch.from_dlpack(arr).to("cuda:0")
+                        arr = cp.ascontiguousarray(cp.from_dlpack(t))
+                    out[name] = hs.as_tensor(arr)
+        op_output.emit(out, "masks")
+
+
+class LabelMapColorizeOp(Operator):
+    """Colorize per-camera label maps via a class LUT -> RGBA, and emit tiled Holoviz specs."""
+
+    def __init__(self, fragment, *args, num_classes, alpha=180, **kwargs):
+        pal = plt.get_cmap("tab20")(np.linspace(0, 1, 20))[:, :3] * 255
+        lut = np.zeros((num_classes + 1, 4), np.uint8)     # class 0 -> transparent background
+        for c in range(1, num_classes + 1):
+            lut[c, :3] = pal[(c - 1) % 20]
+            lut[c, 3] = alpha
+        self._lut = cp.asarray(lut)
+        super().__init__(fragment, *args, **kwargs)
+
+    def setup(self, spec: OperatorSpec):
+        spec.input("masks")
+        spec.output("viz")
+        spec.output("specs")
+
+    def compute(self, op_input, op_output, context):
+        msg = op_input.receive("masks")
+        names = sorted(msg.keys())
+        out = {}
+        with cp.cuda.Device(0):
+            for name in names:
+                lm = cp.asarray(msg.get(name))          # (H,W) uint8
+                rgba = self._lut[lm]                     # (H,W,4) uint8
+                out[name] = hs.as_tensor(cp.ascontiguousarray(rgba))
+        op_output.emit(out, "viz")
+        op_output.emit(self._tiled_specs(names), "specs")
+
+    def _tiled_specs(self, names):
+        grid = int(math.ceil(math.sqrt(len(names)))) if names else 1
+        tile = 1.0 / grid
+        specs = []
+        for i, name in enumerate(names):
+            spec = HolovizOp.InputSpec(name, HolovizOp.InputType.COLOR)
+            view = HolovizOp.InputSpec.View()
+            view.offset_x = (i % grid) * tile
+            view.offset_y = (i // grid) * tile
+            view.width = tile
+            view.height = tile
+            spec.views = [view]
+            specs.append(spec)
+        return specs
+
+
+class LangSamMultiCamProcessingSubgraph(Subgraph):
+    """Wires N per-GPU LangSamBatchOp workers -> collector -> colorize."""
+
+    def __init__(self, fragment, name, kwargs, all_color_cameras):
+        self.kwargs = kwargs
+        self.all_color_cameras = list(all_color_cameras)
+        super().__init__(fragment, name)
+
+    def _n(self, s):
+        return f"{self.name}_{s}"
+
+    def _get(self, key):
+        try:
+            return self.kwargs(key)
+        except Exception:
+            return None
+
+    def compose(self):
+        log.info("Compose subgraph: LangSamMultiCamProcessing")
+        multicam_cfg = self._get("langsam_multicam") or {}
+        langsam_cfg = self.kwargs("langsam_inference")
+        prompts = (self._get("text_prompts") or {}).get("prompts", [])
+        workers = resolve_workers(multicam_cfg, self.all_color_cameras)
+        log.info(f"LangSAM multicam workers: {workers}")
+
+        collector = MaskCollectorOp(self, name=self._n("collector"))
+        colorize = LabelMapColorizeOp(self, name=self._n("colorize"), num_classes=len(prompts))
+        self.add_flow(collector, colorize, {("masks", "masks")})
+
+        for i, w in enumerate(workers):
+            op = LangSamBatchOp(
+                self, name=self._n(f"worker{i}"),
+                cameras=w["cameras"], device=w["device"],
+                langsam_cfg=langsam_cfg, prompts=prompts,
+            )
+            self.add_flow(op, collector, {("masks", "receivers")})
+            self.add_input_interface_port("input", op, "color_input")
+
+        self.add_output_interface_port("output_masks", collector, "masks")
+        self.add_output_interface_port("output_viz", colorize, "viz")
+        self.add_output_interface_port("output_specs", colorize, "specs")
