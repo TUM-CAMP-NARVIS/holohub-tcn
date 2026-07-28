@@ -58,13 +58,23 @@ SAM_MODELS = {
 
 class SAM:
 
-    def __init__(self, sam_type: str, ckpt_path: str | None = None, device: torch.device | None = None):
+    def __init__(self, sam_type: str, ckpt_path: str | None = None, device: torch.device | None = None, compile_model: bool = False):
         self.sam_type = sam_type
         self.ckpt_path = ckpt_path
         self.device = device
+        self.compile_model = compile_model
         self.model = None
         self.mask_generator = None
         self.predictor = None
+        # Last per-call sub-stage timings (ms), populated when predict_batch(timing=True):
+        #   encode = set_image_batch (Hiera image encoder)
+        #   decode = predict_batch   (mask decoder + postprocess_masks upsampling)
+        self.last_encode_ms = 0.0
+        self.last_decode_ms = 0.0
+
+    def _sync(self):
+        if self.device is not None and self.device.type == "cuda":
+            torch.cuda.synchronize()
 
 
     def build_model(self):
@@ -78,6 +88,15 @@ class SAM:
         self.model.eval()
         self.mask_generator = SAM2AutomaticMaskGenerator(self.model)
         self.predictor = SAM2ImagePredictor(self.model)
+        # Optionally torch.compile the image encoder (fixed 1024^2 input -> static shapes,
+        # good for compile). Only the encoder is compiled; the decoder runs over a variable
+        # number of boxes, which would trigger recompilation. Falls back to eager on error.
+        if self.compile_model:
+            try:
+                self.model.image_encoder = torch.compile(self.model.image_encoder)
+                print("SAM2 image encoder compiled (torch.compile)")
+            except Exception as e:
+                print(f"torch.compile(SAM image_encoder) failed; using eager. {e}")
 
     def _load_checkpoint(self, model: torch.nn.Module):
         if self.ckpt_path is None:
@@ -135,22 +154,76 @@ class SAM:
         self,
         images_rgb: list[np.ndarray],
         xyxy: list[np.ndarray],
+        timing: bool = False,
     ) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
         with self._autocast():
+            if timing:
+                self._sync(); _t0 = time.perf_counter()
             self.predictor.set_image_batch(images_rgb)
+            if timing:
+                self._sync(); self.last_encode_ms = (time.perf_counter() - _t0) * 1000.0
+                _t1 = time.perf_counter()
             masks, scores, logits = self.predictor.predict_batch(box_batch=xyxy, multimask_output=False)
+            if timing:
+                self._sync(); self.last_decode_ms = (time.perf_counter() - _t1) * 1000.0
 
         masks = [np.squeeze(mask, axis=1) if len(mask.shape) > 3 else mask for mask in masks]
         scores = [np.squeeze(score) for score in scores]
         logits = [np.squeeze(logit, axis=1) if len(logit.shape) > 3 else logit for logit in logits]
         return masks, scores, logits
 
+    def predict_batch_gpu(
+        self,
+        images_rgb: list[np.ndarray],
+        xyxy: list[np.ndarray],
+        timing: bool = False,
+    ) -> tuple[list, list, None]:
+        """Same as predict_batch but keeps masks ON THE GPU.
+
+        SAM2's predict_batch does `masks.float().detach().cpu().numpy()` -- shipping N
+        full-resolution FLOAT masks to the host every frame, which we then push straight
+        back to the GPU for compositing. This replicates SAM2's per-image loop (using its
+        _prep_prompts/_predict) but returns cupy uint8 (N, H, W) masks + cupy scores, so the
+        masks never leave the device. The `decode` timer here therefore excludes the host
+        transfer -- comparing it to predict_batch's tells us if the transfer was the cost.
+        """
+        p = self.predictor
+        with self._autocast():
+            if timing:
+                self._sync(); _t0 = time.perf_counter()
+            p.set_image_batch(images_rgb)
+            if timing:
+                self._sync(); self.last_encode_ms = (time.perf_counter() - _t0) * 1000.0
+                _t1 = time.perf_counter()
+            num_images = len(p._features["image_embed"])
+            all_masks, all_scores = [], []
+            for img_idx in range(num_images):
+                box = xyxy[img_idx] if xyxy is not None else None
+                mask_input, unnorm_coords, labels, unnorm_box = p._prep_prompts(
+                    None, None, box, None, True, img_idx=img_idx
+                )
+                masks, iou, _ = p._predict(
+                    unnorm_coords, labels, unnorm_box, mask_input,
+                    multimask_output=False, return_logits=False, img_idx=img_idx,
+                )
+                if masks.ndim == 4:
+                    masks = masks[:, 0]                      # (num_boxes, H, W), bool
+                masks_u8 = masks.to(torch.uint8).contiguous()
+                # torch -> cupy (zero-copy view) then .copy() so cupy owns the memory and
+                # it survives after the torch tensors are freed.
+                all_masks.append(cp.from_dlpack(masks_u8).copy())
+                all_scores.append(cp.from_dlpack(iou.reshape(-1).float().contiguous()).copy())
+            if timing:
+                self._sync(); self.last_decode_ms = (time.perf_counter() - _t1) * 1000.0
+        return all_masks, all_scores, None
+
 
 class GDINO:
-    def __init__(self, model_ckpt_path: str | None = None, processor_ckpt_path: str | None = None, device: torch.device | None = None, model_id: str = "IDEA-Research/grounding-dino-base", input_size: int | None = None):
+    def __init__(self, model_ckpt_path: str | None = None, processor_ckpt_path: str | None = None, device: torch.device | None = None, model_id: str = "IDEA-Research/grounding-dino-base", input_size: int | None = None, compile_model: bool = False):
         self.model_ckpt_path = model_ckpt_path
         self.processor_ckpt_path = processor_ckpt_path
         self.device = device
+        self.compile_model = compile_model
         # Hugging Face Hub id used when no local checkpoint paths are given (or as a
         # fallback). Swap to "IDEA-Research/grounding-dino-tiny" for a smaller backbone.
         self.model_id = model_id
@@ -194,6 +267,8 @@ class GDINO:
                 self.processor = AutoProcessor.from_pretrained(model_id)
                 self.model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(self.device)
                 self._maybe_override_size()
+                self._init_preprocess()
+                self._maybe_compile()
                 return
 
             print(f"Attempting to load model from local path: {self.model_ckpt_path}")
@@ -212,6 +287,18 @@ class GDINO:
                 self.model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(self.device)
 
         self._maybe_override_size()
+        self._init_preprocess()
+        self._maybe_compile()
+
+    def _maybe_compile(self):
+        # Optionally torch.compile the whole detector. Inputs are static (fixed resize +
+        # cached text tokens), so no recompilation. Falls back to eager on error.
+        if self.compile_model and self.model is not None:
+            try:
+                self.model = torch.compile(self.model)
+                print("Grounding DINO compiled (torch.compile)")
+            except Exception as e:
+                print(f"torch.compile(GDINO) failed; using eager. {e}")
 
     def predict(
         self,
@@ -253,6 +340,95 @@ class GDINO:
         )
         return results
 
+    # ------------------------------------------------------------------ #
+    # GPU-native inference path: no PIL, no CPU image processor, no        #
+    # host<->device copies, and text tokenization cached across frames.    #
+    # ------------------------------------------------------------------ #
+    def _init_preprocess(self):
+        """Cache image-preprocessing params from the HF image processor so we can run the
+        resize/normalize on GPU, matching the processor exactly."""
+        ip = getattr(self.processor, "image_processor", None)
+        if ip is None or self.device is None:
+            return
+        self._img_mean = torch.tensor(ip.image_mean, device=self.device, dtype=torch.float32).view(1, 3, 1, 1)
+        self._img_std = torch.tensor(ip.image_std, device=self.device, dtype=torch.float32).view(1, 3, 1, 1)
+        self._rescale = float(getattr(ip, "rescale_factor", 1.0 / 255.0))
+        size = ip.size if isinstance(ip.size, dict) else {}
+        self._shortest_edge = int(size.get("shortest_edge", 800))
+        self._longest_edge = int(size.get("longest_edge", 1333))
+        self._text_cache_key = None
+        self._text_cache = None
+
+    def _resize_hw(self, h, w):
+        """Aspect-preserving target (H, W) matching HF get_size_with_aspect_ratio."""
+        size = self._shortest_edge
+        max_size = self._longest_edge
+        if max_size is not None:
+            min_o = float(min(h, w))
+            max_o = float(max(h, w))
+            if max_o / min_o * size > max_size:
+                size = int(round(max_size * min_o / max_o))
+        if (h <= w and h == size) or (w <= h and w == size):
+            return h, w
+        if w < h:
+            return int(round(size * h / w)), size
+        return size, int(round(size * w / h))
+
+    def _preprocess_image_gpu(self, image_gpu):
+        """(H, W, C>=3) uint8 GPU tensor -> (1, 3, H', W') normalized float on device."""
+        img = image_gpu[..., :3].to(self.device)
+        img = img.permute(2, 0, 1).unsqueeze(0).to(torch.float32).contiguous()  # (1,3,H,W)
+        img = img * self._rescale
+        h, w = img.shape[-2], img.shape[-1]
+        nh, nw = self._resize_hw(h, w)
+        if (nh, nw) != (h, w):
+            img = torch.nn.functional.interpolate(
+                img, size=(nh, nw), mode="bilinear", align_corners=False, antialias=True
+            )
+        return (img - self._img_mean) / self._img_std
+
+    def _encode_text(self, texts_prompt):
+        """Tokenize the (static) prompt set once and reuse the GPU tensors every frame."""
+        if len(texts_prompt) > 1:
+            combined = ". ".join(texts_prompt)
+            if not combined.endswith("."):
+                combined += "."
+            prompts = [combined]
+        else:
+            prompts = [p if p.endswith(".") else p + "." for p in texts_prompt]
+        key = tuple(prompts)
+        if key != getattr(self, "_text_cache_key", None):
+            self._text_cache = self.processor.tokenizer(
+                prompts, padding=True, return_tensors="pt"
+            ).to(self.device)
+            self._text_cache_key = key
+        return self._text_cache
+
+    def predict_gpu(self, image_gpu, texts_prompt, box_threshold, text_threshold, orig_hw):
+        """Run detection entirely on GPU. image_gpu: (H, W, C) uint8 CUDA tensor.
+        orig_hw: (H, W) of the original frame for box rescaling."""
+        enc = self._encode_text(texts_prompt)
+        pixel_values = self._preprocess_image_gpu(image_gpu)
+        use_amp = self.device is not None and self.device.type == "cuda"
+        with torch.no_grad(), torch.autocast(
+            device_type=self.device.type if self.device is not None else "cpu",
+            dtype=torch.bfloat16,
+            enabled=use_amp,
+        ):
+            outputs = self.model(
+                pixel_values=pixel_values,
+                input_ids=enc.input_ids,
+                token_type_ids=enc.get("token_type_ids"),
+                attention_mask=enc.attention_mask,
+            )
+        return self.processor.post_process_grounded_object_detection(
+            outputs,
+            enc.input_ids,
+            box_threshold,
+            text_threshold=text_threshold,
+            target_sizes=[orig_hw],
+        )
+
 
 
 
@@ -276,10 +452,17 @@ class TextPromptPublisher(Operator):
 class LangSAM2Operator(Operator):
     """Operator to perform inference using LangSAM (Grounding DINO + SAM2)"""
 
-    def __init__(self, *args, sam_type="sam2.1_hiera_small", sam_ckpt_path: str | None = None, gdino_model_ckpt_path: str | None = None, gdino_processor_ckpt_path: str | None = None, gdino_model_id: str = "IDEA-Research/grounding-dino-base", gdino_input_size: int | None = None, device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"), timing=False, timing_log_every=30, **kwargs):
+    def __init__(self, *args, sam_type="sam2.1_hiera_small", sam_ckpt_path: str | None = None, gdino_model_ckpt_path: str | None = None, gdino_processor_ckpt_path: str | None = None, gdino_model_id: str = "IDEA-Research/grounding-dino-base", gdino_input_size: int | None = None, gdino_gpu_preprocess: bool = True, sam_gpu_output: bool = True, gdino_compile: bool = False, sam_compile: bool = False, device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"), timing=False, timing_log_every=30, **kwargs):
         super().__init__(*args, **kwargs)
         self.sam_type = sam_type
         self.device = device
+        # When True, run Grounding DINO fully on GPU (no PIL, no CPU image processor, no
+        # host<->device copies for detection, cached text tokenization). False falls back
+        # to the original PIL + HF-processor path.
+        self.gdino_gpu_preprocess = gdino_gpu_preprocess
+        # When True, keep SAM masks on the GPU (avoids SAM2's full-res float mask
+        # device->host->device roundtrip). False uses the stock numpy predict_batch.
+        self.sam_gpu_output = sam_gpu_output
 
         # Opt-in per-stage timing to split the per-frame cost into GDINO vs SAM. Off by
         # default (zero overhead). When on, logs a rolling average every timing_log_every
@@ -289,14 +472,16 @@ class LangSAM2Operator(Operator):
         self._timing_log_every = max(1, int(timing_log_every))
         self._t_gdino = 0.0
         self._t_sam = 0.0
+        self._t_sam_enc = 0.0  # SAM: set_image_batch (encoder)
+        self._t_sam_dec = 0.0  # SAM: predict_batch (decoder + postprocess upsampling)
         self._t_frames = 0
 
         # Initialize SAM model
-        self.sam = SAM(sam_type, sam_ckpt_path, device=device)
+        self.sam = SAM(sam_type, sam_ckpt_path, device=device, compile_model=sam_compile)
         self.sam.build_model()
 
         # Initialize Grounding DINO model
-        self.gdino = GDINO(model_ckpt_path=gdino_model_ckpt_path, processor_ckpt_path=gdino_processor_ckpt_path, device=device, model_id=gdino_model_id, input_size=gdino_input_size)
+        self.gdino = GDINO(model_ckpt_path=gdino_model_ckpt_path, processor_ckpt_path=gdino_processor_ckpt_path, device=device, model_id=gdino_model_id, input_size=gdino_input_size, compile_model=gdino_compile)
         self.gdino.build_model()
 
     def _sync(self):
@@ -328,27 +513,21 @@ class LangSAM2Operator(Operator):
             print("Warning: No image tensor received")
             return
 
-        image_np = cp.asarray(image_tensor).get()
+        # The frame arrives on the GPU. Grounding DINO now consumes it directly on-device
+        # (see gdino_gpu_preprocess). SAM2's public API is numpy-only, so we still copy the
+        # frame to host once for it -- that single .get() is the only remaining gpu->host.
+        cp_img = cp.asarray(image_tensor)          # (H, W, C) uint8 on GPU
+        H0, W0 = int(cp_img.shape[0]), int(cp_img.shape[1])
 
-        # Drop alpha channel and produce a single contiguous uint8 RGB array, reused for
-        # both Grounding DINO (via PIL) and SAM2 (directly) -- avoids a redundant
-        # PIL->numpy round-trip when building the SAM input below.
+        image_np = cp_img.get()
         rgb_np = image_np[..., :3] if image_np.shape[-1] == 4 else image_np
         rgb_np = np.ascontiguousarray(rgb_np, dtype=np.uint8)
-
-        # Grounding DINO's HF processor expects PIL/CPU input.
-        image_pil = Image.fromarray(rgb_np)
+        rgb_images = [rgb_np]  # stays index-parallel to gdino_results for SAM below
 
         # Get text prompts (assume it's a list of strings or a single string)
         text_prompts = text_prompts_message.get("text_prompts")
         if isinstance(text_prompts, str):
             text_prompts = [text_prompts]
-
-        # Wrap single image and prompts in lists for batch processing.
-        # rgb_images stays parallel to images_pil so SAM can consume the numpy array
-        # directly (see the sam_images.append below).
-        images_pil = [image_pil]
-        rgb_images = [rgb_np]
         texts_prompt = text_prompts if isinstance(text_prompts, list) else [text_prompts]
 
         # Get threshold parameters
@@ -357,7 +536,16 @@ class LangSAM2Operator(Operator):
 
         # Run Grounding DINO to get bounding boxes
         self._sync(); _t0 = time.perf_counter()
-        gdino_results = self.gdino.predict(images_pil, texts_prompt, box_threshold, text_threshold)
+        if self.gdino_gpu_preprocess:
+            # Zero-copy view of the GPU frame as a torch tensor; no host round-trip.
+            img_gpu = torch.from_dlpack(cp_img)
+            gdino_results = self.gdino.predict_gpu(
+                img_gpu, texts_prompt, box_threshold, text_threshold, (H0, W0)
+            )
+        else:
+            gdino_results = self.gdino.predict(
+                [Image.fromarray(rgb_np)], texts_prompt, box_threshold, text_threshold
+            )
         self._sync(); _t_gdino = time.perf_counter() - _t0
         _t_sam = 0.0
 
@@ -394,11 +582,19 @@ class LangSAM2Operator(Operator):
             all_results.append(processed_result)
 
         # Run SAM2 to generate masks if any boxes were detected
+        _t_sam_enc = 0.0
+        _t_sam_dec = 0.0
         if sam_images:
             print(f"Predicting {len(sam_boxes)} masks")
             self._sync(); _t1 = time.perf_counter()
-            masks, mask_scores, _ = self.sam.predict_batch(sam_images, xyxy=sam_boxes)
+            if self.sam_gpu_output:
+                masks, mask_scores, _ = self.sam.predict_batch_gpu(sam_images, xyxy=sam_boxes, timing=self.timing)
+            else:
+                masks, mask_scores, _ = self.sam.predict_batch(sam_images, xyxy=sam_boxes, timing=self.timing)
             self._sync(); _t_sam = time.perf_counter() - _t1
+            if self.timing:
+                _t_sam_enc = self.sam.last_encode_ms / 1000.0
+                _t_sam_dec = self.sam.last_decode_ms / 1000.0
             for idx, mask, score in zip(sam_indices, masks, mask_scores):
                 all_results[idx].update(
                     {
@@ -417,18 +613,25 @@ class LangSAM2Operator(Operator):
                 self.sam.predictor._orig_hw = None
                 self.sam.predictor._is_image_set = False
 
-        # Per-stage timing: rolling GDINO vs SAM average, logged every N frames.
+        # Per-stage timing: rolling GDINO vs SAM average (with SAM encode/decode split),
+        # logged every N frames.
         if self.timing:
             self._t_gdino += _t_gdino
             self._t_sam += _t_sam
+            self._t_sam_enc += _t_sam_enc
+            self._t_sam_dec += _t_sam_dec
             self._t_frames += 1
             if self._t_frames % self._timing_log_every == 0:
                 n = self._timing_log_every
                 print(f"[langsam timing] last {n} frames avg: "
                       f"GDINO={1000 * self._t_gdino / n:.1f} ms, "
-                      f"SAM={1000 * self._t_sam / n:.1f} ms")
+                      f"SAM={1000 * self._t_sam / n:.1f} ms "
+                      f"(encode={1000 * self._t_sam_enc / n:.1f}, "
+                      f"decode+post={1000 * self._t_sam_dec / n:.1f})")
                 self._t_gdino = 0.0
                 self._t_sam = 0.0
+                self._t_sam_enc = 0.0
+                self._t_sam_dec = 0.0
 
         # Convert results for output. For the single-image case, use the first result.
         result = all_results[0]

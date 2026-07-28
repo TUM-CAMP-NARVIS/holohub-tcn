@@ -64,7 +64,8 @@ da3_inference:
 
 # LangSAM (Grounding DINO + SAM2) Configuration
 langsam_inference:
-  sam_type: "sam2.1_hiera_small"
+  # A/B: sam2.1_hiera_tiny (faster encoder) vs sam2.1_hiera_small (higher quality).
+  sam_type: "sam2.1_hiera_tiny"
   sam_ckpt_path: null
   gdino_model_ckpt_path: null  # Set to null to download from HuggingFace, or provide local path
   gdino_processor_ckpt_path: null  # Set to null to download from HuggingFace, or provide local path
@@ -75,6 +76,17 @@ langsam_inference:
   # camera frame -- the main GDINO cost is here, not the backbone. Lower = faster; raise
   # toward 640/800 if small objects are missed. null = keep the HF default (800).
   gdino_input_size: 512
+  # Run Grounding DINO fully on GPU (no PIL / CPU image processor / host<->device copies,
+  # cached text tokenization). Set false to fall back to the original PIL path.
+  gdino_gpu_preprocess: true
+  # Keep SAM masks on the GPU (avoids SAM2's full-res float mask device->host->device
+  # roundtrip). Set false to use the stock numpy predict_batch path.
+  sam_gpu_output: true
+  # torch.compile the GDINO model / SAM2 image encoder (no quality loss). WARNING: first-
+  # forward compilation is heavy on host RAM and can OOM (SIGKILL/-9), especially GDINO.
+  # Enable ONE at a time and watch memory; sam_compile is the safer/cleaner target.
+  gdino_compile: false
+  sam_compile: true
   box_threshold: 0.3
   text_threshold: 0.25
   # Set true to log rolling GDINO-vs-SAM per-stage timing (to find the bottleneck).
