@@ -68,8 +68,18 @@ langsam_inference:
   sam_ckpt_path: null
   gdino_model_ckpt_path: null  # Set to null to download from HuggingFace, or provide local path
   gdino_processor_ckpt_path: null  # Set to null to download from HuggingFace, or provide local path
+  # Grounding DINO variant (used when the local paths above are null). "-tiny" (Swin-T) is
+  # a smaller backbone than "-base" (Swin-B); switch back to base if detection quality suffers.
+  gdino_model_id: "IDEA-Research/grounding-dino-tiny"
+  # Detector resize target (shortest edge, px). HF default is 800, which UPSCALES a typical
+  # camera frame -- the main GDINO cost is here, not the backbone. Lower = faster; raise
+  # toward 640/800 if small objects are missed. null = keep the HF default (800).
+  gdino_input_size: 512
   box_threshold: 0.3
   text_threshold: 0.25
+  # Set true to log rolling GDINO-vs-SAM per-stage timing (to find the bottleneck).
+  timing: true
+  timing_log_every: 30
 
 text_prompts:
   prompts: ["floor", "person", "robot", "furniture", "lamp"]
