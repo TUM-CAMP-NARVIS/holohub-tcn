@@ -61,6 +61,16 @@ For custom Docker builds:
 ./holohub run-container tcn_shm_receiver --gpu-type dgpu
 ```
 
+## Models
+
+### Depth-Anything-3 ONNX
+
+The DA3 fragment needs an ONNX model exported with a **channels-last (NHWC)** input to match
+the Holoscan `FormatConverterOp` / DepthAnything-V2 contract — the stock Depth-Anything-3
+exporter produces an NCHW graph that TensorRT silently misreads. See
+[`docs/da3_onnx_export.md`](docs/da3_onnx_export.md) for the how-to and
+[`docs/da3_export.py`](docs/da3_export.py) for the ready-to-run patched exporter.
+
 ## Development
 
 ### Project Structure
