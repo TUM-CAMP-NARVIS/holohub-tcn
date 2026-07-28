@@ -94,7 +94,8 @@ langsam_inference:
   timing_log_every: 30
 
 text_prompts:
-  prompts: ["floor", "person", "robot", "furniture", "lamp"]
+#  prompts: ["floor", "person", "robot", "furniture", "lamp"]
+  prompts: ["floor", "person"]
 
 langsam_postprocessor:
   save_intermediate: false
