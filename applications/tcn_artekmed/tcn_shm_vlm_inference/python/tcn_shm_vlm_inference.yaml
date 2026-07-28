@@ -15,6 +15,7 @@ camera_stream_processing:
   enable_da2: False
   enable_da3: False
   enable_langsam: True
+  enable_langsam_multicam: False
 
 
 # Depth Anything V2 Example
@@ -100,6 +101,21 @@ text_prompts:
 langsam_postprocessor:
   save_intermediate: false
   verbose: false
+
+# Multi-camera LangSAM: one worker (model instance) per GPU, each batching a camera subset.
+# Reuses langsam_inference (models/thresholds/flags) and text_prompts (class ids) for every
+# worker. Omit or empty `workers` -> a single worker on GPU 0 processing all color cameras.
+langsam_multicam:
+  workers:
+    - device: 0
+      cameras: ["camera01_colorimage", "camera02_colorimage"]
+    - device: 1
+      cameras: ["camera03_colorimage", "camera04_colorimage", "camera05_colorimage"]
+
+langsam_multicam_holoviz:
+  width: 1920
+  height: 1080
+  framerate: 30
 
 debug_output:
   enable_colorimage: True

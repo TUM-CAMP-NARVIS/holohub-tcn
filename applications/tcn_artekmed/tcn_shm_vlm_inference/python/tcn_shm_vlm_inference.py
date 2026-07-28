@@ -45,6 +45,7 @@ from tcnart.core.semantic_type.model import ImageFormatTypes
 from da3_fragment import DA3MetricProcessingSubgraph, DA3PostprocessorOp
 from da2_fragment import DA2MetricProcessingSubgraph, DA2PostprocessorOp
 from langsam_fragment import LangSamProcessingSubgraph
+from langsam_multicam_fragment import LangSamMultiCamProcessingSubgraph
 
 
 log = logging.getLogger(__name__)
@@ -342,6 +343,25 @@ class App(hs.core.Application):
 
             self.add_flow(inference_input[0], langsam_pipeline, {(inference_input[1], "input")})
             self.add_flow(langsam_pipeline, langsam_holoviz, {("output_masks", "receivers")})
+            have_camera_consumer = True
+
+        if camera_streams_config.get("enable_langsam_multicam", False):
+            all_color_cams = [c["name"] for c in color_streams_config]
+            langsam_mc = LangSamMultiCamProcessingSubgraph(
+                self, "langsam_multicam", self.kwargs, all_color_cams)
+
+            langsam_mc_holoviz = HolovizOp(
+                self,
+                allocator=device_memory_pool,
+                name="langsam_multicam_holoviz",
+                window_title="LangSAM Multi-Camera Masks",
+                **self.kwargs("langsam_multicam_holoviz"),
+            )
+
+            # Feed the full color entity (all cameras) straight in; workers self-select.
+            self.add_flow(subscriber_op, langsam_mc, {("color_outputs", "input")})
+            self.add_flow(langsam_mc, langsam_mc_holoviz, {("output_viz", "receivers")})
+            self.add_flow(langsam_mc, langsam_mc_holoviz, {("output_specs", "input_specs")})
             have_camera_consumer = True
 
         if not have_camera_consumer:
