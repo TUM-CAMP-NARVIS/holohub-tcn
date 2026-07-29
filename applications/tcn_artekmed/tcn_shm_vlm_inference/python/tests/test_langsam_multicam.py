@@ -18,6 +18,9 @@ from langsam_helpers import (
     class_id_map,
     class_id_for_label,
     build_label_map,
+    build_panoptic_map,
+    panoptic_class,
+    panoptic_instance,
 )
 
 ALL = ["camera01_colorimage", "camera02_colorimage", "camera03_colorimage"]
@@ -77,6 +80,36 @@ def test_build_label_map_skips_unknown_labels():
     mask = np.ones((1, H, W), bool)
     lm = build_label_map(mask, ["lamp"], np.array([0.9]), cmap, H, W, xp=np)  # lamp unknown
     assert int(lm.max()) == 0  # nothing painted
+
+
+def test_build_panoptic_map_packs_class_and_per_class_instances():
+    cmap = class_id_map(["floor", "person"])
+    H = W = 6
+    # two person instances (disjoint) + one floor
+    p1 = np.zeros((H, W), bool); p1[0:2, 0:2] = True
+    p2 = np.zeros((H, W), bool); p2[0:2, 4:6] = True
+    fl = np.zeros((H, W), bool); fl[4:6, 0:2] = True
+    masks = np.stack([p1, p2, fl])
+    labels = ["person", "person", "floor"]
+    scores = np.array([0.9, 0.6, 0.8])       # p1 most confident person, then p2
+    pm = build_panoptic_map(masks, labels, scores, cmap, H, W, xp=np)
+    assert pm.dtype == np.uint16
+    # class ids in high byte: person=2, floor=1
+    assert panoptic_class(pm[0, 0]) == 2 and panoptic_instance(pm[0, 0]) == 1   # top person
+    assert panoptic_class(pm[0, 4]) == 2 and panoptic_instance(pm[0, 4]) == 2   # 2nd person
+    assert panoptic_class(pm[4, 0]) == 1 and panoptic_instance(pm[4, 0]) == 1   # floor inst 1
+    assert pm[3, 3] == 0                                                        # background
+
+
+def test_build_panoptic_map_overlap_highest_score_wins():
+    cmap = class_id_map(["person"])
+    H = W = 4
+    a = np.zeros((H, W), bool); a[0:3, 0:3] = True   # score 0.4
+    b = np.zeros((H, W), bool); b[1:4, 1:4] = True   # score 0.9 (wins overlap, instance 1)
+    pm = build_panoptic_map(np.stack([a, b]), ["person", "person"], np.array([0.4, 0.9]),
+                            cmap, H, W, xp=np)
+    assert panoptic_instance(pm[2, 2]) == 1          # overlap -> most-confident instance (b)
+    assert panoptic_class(pm[2, 2]) == 1
 
 
 if __name__ == "__main__":

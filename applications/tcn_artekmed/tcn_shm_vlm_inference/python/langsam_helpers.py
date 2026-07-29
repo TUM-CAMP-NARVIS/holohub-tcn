@@ -56,3 +56,47 @@ def build_label_map(masks, labels, scores, cmap, height, width, xp=np):
             continue
         label_map[masks[j] > 0] = cid
     return label_map
+
+
+# Packed panoptic encoding: value = (class_id << 8) | instance_id; 0 = background.
+PANOPTIC_CLASS_SHIFT = 8
+PANOPTIC_INSTANCE_MASK = 0xFF
+
+
+def panoptic_class(value):
+    """Class id from a packed panoptic value (scalar or array)."""
+    return value >> PANOPTIC_CLASS_SHIFT
+
+
+def panoptic_instance(value):
+    """Instance id from a packed panoptic value (scalar or array)."""
+    return value & PANOPTIC_INSTANCE_MASK
+
+
+def build_panoptic_map(masks, labels, scores, cmap, height, width, xp=np):
+    """(M,H,W) masks + labels + scores -> (H,W) uint16 panoptic map.
+
+    Each value packs ``(class_id << 8) | instance_id`` (0 = background). Instances are
+    numbered per class by descending score (instance 1 = most confident); painting is done in
+    ascending score order so the most confident detection wins on overlap. Instance ids are
+    per-frame (not temporally stable). Unknown labels (class id 0) are skipped.
+    """
+    pmap = xp.zeros((height, width), dtype=xp.uint16)
+    if masks is None or len(masks) == 0:
+        return pmap
+    order = xp.argsort(scores)
+    order = [int(i) for i in (order.tolist() if hasattr(order, "tolist") else order)]
+    inst_count = {}
+    value_of = {}
+    for j in reversed(order):                       # descending score: number instances
+        cid = class_id_for_label(labels[j], cmap)
+        if cid == 0:
+            value_of[j] = 0
+            continue
+        inst_count[cid] = inst_count.get(cid, 0) + 1
+        value_of[j] = (cid << PANOPTIC_CLASS_SHIFT) | min(inst_count[cid], PANOPTIC_INSTANCE_MASK)
+    for j in order:                                 # ascending score: highest wins overlap
+        v = value_of[j]
+        if v:
+            pmap[masks[j] > 0] = v
+    return pmap

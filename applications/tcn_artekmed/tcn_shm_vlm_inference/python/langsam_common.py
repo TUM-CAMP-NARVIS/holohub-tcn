@@ -28,7 +28,32 @@ from langsam_helpers import (  # noqa: F401
     class_id_map,
     class_id_for_label,
     build_label_map,
+    build_panoptic_map,
+    panoptic_class,
+    panoptic_instance,
 )
+
+
+def build_panoptic_lut(num_classes, max_instances=64, alpha=180):
+    """RGBA LUT indexed directly by a packed uint16 panoptic value (``lut[panoptic_map]``).
+
+    Classes get large color differences (tab20 base colors); instances of a class get a
+    subtle per-instance brightness variation. Class 0 (background) -> transparent.
+    Returns a cupy ``uint8`` array of shape ``((num_classes + 1) << 8, 4)``.
+    """
+    pal = plt.get_cmap("tab20")(np.linspace(0, 1, 20))[:, :3] * 255.0
+    factors = np.array([1.0, 0.78, 0.60, 0.90, 0.68, 0.50])   # subtle per-instance brightness
+    size = (num_classes + 1) << 8
+    lut = np.zeros((size, 4), np.uint8)
+    for c in range(1, num_classes + 1):
+        base = pal[(c - 1) % 20]
+        lut[c << 8, :3] = np.clip(base, 0, 255)               # instance 0 fallback -> base
+        lut[c << 8, 3] = alpha
+        for i in range(1, min(max_instances, 255) + 1):
+            f = factors[(i - 1) % len(factors)]
+            lut[(c << 8) | i, :3] = np.clip(base * f, 0, 255)
+            lut[(c << 8) | i, 3] = alpha
+    return cp.asarray(lut)
 
 SAM_MODELS = {
     "sam2.1_hiera_tiny": {

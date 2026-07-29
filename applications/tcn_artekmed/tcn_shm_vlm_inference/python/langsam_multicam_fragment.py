@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Multi-camera LangSAM: batched Grounding DINO + SAM2 over all color cameras, split across
-GPUs, emitting a composite entity of per-camera uint8 class-label maps plus a tiled view.
+GPUs, emitting a composite entity of per-camera uint16 panoptic maps (class<<8 | instance)
+plus a tiled colorized view.
 
 See docs/specs/2026-07-28-langsam-multicam-design.md.
 """
@@ -16,7 +17,9 @@ import holoscan as hs
 from holoscan.core import Operator, OperatorSpec, Subgraph, IOSpec
 from holoscan.operators import HolovizOp
 
-from langsam_common import SAM, GDINO, resolve_workers, class_id_map, build_label_map
+from langsam_common import (
+    SAM, GDINO, resolve_workers, class_id_map, build_panoptic_map, build_panoptic_lut,
+)
 
 log = logging.getLogger(__name__)
 
@@ -30,7 +33,8 @@ class LangSamBatchOp(Operator):
     """Batched LangSAM over a subset of cameras on one GPU.
 
     In:  `color_input` (the full color_outputs entity, named GPU tensors).
-    Out: `masks` (dict of `<cam>_mask` -> cupy uint8 (H,W) label maps on `device`).
+    Out: `masks` (dict of `<cam>_mask` -> cupy uint16 (H,W) panoptic maps `(class<<8|inst)`
+         on `device`).
     """
 
     def __init__(self, fragment, *args, cameras, device, langsam_cfg, prompts, **kwargs):
@@ -108,17 +112,17 @@ class LangSamBatchOp(Operator):
                     sam_labels.append(labels)
                     sam_idx.append(i)
 
-            label_maps = {i: build_label_map(None, [], None, self._cmap, hw[0], hw[1], xp=cp)
-                          for i in range(len(names))}
+            pmaps = {i: build_panoptic_map(None, [], None, self._cmap, hw[0], hw[1], xp=cp)
+                     for i in range(len(names))}
 
             if sam_np:
                 masks, mscores, _ = self.sam.predict_batch_gpu(sam_np, xyxy=sam_boxes, timing=False)
                 for k, i in enumerate(sam_idx):
-                    label_maps[i] = build_label_map(
+                    pmaps[i] = build_panoptic_map(
                         masks[k], sam_labels[k], mscores[k], self._cmap, hw[0], hw[1], xp=cp)
 
             for i, cam in enumerate(names):
-                out[_mask_name(cam)] = hs.as_tensor(cp.ascontiguousarray(label_maps[i]))
+                out[_mask_name(cam)] = hs.as_tensor(cp.ascontiguousarray(pmaps[i]))
         op_output.emit(out, "masks")
 
 
@@ -149,12 +153,9 @@ class LabelMapColorizeOp(Operator):
     """Colorize per-camera label maps via a class LUT -> RGBA, and emit tiled Holoviz specs."""
 
     def __init__(self, fragment, *args, num_classes, alpha=180, **kwargs):
-        pal = plt.get_cmap("tab20")(np.linspace(0, 1, 20))[:, :3] * 255
-        lut = np.zeros((num_classes + 1, 4), np.uint8)     # class 0 -> transparent background
-        for c in range(1, num_classes + 1):
-            lut[c, :3] = pal[(c - 1) % 20]
-            lut[c, 3] = alpha
-        self._lut = cp.asarray(lut)
+        # Panoptic LUT indexed directly by the packed uint16 value (class<<8|instance):
+        # class = large color difference, instance = subtle brightness variation.
+        self._lut = build_panoptic_lut(num_classes, alpha=alpha)
         super().__init__(fragment, *args, **kwargs)
 
     def setup(self, spec: OperatorSpec):
@@ -168,8 +169,8 @@ class LabelMapColorizeOp(Operator):
         out = {}
         with cp.cuda.Device(0):
             for name in names:
-                lm = cp.asarray(msg.get(name))          # (H,W) uint8
-                rgba = self._lut[lm]                     # (H,W,4) uint8
+                pmap = cp.asarray(msg.get(name))        # (H,W) uint16 panoptic (class<<8|inst)
+                rgba = self._lut[pmap]                   # (H,W,4) uint8
                 out[name] = hs.as_tensor(cp.ascontiguousarray(rgba))
         op_output.emit(out, "viz")
         op_output.emit(self._tiled_specs(names), "specs")

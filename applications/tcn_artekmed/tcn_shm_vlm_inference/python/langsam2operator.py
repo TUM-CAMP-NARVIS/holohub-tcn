@@ -33,7 +33,9 @@ from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
 from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 from sam2.sam2_image_predictor import SAM2ImagePredictor
-from langsam_common import SAM, GDINO, SAM_MODELS
+from langsam_common import (
+    SAM, GDINO, SAM_MODELS, class_id_map, build_panoptic_map, build_panoptic_lut,
+)
 
 
 class TextPromptPublisher(Operator):
@@ -304,6 +306,10 @@ class LangSamPostprocessorOp(Operator):
         self._label_to_idx = {}
         for prompt in (prompts or []):
             self._register_label(prompt)
+        # Panoptic (class, instance) coloring: class ids from the prompt order, and an RGBA
+        # LUT indexed by the packed uint16 value (class = big color diff, instance = subtle).
+        self._cmap = class_id_map(prompts or [])
+        self._panoptic_lut = build_panoptic_lut(len(prompts or []), alpha=mask_alpha)
 
     @staticmethod
     def _normalize_label(label):
@@ -327,12 +333,11 @@ class LangSamPostprocessorOp(Operator):
         # Unknown label: assign and remember the next free slot.
         return self._register_label(label)
 
-    def _composite_masks(self, masks, labels=None):
-        """Composite all detection masks into a single (H, W, 4) RGBA image.
-
-        Each instance is colored by its class label (stable across frames); where masks
-        overlap the later (lower-scoring) instance is drawn on top. Background stays
-        transparent. `masks` is a cupy array of shape (N, H, W), (N, 1, H, W) or (H, W).
+    def _composite_masks(self, masks, labels=None, scores=None):
+        """Composite all detection masks into a single (H, W, 4) RGBA image colored by
+        (class, instance): classes get large color differences, instances a subtle brightness
+        variation. Overlaps resolve to the most-confident detection. `masks` is a cupy array
+        of shape (N, H, W), (N, 1, H, W) or (H, W).
         """
         if masks.ndim == 4:
             # (N, num_masks_per_detection, H, W) -> (N, H, W): SAM ran multimask_output=False
@@ -341,19 +346,15 @@ class LangSamPostprocessorOp(Operator):
             masks = masks[None, ...]
 
         num_instances, h, w = masks.shape
-        rgba = cp.zeros((h, w, 4), dtype=cp.uint8)
-        for i in range(num_instances):
-            m = masks[i] > 0.5
-            if labels is not None and i < len(labels):
-                color_idx = self._color_index_for_label(labels[i])
-            else:
-                color_idx = i  # no label available -> fall back to per-instance color
-            color = self.palette[color_idx % self.palette.shape[0]]
-            rgba[m, 0:3] = color
-            rgba[m, 3] = self.mask_alpha
+        if labels is None:
+            labels = [""] * num_instances
+        if scores is None:
+            scores = cp.arange(num_instances, dtype=cp.float32)
+        pmap = build_panoptic_map(masks, labels, scores, self._cmap, h, w, xp=cp)
+        rgba = self._panoptic_lut[pmap]
         if self.verbose:
-            print(f"Composited {num_instances} mask(s) into {rgba.shape} RGBA; "
-                  f"labels={list(labels) if labels is not None else None}")
+            print(f"Composited {num_instances} mask(s) -> panoptic {pmap.shape}; "
+                  f"labels={list(labels)}")
         return rgba
 
     def setup(self, spec: OperatorSpec):
@@ -410,7 +411,7 @@ class LangSamPostprocessorOp(Operator):
         # Composite ALL detected masks into one RGBA image, each instance in a distinct
         # color. (Previously this selected only the single argmax-scoring mask, which is
         # why just one object showed up and it flipped between objects frame-to-frame.)
-        rgba_mask = self._composite_masks(masks, labels)
+        rgba_mask = self._composite_masks(masks, labels, mask_scores)
 
         # Make array contiguous
         rgba_mask = cp.ascontiguousarray(rgba_mask)

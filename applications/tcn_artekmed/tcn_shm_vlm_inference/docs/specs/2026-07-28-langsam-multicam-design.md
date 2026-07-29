@@ -36,7 +36,15 @@ one per color port — `camera01_colorimage` … `cameraNN_colorimage`, each `ui
 
 ### Output
 `output_masks`: a composite entity of named tensors `camera0X_mask`, each a full-resolution
-**`uint8` `[H, W]` class-label map**:
+`[H, W]` label map.
+
+> **Update (2026-07-29): panoptic (class, instance).** The map is now **`uint16`** packing
+> `(class_id << 8) | instance_id` (`0` = background). Query class with `value >> 8`, instance
+> with `value & 0xFF`. Instances are numbered per class by descending score (instance 1 =
+> most confident) and are **per-frame** (not temporally tracked). The class-only `uint8`
+> form below is superseded.
+
+Original class-only contract:
 - `0` = background.
 - `i` = class `i`, where class ids follow the `text_prompts.prompts` order (`prompt[0]`→1,
   `prompt[1]`→2, …). This mapping is the documented contract for downstream consumers.
