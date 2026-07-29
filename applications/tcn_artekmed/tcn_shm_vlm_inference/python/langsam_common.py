@@ -191,26 +191,54 @@ class SAM:
         logits = [np.squeeze(logit, axis=1) if len(logit.shape) > 3 else logit for logit in logits]
         return masks, scores, logits
 
+    @torch.no_grad()
+    def _set_image_batch_gpu(self, images_gpu):
+        """GPU-native SAM2 `set_image_batch`: `images_gpu` is a list of (H,W,3) uint8 CUDA
+        tensors (RGB). Replicates `predictor.set_image_batch()` exactly but runs the
+        resize+normalize on the GPU (reusing SAM2's own scripted transform), so the images
+        never round-trip through host memory. Sets the predictor's `_features`/`_orig_hw`
+        state so `_predict` works as usual.
+        """
+        p = self.predictor
+        p.reset_predictor()
+        p._orig_hw = [(int(im.shape[0]), int(im.shape[1])) for im in images_gpu]
+        resize_norm = p._transforms.transforms   # scripted Resize(1024)+Normalize (runs on GPU)
+        batch = torch.stack(
+            [resize_norm(im.permute(2, 0, 1).to(torch.float32).div_(255.0)) for im in images_gpu],
+            dim=0,
+        ).to(self.device)
+        model = p.model
+        backbone_out = model.forward_image(batch)
+        _, vision_feats, _, _ = model._prepare_backbone_features(backbone_out)
+        if model.directly_add_no_mem_embed:
+            vision_feats[-1] = vision_feats[-1] + model.no_mem_embed
+        bsz = batch.shape[0]
+        feats = [
+            feat.permute(1, 2, 0).view(bsz, -1, *feat_size)
+            for feat, feat_size in zip(vision_feats[::-1], p._bb_feat_sizes[::-1])
+        ][::-1]
+        p._features = {"image_embed": feats[-1], "high_res_feats": feats[:-1]}
+        p._is_image_set = True
+        p._is_batch = True
+
     def predict_batch_gpu(
         self,
-        images_rgb: list[np.ndarray],
-        xyxy: list[np.ndarray],
+        images,
+        xyxy: list,
         timing: bool = False,
     ) -> tuple[list, list, None]:
-        """Same as predict_batch but keeps masks ON THE GPU.
+        """Fully GPU-resident batched SAM: `images` is a list of (H,W,3) uint8 CUDA tensors.
 
-        SAM2's predict_batch does `masks.float().detach().cpu().numpy()` -- shipping N
-        full-resolution FLOAT masks to the host every frame, which we then push straight
-        back to the GPU for compositing. This replicates SAM2's per-image loop (using its
-        _prep_prompts/_predict) but returns cupy uint8 (N, H, W) masks + cupy scores, so the
-        masks never leave the device. The `decode` timer here therefore excludes the host
-        transfer -- comparing it to predict_batch's tells us if the transfer was the cost.
+        Encodes them via `_set_image_batch_gpu` (no host round-trip -- the old numpy
+        `set_image_batch` path uploaded each frame from host every tick), runs SAM2's
+        per-image decode (`_prep_prompts`/`_predict`), and returns cupy uint8 (N,H,W) masks +
+        cupy scores so masks also never leave the device.
         """
         p = self.predictor
         with self._autocast():
             if timing:
                 self._sync(); _t0 = time.perf_counter()
-            p.set_image_batch(images_rgb)
+            self._set_image_batch_gpu(images)
             if timing:
                 self._sync(); self.last_encode_ms = (time.perf_counter() - _t0) * 1000.0
                 _t1 = time.perf_counter()

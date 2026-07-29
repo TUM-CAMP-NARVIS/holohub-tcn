@@ -118,16 +118,22 @@ class LangSAM2Operator(Operator):
             print("Warning: No image tensor received")
             return
 
-        # The frame arrives on the GPU. Grounding DINO now consumes it directly on-device
-        # (see gdino_gpu_preprocess). SAM2's public API is numpy-only, so we still copy the
-        # frame to host once for it -- that single .get() is the only remaining gpu->host.
-        cp_img = cp.asarray(image_tensor)          # (H, W, C) uint8 on GPU
+        # The frame arrives on the GPU (RGBA from ConvertBgraToRgbaOp). Both GDINO and SAM
+        # now consume it on-device (gdino_gpu_preprocess / sam_gpu_output), so no host copy is
+        # needed on the fast path. rgb_np is only built for the eager fallbacks.
+        cp_img = cp.asarray(image_tensor)          # (H, W, C) uint8 on GPU (RGBA)
         H0, W0 = int(cp_img.shape[0]), int(cp_img.shape[1])
+        rgb_gpu = torch.from_dlpack(cp_img)[..., :3].contiguous()  # (H,W,3) RGB on GPU
 
-        image_np = cp_img.get()
-        rgb_np = image_np[..., :3] if image_np.shape[-1] == 4 else image_np
-        rgb_np = np.ascontiguousarray(rgb_np, dtype=np.uint8)
-        rgb_images = [rgb_np]  # stays index-parallel to gdino_results for SAM below
+        if self.sam_gpu_output:
+            sam_inputs = [rgb_gpu]          # full-GPU SAM: pass GPU tensors (no host copy)
+            rgb_np = None
+        else:
+            image_np = cp_img.get()
+            rgb_np = np.ascontiguousarray(
+                image_np[..., :3] if image_np.shape[-1] == 4 else image_np, dtype=np.uint8)
+            sam_inputs = [rgb_np]           # stock predict_batch needs numpy
+        rgb_images = sam_inputs  # index-parallel to gdino_results for SAM below
 
         # Get text prompts (assume it's a list of strings or a single string)
         text_prompts = text_prompts_message.get("text_prompts")
@@ -148,6 +154,8 @@ class LangSAM2Operator(Operator):
                 img_gpu, texts_prompt, box_threshold, text_threshold, (H0, W0)
             )
         else:
+            if rgb_np is None:
+                rgb_np = np.ascontiguousarray(cp.asnumpy(cp_img)[..., :3], dtype=np.uint8)
             gdino_results = self.gdino.predict(
                 [Image.fromarray(rgb_np)], texts_prompt, box_threshold, text_threshold
             )

@@ -81,7 +81,7 @@ class LangSamBatchOp(Operator):
         msg = op_input.receive("color_input")
         out = {}
         with torch.cuda.device(self.device), cp.cuda.Device(self.device.index):
-            rgb_gpu, rgb_np, names, hw = [], [], [], None
+            rgb_gpu, names, hw = [], [], None
             for cam in self.cameras:
                 t = msg.get(cam)
                 if t is None:
@@ -90,7 +90,6 @@ class LangSamBatchOp(Operator):
                 img = torch.from_dlpack(cp.asarray(t))               # (H,W,4) BGRA uint8, cuda:0
                 img = img.to(self.device)[..., [2, 1, 0]].contiguous()  # -> RGB on this device
                 rgb_gpu.append(img)
-                rgb_np.append(img.cpu().numpy())                     # host copy for SAM's numpy API
                 names.append(cam)
                 hw = (int(img.shape[0]), int(img.shape[1]))
 
@@ -103,11 +102,11 @@ class LangSamBatchOp(Operator):
                 rgb_gpu, self.prompts, self.box_threshold, self.text_threshold, hw)
 
             # Partition: only cameras with >=1 detection go to SAM; others are all-background.
-            sam_np, sam_boxes, sam_labels, sam_idx = [], [], [], []
+            sam_imgs, sam_boxes, sam_labels, sam_idx = [], [], [], []
             for i, r in enumerate(gres):
                 boxes, labels = self._to_numpy_result(r)
                 if boxes is not None and len(boxes) > 0:
-                    sam_np.append(rgb_np[i])
+                    sam_imgs.append(rgb_gpu[i])          # GPU tensor -> full-GPU SAM (no host copy)
                     sam_boxes.append(boxes)
                     sam_labels.append(labels)
                     sam_idx.append(i)
@@ -115,8 +114,8 @@ class LangSamBatchOp(Operator):
             pmaps = {i: build_panoptic_map(None, [], None, self._cmap, hw[0], hw[1], xp=cp)
                      for i in range(len(names))}
 
-            if sam_np:
-                masks, mscores, _ = self.sam.predict_batch_gpu(sam_np, xyxy=sam_boxes, timing=False)
+            if sam_imgs:
+                masks, mscores, _ = self.sam.predict_batch_gpu(sam_imgs, xyxy=sam_boxes, timing=False)
                 for k, i in enumerate(sam_idx):
                     pmaps[i] = build_panoptic_map(
                         masks[k], sam_labels[k], mscores[k], self._cmap, hw[0], hw[1], xp=cp)

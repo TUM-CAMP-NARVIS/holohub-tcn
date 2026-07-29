@@ -14,8 +14,8 @@ camera_stream_processing:
   buffer_size: 8
   enable_da2: False
   enable_da3: False
-  enable_langsam: True
-  enable_langsam_multicam: False
+  enable_langsam: False
+  enable_langsam_multicam: True
 
 
 # Depth Anything V2 Example
@@ -87,11 +87,11 @@ langsam_inference:
   # forward compilation is heavy on host RAM and can OOM (SIGKILL/-9), especially GDINO.
   # Enable ONE at a time and watch memory; sam_compile is the safer/cleaner target.
   gdino_compile: false
-  sam_compile: true
+  sam_compile: false
   box_threshold: 0.3
   text_threshold: 0.25
   # Set true to log rolling GDINO-vs-SAM per-stage timing (to find the bottleneck).
-  timing: true
+  timing: false
   timing_log_every: 30
 
 text_prompts:
@@ -106,11 +106,12 @@ langsam_postprocessor:
 # Reuses langsam_inference (models/thresholds/flags) and text_prompts (class ids) for every
 # worker. Omit or empty `workers` -> a single worker on GPU 0 processing all color cameras.
 langsam_multicam:
+  # Single-GPU: one worker on device 1 batching all cameras (keeps GPU0 for desktop/Holoviz).
+  # The 2-GPU split gave only ~+11% because per-worker fixed overhead dominates; revisit
+  # splitting after the fixed overhead (full-GPU SAM, syncs) is reduced.
   workers:
-    - device: 0
-      cameras: ["camera01_colorimage", "camera02_colorimage"]
     - device: 1
-      cameras: ["camera03_colorimage", "camera04_colorimage", "camera05_colorimage"]
+      cameras: ["camera01_colorimage", "camera02_colorimage", "camera03_colorimage", "camera04_colorimage", "camera05_colorimage"]
 
 langsam_multicam_holoviz:
   width: 1920
