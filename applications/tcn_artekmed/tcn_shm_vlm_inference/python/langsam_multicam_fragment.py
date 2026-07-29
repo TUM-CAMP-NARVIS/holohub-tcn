@@ -67,11 +67,16 @@ class LangSamBatchOp(Operator):
         spec.input("color_input")
         spec.output("masks")
 
-    def _to_numpy_result(self, r):
-        """Convert one HF GDINO result dict: boxes -> numpy float32, labels -> list[str]."""
+    def _extract_result(self, r):
+        """One HF GDINO result dict -> (boxes kept ON GPU, labels as list[str]).
+
+        Boxes stay on the GPU: SAM's `_prep_prompts` does `torch.as_tensor(box, device=...)`,
+        which is a no-op for a GPU tensor -- so we avoid the box D2H + H2D round-trip (and the
+        sync it forces) that the old numpy conversion caused per camera.
+        """
         boxes = r.get("boxes")
-        if hasattr(boxes, "numpy"):
-            boxes = boxes.detach().float().cpu().numpy()
+        if hasattr(boxes, "detach"):
+            boxes = boxes.detach().float()          # stays on GPU
         labels = r.get("text_labels", r.get("labels", []))
         if hasattr(labels, "tolist"):
             labels = labels.tolist()
@@ -98,16 +103,19 @@ class LangSamBatchOp(Operator):
                 return
 
             # --- Batched Grounding DINO over all this worker's cameras ---
+            torch.cuda.nvtx.range_push("gdino")
             gres = self.gdino.predict_gpu_batch(
                 rgb_gpu, self.prompts, self.box_threshold, self.text_threshold, hw)
+            torch.cuda.nvtx.range_pop()
 
             # Partition: only cameras with >=1 detection go to SAM; others are all-background.
+            # Boxes stay on the GPU (see _extract_result).
             sam_imgs, sam_boxes, sam_labels, sam_idx = [], [], [], []
             for i, r in enumerate(gres):
-                boxes, labels = self._to_numpy_result(r)
+                boxes, labels = self._extract_result(r)
                 if boxes is not None and len(boxes) > 0:
                     sam_imgs.append(rgb_gpu[i])          # GPU tensor -> full-GPU SAM (no host copy)
-                    sam_boxes.append(boxes)
+                    sam_boxes.append(boxes)              # GPU tensor -> no D2H/H2D round-trip
                     sam_labels.append(labels)
                     sam_idx.append(i)
 
@@ -115,10 +123,14 @@ class LangSamBatchOp(Operator):
                      for i in range(len(names))}
 
             if sam_imgs:
+                torch.cuda.nvtx.range_push("sam")
                 masks, mscores, _ = self.sam.predict_batch_gpu(sam_imgs, xyxy=sam_boxes, timing=False)
+                torch.cuda.nvtx.range_pop()
+                torch.cuda.nvtx.range_push("panoptic")
                 for k, i in enumerate(sam_idx):
                     pmaps[i] = build_panoptic_map(
                         masks[k], sam_labels[k], mscores[k], self._cmap, hw[0], hw[1], xp=cp)
+                torch.cuda.nvtx.range_pop()
 
             for i, cam in enumerate(names):
                 out[_mask_name(cam)] = hs.as_tensor(cp.ascontiguousarray(pmaps[i]))

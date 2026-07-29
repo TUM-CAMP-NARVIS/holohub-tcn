@@ -492,21 +492,23 @@ class GDINO:
             dtype=torch.bfloat16,
             enabled=use_amp,
         ):
+            torch.cuda.nvtx.range_push("gdino_forward")
             outputs = self.model(
                 pixel_values=pixel_values,
                 input_ids=input_ids,
                 token_type_ids=token_type_ids,
                 attention_mask=attention_mask,
             )
-        return self.processor.post_process_grounded_object_detection(
+            torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("gdino_postprocess")
+        results = self.processor.post_process_grounded_object_detection(
             outputs,
             input_ids,
             box_threshold,
             text_threshold=text_threshold,
             target_sizes=[orig_hw] * n,
         )
-
-
-
+        torch.cuda.nvtx.range_pop()
+        return results
 
 
