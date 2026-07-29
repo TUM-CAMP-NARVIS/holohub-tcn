@@ -106,12 +106,15 @@ langsam_postprocessor:
 # Reuses langsam_inference (models/thresholds/flags) and text_prompts (class ids) for every
 # worker. Omit or empty `workers` -> a single worker on GPU 0 processing all color cameras.
 langsam_multicam:
-  # Single-GPU: one worker on device 1 batching all cameras (keeps GPU0 for desktop/Holoviz).
-  # The 2-GPU split gave only ~+11% because per-worker fixed overhead dominates; revisit
-  # splitting after the fixed overhead (full-GPU SAM, syncs) is reduced.
+  # 2-GPU split (re-enabled). With full-GPU SAM the per-worker cost is now batch-scaling
+  # compute (GDINO forward ~56%, SAM ~32%) rather than fixed overhead, so splitting the
+  # cameras across GPUs should scale much better than the earlier +11%. GPU0 gets the
+  # smaller share (it also drives desktop/Holoviz/collector/colorize).
   workers:
+    - device: 0
+      cameras: ["camera01_colorimage", "camera02_colorimage"]
     - device: 1
-      cameras: ["camera01_colorimage", "camera02_colorimage", "camera03_colorimage", "camera04_colorimage", "camera05_colorimage"]
+      cameras: ["camera03_colorimage", "camera04_colorimage", "camera05_colorimage"]
 
 langsam_multicam_holoviz:
   width: 1920
