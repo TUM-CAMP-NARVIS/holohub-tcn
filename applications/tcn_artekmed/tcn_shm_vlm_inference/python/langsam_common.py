@@ -31,6 +31,7 @@ from langsam_helpers import (  # noqa: F401
     build_panoptic_map,
     panoptic_class,
     panoptic_instance,
+    gdino_postprocess,
 )
 
 
@@ -512,3 +513,80 @@ class GDINO:
         return results
 
 
+
+
+class GDinoTrtDetector:
+    """Runtime Grounding DINO via a prebuilt TensorRT engine (built offline by
+    docs/gdino_trt_export.py). Loads the engine + baked constant text tensors once; per frame
+    it GPU-preprocesses the image, runs one execute_async_v3, and returns detections.
+
+    detect(rgb_gpu) -> (boxes_xyxy_gpu, class_ids_list, scores_gpu), boxes in the ORIGINAL
+    camera resolution (pixel xyxy). Class ids are 1-based (prompt order); background is never
+    returned.
+    """
+
+    IMAGENET_MEAN = [0.485, 0.456, 0.406]
+    IMAGENET_STD = [0.229, 0.224, 0.225]
+
+    def __init__(self, engine_path, text_npz, prompts, device,
+                 box_threshold=0.3, hw=(512, 672)):
+        import tensorrt as trt
+        self.trt = trt
+        self.device = device if isinstance(device, torch.device) else torch.device(f"cuda:{int(device)}")
+        self.H, self.W = int(hw[0]), int(hw[1])
+        self.box_threshold = float(box_threshold)
+        self.num_classes = len(prompts)
+        data = np.load(text_npz, allow_pickle=True)
+        saved = [str(p) for p in list(data["prompts"])]
+        if saved != [str(p) for p in prompts]:
+            raise ValueError(
+                f"GDINO TRT engine text prompts {saved} != configured {list(prompts)}; re-export the engine")
+        self.token_class_ids = cp.asarray(data["token_class_ids"])
+        with torch.cuda.device(self.device):
+            logger = trt.Logger(trt.Logger.ERROR)
+            with open(engine_path, "rb") as f:
+                self.engine = trt.Runtime(logger).deserialize_cuda_engine(f.read())
+            if self.engine is None:
+                raise RuntimeError(f"Failed to load GDINO TRT engine: {engine_path}")
+            self.ctx = self.engine.create_execution_context()
+            self._text = {}
+            for n in ("input_ids", "attention_mask", "position_ids", "token_type_ids", "text_token_mask"):
+                want = trt.nptype(self.engine.get_tensor_dtype(n))
+                t = torch.as_tensor(np.ascontiguousarray(data[n])).to(self.device)
+                self._text[n] = t.to(self._torch_dtype(want)).contiguous()
+            self._mean = torch.tensor(self.IMAGENET_MEAN, device=self.device).view(1, 3, 1, 1)
+            self._std = torch.tensor(self.IMAGENET_STD, device=self.device).view(1, 3, 1, 1)
+
+    @staticmethod
+    def _torch_dtype(np_t):
+        return {np.int32: torch.int32, np.int64: torch.int64, np.float32: torch.float32,
+                np.float16: torch.float16, np.bool_: torch.bool}[np_t]
+
+    def detect(self, rgb_gpu):
+        """rgb_gpu: (H0, W0, 3) uint8 CUDA tensor (RGB)."""
+        with torch.cuda.device(self.device), cp.cuda.Device(self.device.index):
+            H0, W0 = int(rgb_gpu.shape[0]), int(rgb_gpu.shape[1])
+            img = rgb_gpu.permute(2, 0, 1).unsqueeze(0).to(torch.float32).div(255.0)
+            img = torch.nn.functional.interpolate(
+                img, size=(self.H, self.W), mode="bilinear", align_corners=False, antialias=True)
+            img = ((img - self._mean) / self._std).contiguous()
+            self.ctx.set_input_shape("img", tuple(img.shape))
+            self.ctx.set_tensor_address("img", img.data_ptr())
+            for n, t in self._text.items():
+                self.ctx.set_input_shape(n, tuple(t.shape))
+                self.ctx.set_tensor_address(n, t.data_ptr())
+            outs = {}
+            for i in range(self.engine.num_io_tensors):
+                n = self.engine.get_tensor_name(i)
+                if self.engine.get_tensor_mode(n) == self.trt.TensorIOMode.OUTPUT:
+                    outs[n] = torch.empty(tuple(self.ctx.get_tensor_shape(n)),
+                                          device=self.device, dtype=torch.float32)
+                    self.ctx.set_tensor_address(n, outs[n].data_ptr())
+            self.ctx.execute_async_v3(torch.cuda.current_stream().cuda_stream)
+            torch.cuda.current_stream().synchronize()
+            logits = cp.from_dlpack(outs["logits"][0])   # (900,256)
+            boxes = cp.from_dlpack(outs["boxes"][0])      # (900,4) cxcywh
+            xyxy, cls, sc = gdino_postprocess(
+                logits, boxes, self.token_class_ids, self.num_classes,
+                self.box_threshold, H0, W0, xp=cp)
+            return xyxy, [int(c) for c in cls.get()], sc
