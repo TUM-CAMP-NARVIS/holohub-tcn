@@ -18,7 +18,8 @@ from holoscan.core import Operator, OperatorSpec, Subgraph, IOSpec
 from holoscan.operators import HolovizOp
 
 from langsam_common import (
-    SAM, GDINO, resolve_workers, class_id_map, build_panoptic_map, build_panoptic_lut,
+    SAM, GDINO, GDinoTrtDetector, resolve_workers, class_id_map, build_panoptic_map,
+    build_panoptic_lut,
 )
 
 log = logging.getLogger(__name__)
@@ -44,6 +45,7 @@ class LangSamBatchOp(Operator):
         self._cmap = class_id_map(self.prompts)
         self.box_threshold = float(langsam_cfg.get("box_threshold", 0.3))
         self.text_threshold = float(langsam_cfg.get("text_threshold", 0.25))
+        self.gdino_backend = langsam_cfg.get("gdino_backend", "pytorch")
         super().__init__(fragment, *args, **kwargs)
         with torch.cuda.device(self.device):
             self.sam = SAM(
@@ -53,15 +55,24 @@ class LangSamBatchOp(Operator):
                 compile_model=bool(langsam_cfg.get("sam_compile", False)),
             )
             self.sam.build_model()
-            self.gdino = GDINO(
-                model_ckpt_path=langsam_cfg.get("gdino_model_ckpt_path"),
-                processor_ckpt_path=langsam_cfg.get("gdino_processor_ckpt_path"),
-                device=self.device,
-                model_id=langsam_cfg.get("gdino_model_id", "IDEA-Research/grounding-dino-tiny"),
-                input_size=langsam_cfg.get("gdino_input_size"),
-                compile_model=bool(langsam_cfg.get("gdino_compile", False)),
-            )
-            self.gdino.build_model()
+            self.gdino = None
+            self.gdino_trt = None
+            if self.gdino_backend == "trt":
+                hw = tuple(langsam_cfg.get("gdino_trt_hw", [512, 672]))
+                self.gdino_trt = GDinoTrtDetector(
+                    langsam_cfg["gdino_trt_engine"], langsam_cfg["gdino_trt_text"],
+                    self.prompts, self.device, self.box_threshold, hw,
+                )
+            else:
+                self.gdino = GDINO(
+                    model_ckpt_path=langsam_cfg.get("gdino_model_ckpt_path"),
+                    processor_ckpt_path=langsam_cfg.get("gdino_processor_ckpt_path"),
+                    device=self.device,
+                    model_id=langsam_cfg.get("gdino_model_id", "IDEA-Research/grounding-dino-tiny"),
+                    input_size=langsam_cfg.get("gdino_input_size"),
+                    compile_model=bool(langsam_cfg.get("gdino_compile", False)),
+                )
+                self.gdino.build_model()
 
     def setup(self, spec: OperatorSpec):
         spec.input("color_input")
@@ -102,22 +113,30 @@ class LangSamBatchOp(Operator):
                 op_output.emit(out, "masks")
                 return
 
-            # --- Batched Grounding DINO over all this worker's cameras ---
-            torch.cuda.nvtx.range_push("gdino")
-            gres = self.gdino.predict_gpu_batch(
-                rgb_gpu, self.prompts, self.box_threshold, self.text_threshold, hw)
-            torch.cuda.nvtx.range_pop()
-
+            # --- Grounding DINO over this worker's cameras (TRT engine or PyTorch) ---
             # Partition: only cameras with >=1 detection go to SAM; others are all-background.
-            # Boxes stay on the GPU (see _extract_result).
+            # Boxes stay on the GPU for SAM's _prep_prompts (no D2H/H2D round-trip).
             sam_imgs, sam_boxes, sam_labels, sam_idx = [], [], [], []
-            for i, r in enumerate(gres):
-                boxes, labels = self._extract_result(r)
-                if boxes is not None and len(boxes) > 0:
-                    sam_imgs.append(rgb_gpu[i])          # GPU tensor -> full-GPU SAM (no host copy)
-                    sam_boxes.append(boxes)              # GPU tensor -> no D2H/H2D round-trip
-                    sam_labels.append(labels)
-                    sam_idx.append(i)
+            torch.cuda.nvtx.range_push("gdino")
+            if self.gdino_backend == "trt":
+                for i, im in enumerate(rgb_gpu):
+                    boxes, cls, _ = self.gdino_trt.detect(im)   # xyxy px (GPU), class ids, scores
+                    if len(cls) > 0:
+                        sam_imgs.append(im)
+                        sam_boxes.append(boxes)
+                        sam_labels.append([self.prompts[c - 1] for c in cls])
+                        sam_idx.append(i)
+            else:
+                gres = self.gdino.predict_gpu_batch(
+                    rgb_gpu, self.prompts, self.box_threshold, self.text_threshold, hw)
+                for i, r in enumerate(gres):
+                    boxes, labels = self._extract_result(r)
+                    if boxes is not None and len(boxes) > 0:
+                        sam_imgs.append(rgb_gpu[i])
+                        sam_boxes.append(boxes)
+                        sam_labels.append(labels)
+                        sam_idx.append(i)
+            torch.cuda.nvtx.range_pop()
 
             pmaps = {i: build_panoptic_map(None, [], None, self._cmap, hw[0], hw[1], xp=cp)
                      for i in range(len(names))}
