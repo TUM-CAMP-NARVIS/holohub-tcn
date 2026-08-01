@@ -100,3 +100,29 @@ def build_panoptic_map(masks, labels, scores, cmap, height, width, xp=np):
         if v:
             pmap[masks[j] > 0] = v
     return pmap
+
+
+def gdino_postprocess(logits, boxes, token_class_ids, num_classes,
+                      box_threshold, img_h, img_w, xp=np):
+    """Grounding DINO raw outputs -> detections, using a fixed token->class map.
+
+    logits (Q,256), boxes (Q,4) cxcywh in [0,1], token_class_ids (256,) with class id
+    (1..num_classes) for prompt tokens else 0. Returns (boxes_xyxy_px, class_ids, scores) for
+    queries whose best per-class score exceeds box_threshold. Array-module-agnostic (xp).
+    """
+    probs = 1.0 / (1.0 + xp.exp(-logits))                       # (Q,256)
+    tcid = xp.asarray(token_class_ids)
+    Q = probs.shape[0]
+    class_score = xp.zeros((Q, num_classes + 1), dtype=probs.dtype)  # col 0 = background/unused
+    for c in range(1, num_classes + 1):
+        mask = (tcid == c)
+        if bool(mask.any()):
+            class_score[:, c] = probs[:, mask].max(axis=1)
+    best_cls = class_score[:, 1:].argmax(axis=1) + 1            # (Q,) 1-based
+    best_score = class_score[xp.arange(Q), best_cls]            # (Q,)
+    keep = best_score > box_threshold
+    b = boxes[keep]
+    cx, cy, w, h = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+    xyxy = xp.stack([(cx - w / 2) * img_w, (cy - h / 2) * img_h,
+                     (cx + w / 2) * img_w, (cy + h / 2) * img_h], axis=1)
+    return xyxy, best_cls[keep], best_score[keep]
