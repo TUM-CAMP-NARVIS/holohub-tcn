@@ -87,9 +87,16 @@ langsam_inference:
   # forward compilation is heavy on host RAM and can OOM (SIGKILL/-9), especially GDINO.
   # Enable ONE at a time and watch memory; sam_compile is the safer/cleaner target.
   gdino_compile: false
-  sam_compile: false
+  sam_compile: true
   box_threshold: 0.3
   text_threshold: 0.25
+  # Grounding DINO backend: "pytorch" (current) | "trt" (prebuilt TensorRT engine).
+  # "trt" requires an engine + text tensors built offline by docs/gdino_trt_export.py; keep
+  # "pytorch" until those artifacts exist. gdino_trt_hw must match the engine's build size.
+  gdino_backend: "pytorch"
+  gdino_trt_engine: "/srv/models/active/groundingdino/gdino_swint_512x672_tf32.engine"
+  gdino_trt_text: "/srv/models/active/groundingdino/gdino_swint_prompts.npz"
+  gdino_trt_hw: [512, 672]
   # Set true to log rolling GDINO-vs-SAM per-stage timing (to find the bottleneck).
   timing: false
   timing_log_every: 30
@@ -112,9 +119,9 @@ langsam_multicam:
   # smaller share (it also drives desktop/Holoviz/collector/colorize).
   workers:
     - device: 0
-      cameras: ["camera01_colorimage", "camera02_colorimage"]
-    - device: 1
-      cameras: ["camera03_colorimage", "camera04_colorimage", "camera05_colorimage"]
+      cameras: ["camera01_colorimage", "camera02_colorimage", "camera03_colorimage", "camera04_colorimage", "camera05_colorimage"]
+#    - device: 1
+#      cameras: []
 
 langsam_multicam_holoviz:
   width: 1920
