@@ -39,13 +39,29 @@ mkdir -p weights && curl -fsSL -o weights/groundingdino_swint_ogc.pth \
   https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth
 ```
 
-Notes / gotchas (found during the spike):
+Notes / gotchas (found during the spike + first real export):
+- **Checkpointing off.** `load_model` sets both `use_checkpoint=False` and
+  `use_transformer_ckpt=False`. The config defaults both to `True`, which wraps encoder layers in
+  `torch.utils.checkpoint.checkpoint` — untraceable (`RuntimeError: unordered_map::at`).
+- **`dynamic_axes` is required.** Without it the legacy tracer constant-folds the image branch and
+  drops `img` as a graph input; the engine output becomes image-independent (bakes the dummy
+  image). The tool passes the full `dynamic_axes` dict; engine profiles still pin fixed shapes.
+- **Clear the feature cache before tracing.** `GroundingDINO.forward` caches backbone features in
+  `self.features`/`self.poss` and only recomputes them if absent, so any prior forward (e.g. the
+  parity reference) makes the trace bake stale features and ignore `img`. The tool calls
+  `model.unset_image_tensor()` before export. Symptom if this regresses: engine gives identical
+  output for different images (test `np.allclose(engine(imgA), engine(imgB))` — must be False).
+- **Capture the parity reference before export.** The same cache means the *first* PyTorch forward
+  after `torch.onnx.export` returns wrong values; the tool computes the reference before exporting.
 - `torch.onnx.export(..., dynamo=False)` — the legacy tracer handles GDINO's data-dependent
   shapes; the dynamo exporter fails.
-- The traced ONNX is **fixed to its traced resolution** despite dynamic axes → the engine's
-  `(H, W)` and token length `L` are baked. Re-run per resolution / prompt change.
+- The traced ONNX is **fixed to its traced resolution / token length** → the engine's `(H, W)` and
+  `L` are baked. Re-run per resolution / prompt change.
 - **TensorRT 11** dropped the `FP16`/`EXPLICIT_BATCH` builder flags (strongly-typed networks);
   the tool uses `TF32` (the validated default) and `create_network(0)`.
+- **The parity image must contain the prompted classes** (`--min-detect`, default 0.30). On an
+  image lacking them every query is low-confidence noise and TF32 rounding flips the argmax box,
+  so top-1 IoU is meaningless; the tool aborts with `PARITY IMAGE UNUSABLE` in that case.
 
 ## Usage
 
@@ -59,17 +75,22 @@ python gdino_trt_export.py \
   --prompts floor person \
   --hw 512 672 \
   --out /data/models/active/groundingdino \
-  --parity-image images/in/car_1.jpg   # ships with the fork; gate checks engine==pytorch agreement
+  --parity-image images/in/person.jpg  # MUST contain the prompted classes (floor/person here)
 ```
+
+The fork only ships `images/in/car_1.jpg`; supply your own image that clearly shows the prompted
+classes (a person on a floor for `floor person`) and pass it as `--parity-image`.
 
 Outputs (into `--out`):
 - `gdino_swint_512x672_tf32.engine`
 - `gdino_swint_prompts.npz` — `input_ids, attention_mask, position_ids, token_type_ids,
   text_token_mask, token_class_ids (256,), prompts`
 
-The run ends with a **parity gate**: it compares the PyTorch (CPU) and engine (GPU) top-box
-and **aborts if IoU < 0.99** (`--min-iou`). The parity image only needs to exist — it checks
-engine-vs-PyTorch *agreement*, not detection quality, so any image works.
+The run ends with a **parity gate**: it captures a clean PyTorch (CPU) top-box *before* export,
+then compares the engine (GPU) top-box against it and **aborts if IoU < 0.99** (`--min-iou`). It
+also aborts (`PARITY IMAGE UNUSABLE`) if the PyTorch top score is below `--min-detect` (0.30),
+i.e. the image does not contain the prompted classes — see the gotchas above for why that makes
+the IoU meaningless. A verified build reports `parity gate OK` with IoU ≈ 0.999.
 
 ## Wiring into the app
 
