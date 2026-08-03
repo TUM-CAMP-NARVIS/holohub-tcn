@@ -13,12 +13,18 @@ and runs from C++/one enqueue, so it also escapes the GIL. Detection quality is 
 
 ## Environment (dedicated venv — NOT the Depth-Anything-3 venv)
 
-The exporter needs the **IDEA-Research GroundingDINO** source and a **transformers 4.x** env
-(5.x removes `BertModel.get_head_mask` and breaks GroundingDINO). Do not reuse the DA3 venv.
+**Use the wingdzero fork, NOT stock IDEA-Research GroundingDINO.** This tool feeds the model
+six pre-tokenized tensors `(img, input_ids, attention_mask, position_ids, token_type_ids,
+text_token_mask)`. The stock `GroundingDINO.forward(self, samples, targets=None)` tokenizes the
+caption internally and rejects that interface (`forward() takes from 2 to 3 positional arguments
+but 7 were given`). The **wingdzero fork** modifies `groundingdino/models/GroundingDINO/
+groundingdino.py` to accept the flat tensors — that modified forward is what the export/engine
+consume, so the exporter must import *that* source. Also needs a **transformers 4.x** env (5.x
+removes `BertModel.get_head_mask` and breaks GroundingDINO). Do not reuse the DA3 venv.
 
 ```bash
-git clone https://github.com/IDEA-Research/GroundingDINO.git   # or reuse an existing checkout
-cd GroundingDINO
+git clone https://github.com/wingdzero/GroundingDINO-TensorRT-and-ONNX-Inference.git
+cd GroundingDINO-TensorRT-and-ONNX-Inference
 python3 -m venv .venv-gdino-export && . .venv-gdino-export/bin/activate
 pip install torch torchvision                       # CUDA build matching your driver
 pip install "transformers==4.44.2" "tokenizers<0.20" addict yapf timm \
@@ -53,7 +59,7 @@ python gdino_trt_export.py \
   --prompts floor person \
   --hw 512 672 \
   --out /data/models/active/groundingdino \
-  --parity-image .asset/cats.png     # any existing image; the gate checks engine==pytorch agreement
+  --parity-image images/in/car_1.jpg   # ships with the fork; gate checks engine==pytorch agreement
 ```
 
 Outputs (into `--out`):
