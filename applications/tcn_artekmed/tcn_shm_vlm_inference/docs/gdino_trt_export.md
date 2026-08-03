@@ -23,9 +23,11 @@ python3 -m venv .venv-gdino-export && . .venv-gdino-export/bin/activate
 pip install torch torchvision                       # CUDA build matching your driver
 pip install "transformers==4.44.2" "tokenizers<0.20" addict yapf timm \
             opencv-python onnx pycocotools tensorrt
-# GroundingDINO's CUDA op is NOT needed: export runs on CPU with the pure-PyTorch
-# deformable-attention fallback. Just make the package importable:
-pip install -e . --no-build-isolation   # or: export PYTHONPATH=$PWD
+# IMPORTANT: do NOT `pip install -e .` — that compiles GroundingDINO's CUDA op (_C) and fails
+# on any CUDA-toolkit-vs-torch version mismatch (e.g. system nvcc 12.9 vs torch cu13.0). The op
+# is NOT needed: export runs on CPU with the pure-PyTorch deformable-attention fallback, and the
+# engine/parity run via TensorRT. Just make the package importable via PYTHONPATH:
+export PYTHONPATH=$PWD
 # checkpoint (Swin-T):
 mkdir -p weights && curl -fsSL -o weights/groundingdino_swint_ogc.pth \
   https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth
@@ -44,13 +46,14 @@ Notes / gotchas (found during the spike):
 Copy `gdino_trt_export.py` into the GroundingDINO checkout root and run:
 
 ```bash
+export PYTHONPATH=$PWD            # so `import groundingdino` resolves (no pip install -e)
 python gdino_trt_export.py \
   --checkpoint weights/groundingdino_swint_ogc.pth \
   --config groundingdino/config/GroundingDINO_SwinT_OGC.py \
   --prompts floor person \
   --hw 512 672 \
   --out /data/models/active/groundingdino \
-  --parity-image images/in/car_1.jpg
+  --parity-image .asset/cats.png     # any existing image; the gate checks engine==pytorch agreement
 ```
 
 Outputs (into `--out`):
