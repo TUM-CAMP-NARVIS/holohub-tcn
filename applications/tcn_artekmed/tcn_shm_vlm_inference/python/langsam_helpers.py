@@ -126,3 +126,45 @@ def gdino_postprocess(logits, boxes, token_class_ids, num_classes,
     xyxy = xp.stack([(cx - w / 2) * img_w, (cy - h / 2) * img_h,
                      (cx + w / 2) * img_w, (cy + h / 2) * img_h], axis=1)
     return xyxy, best_cls[keep], best_score[keep]
+
+
+def build_class_token_masks(token_class_ids, num_classes, xp=np):
+    """(num_classes, 256) bool; row c-1 marks the token slots belonging to class c.
+
+    Hoisted out of the per-frame path. `token_class_ids` is fixed for a given prompt set, so
+    these masks -- and the per-class `.any()` check the per-image path ran for every camera on
+    every frame, each a device->host sync -- are computed once, when the active prompt set
+    changes. See GDinoTrtDetector.set_prompts.
+    """
+    tcid = xp.asarray(token_class_ids)
+    return xp.stack([(tcid == c) for c in range(1, int(num_classes) + 1)], axis=0)
+
+
+def gdino_postprocess_batch(logits, boxes, class_masks, img_hw, xp=np):
+    """Batched Grounding DINO decode -- adds NO synchronisation.
+
+    logits (N,Q,256), boxes (N,Q,4) cxcywh in [0,1], class_masks (C,256) bool from
+    build_class_token_masks, img_hw a list of N (h,w) giving each camera's ORIGINAL pixel size.
+
+    Returns (xyxy (N,Q,4) in pixels, best_cls (N,Q) 1-based, best_score (N,Q)) for ALL queries;
+    the caller thresholds on `best_score` after a single device->host transfer. Deliberately
+    returns unfiltered arrays: boolean indexing would force cupy to size the output on the
+    host, which is one of the syncs this whole change exists to remove.
+    """
+    probs = 1.0 / (1.0 + xp.exp(-logits))                          # (N,Q,256)
+    # xp.where(mask, probs, 0.0) instead of probs[..., mask]: sigmoids are strictly > 0, so
+    # masking with 0 yields the same maximum as selecting the class's columns, while an empty
+    # class scores exactly 0 -- matching gdino_postprocess -- and neither indexes nor syncs.
+    per_class = xp.stack(
+        [xp.where(class_masks[c], probs, 0.0).max(axis=-1) for c in range(class_masks.shape[0])],
+        axis=-1)                                                   # (N,Q,C)
+    best_idx = per_class.argmax(axis=-1)                           # (N,Q) 0-based
+    best_cls = best_idx + 1                                        # 1-based; 0 is background
+    best_score = xp.take_along_axis(per_class, best_idx[..., None], axis=-1)[..., 0]
+
+    h = xp.asarray([float(a) for a, _ in img_hw]).reshape(-1, 1)
+    w = xp.asarray([float(b) for _, b in img_hw]).reshape(-1, 1)
+    cx, cy, bw, bh = boxes[..., 0], boxes[..., 1], boxes[..., 2], boxes[..., 3]
+    xyxy = xp.stack([(cx - bw / 2) * w, (cy - bh / 2) * h,
+                     (cx + bw / 2) * w, (cy + bh / 2) * h], axis=-1)   # (N,Q,4) pixels
+    return xyxy, best_cls, best_score
