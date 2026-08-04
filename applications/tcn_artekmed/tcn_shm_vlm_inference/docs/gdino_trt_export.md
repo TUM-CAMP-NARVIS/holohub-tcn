@@ -130,15 +130,24 @@ the stage-1 artifacts are already visible:
 ```bash
 ./run_tcn_shm_receiver.sh          # drops into the tcn_shm_receiver container
 python3 /workspace/holohub/applications/tcn_artekmed/tcn_shm_vlm_inference/docs/gdino_trt_export.py \
-  --stage build --hw 512 672 --out /srv/models/active/groundingdino
+  --stage build --hw 512 672 --out /srv/models/active/groundingdino \
+  --batch 1 3 5
 ```
+
+`--batch MIN OPT MAX` (default `1 3 5`) sets the optimization profile's batch range so one
+engine can serve a whole worker's cameras in a single execution. Set `OPT` to the busiest
+worker's camera count and `MAX` to the largest split you want to run without rebuilding. The
+ONNX is already batch-dynamic, so this needs no host re-export.
 
 Output: `gdino_swint_512x672_tf32.engine` (overwrites any earlier engine at that path — the
 filename carries no TRT version so the YAML never changes).
 
-The run ends with the **parity gate**: it compares the engine's (GPU) top box against the
-PyTorch top box saved in stage 1 and **aborts if IoU < 0.99** (`--min-iou`). A verified build
-reports `parity gate OK` with IoU ≈ 0.999.
+The build then runs two gates: the batch-1 **parity gate** against the stage-1 PyTorch
+reference, and a **batch-consistency gate** that replays the same image at batch `OPT` and
+requires every slice to match batch 1 (top-box IoU >= `--min-iou`, top-score delta <= 0.01).
+The second exists because the ONNX was traced at batch 1: GroundingDINO's reshape ops can bake
+that dimension despite the dynamic axes, and the failure mode is silently wrong output on
+slices 1..N-1. If it fails, batching needs a host re-export with a batch>1 dummy.
 
 ## Customizing: prompts, resolution, model
 

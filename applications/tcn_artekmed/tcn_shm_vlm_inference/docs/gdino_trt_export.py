@@ -124,7 +124,7 @@ def export_onnx(model, text, H, W, onnx_path):
     print(f"ONNX written: {onnx_path}")
 
 
-def build_engine(onnx_path, engine_path, H, W, L, fp16=False):
+def build_engine(onnx_path, engine_path, H, W, L, fp16=False, batch=(1, 3, 5)):
     logger = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(logger)
     network = builder.create_network(0)   # TRT 10/11: explicit batch is implicit
@@ -141,17 +141,24 @@ def build_engine(onnx_path, engine_path, H, W, L, fp16=False):
     if fp16 and hasattr(trt.BuilderFlag, "FP16"):
         config.set_flag(trt.BuilderFlag.FP16)   # TRT<11; TRT11 uses strongly-typed fp16 ONNX
     prof = builder.create_optimization_profile()
-    prof.set_shape("img", (1, 3, H, W), (1, 3, H, W), (1, 3, H, W))
+    # Batch-dynamic: one engine serves every worker. The ONNX already declares batch_size
+    # dynamic on all six inputs (see export_onnx's dynamic_axes); only this profile used to
+    # pin it to 1, which forced one execute + one stream sync PER CAMERA at runtime.
+    bmin, bopt, bmax = (int(b) for b in batch)
+    if not 1 <= bmin <= bopt <= bmax:
+        raise SystemExit(f"--batch must satisfy 1 <= min <= opt <= max, got {batch}")
+    prof.set_shape("img", (bmin, 3, H, W), (bopt, 3, H, W), (bmax, 3, H, W))
     for n in ("input_ids", "attention_mask", "position_ids", "token_type_ids"):
-        prof.set_shape(n, (1, L), (1, L), (1, L))
-    prof.set_shape("text_token_mask", (1, L, L), (1, L, L), (1, L, L))
+        prof.set_shape(n, (bmin, L), (bopt, L), (bmax, L))
+    prof.set_shape("text_token_mask", (bmin, L, L), (bopt, L, L), (bmax, L, L))
     config.add_optimization_profile(prof)
     ser = builder.build_serialized_network(network, config)
     if ser is None:
         raise SystemExit("engine build returned None")
     with open(engine_path, "wb") as f:
         f.write(ser)
-    print(f"engine written: {engine_path}")
+    print(f"engine written: {engine_path}  (batch {bmin}/{bopt}/{bmax}, "
+          f"{os.path.getsize(engine_path) / 2**20:.0f} MiB)")
     return ser
 
 
@@ -244,6 +251,44 @@ def parity_gate(ser, text, img, s_pt, b_pt, image_path, min_iou=0.99, min_detect
     print("parity gate OK")
 
 
+def batch_consistency_gate(ser, text, img, s_ref, b_ref, batch, min_iou=0.99,
+                           max_score_delta=0.01):
+    """Every slice of a batched run must agree with the batch-1 result.
+
+    The ONNX was TRACED at batch 1. GroundingDINO is full of reshape/view ops that can bake a
+    literal batch dimension even though dynamic_axes marks it dynamic; the failure mode is
+    silently wrong output for slices 1..N-1, which would look like random detection dropouts on
+    some cameras. So replicate the parity image to the profile's opt batch and check each slice.
+
+    Bit-exactness is NOT required -- batch>1 legitimately selects different kernels -- so this
+    reuses the batch-1 parity criterion: top-box IoU and top-score agreement.
+    """
+    b = int(batch[1])
+    if b < 2:
+        print("batch-consistency gate: opt batch < 2, nothing to check")
+        return
+    feed = {"img": img.repeat(b, 1, 1, 1)}
+    for k, v in text.items():
+        feed[k] = v.repeat(*([b] + [1] * (v.dim() - 1)))
+    o = _run_engine(ser, feed)
+    worst_iou, worst_ds = 1.0, 0.0
+    for i in range(b):
+        s_i, b_i = _top_box(o["logits"][i:i + 1], o["boxes"][i:i + 1])
+        iou = _iou(b_ref, b_i)
+        ds = abs(float(s_i) - float(s_ref))
+        worst_iou = min(worst_iou, iou)
+        worst_ds = max(worst_ds, ds)
+        if iou < min_iou or ds > max_score_delta:
+            raise SystemExit(
+                f"BATCH CONSISTENCY GATE FAILED at slice {i}/{b}: IoU {iou:.4f} (need "
+                f">= {min_iou}), |score delta| {ds:.4f} (need <= {max_score_delta}).\n"
+                f"The ONNX was traced at batch 1 and appears to have baked that batch "
+                f"dimension, so batching is NOT safe with this ONNX. Re-export on the host "
+                f"with a batch>1 dummy input, then rebuild.")
+    print(f"batch-consistency gate OK (batch {b}: worst IoU {worst_iou:.4f}, "
+          f"worst |score delta| {worst_ds:.4f})")
+
+
 def save_parity_ref(path, img, s_pt, b_pt, image_path, H, W):
     """Persist the PyTorch reference so the build stage can gate without torch weights."""
     np.savez(path, image=img.numpy(), score=np.float32(s_pt), box_cxcywh=np.asarray(b_pt, np.float32),
@@ -312,9 +357,10 @@ def stage_build(args, H, W, onnx_path, engine_path, npz_path, ref_path):
     print(f"TensorRT {trt.__version__}  |  L={L}  |  pytorch reference: top score={s_pt:.3f} "
           f"on {ref_image_path}")
 
-    ser = build_engine(onnx_path, engine_path, H, W, L, fp16=args.fp16)
+    ser = build_engine(onnx_path, engine_path, H, W, L, fp16=args.fp16, batch=args.batch)
     parity_gate(ser, text, ref_img, s_pt, b_pt, ref_image_path,
                 min_iou=args.min_iou, min_detect=args.min_detect)
+    batch_consistency_gate(ser, text, ref_img, s_pt, b_pt, args.batch, min_iou=args.min_iou)
     print(f"\nDONE. Engine: {engine_path}\n      Text:   {npz_path}")
 
 
@@ -342,6 +388,11 @@ def main():
                     help="PyTorch top score the parity image must reach for the IoU check to be "
                          "valid (i.e. the image must actually contain a prompted class)")
     ap.add_argument("--fp16", action="store_true", help="experimental; TF32 is the validated default")
+    ap.add_argument("--batch", nargs=3, type=int, default=[1, 3, 5],
+                    metavar=("MIN", "OPT", "MAX"),
+                    help="build-stage optimization profile batch range. OPT should match the "
+                         "busiest worker's camera count, MAX the largest split you want to run "
+                         "without rebuilding (default 1 3 5)")
     args = ap.parse_args()
 
     H, W = args.hw
