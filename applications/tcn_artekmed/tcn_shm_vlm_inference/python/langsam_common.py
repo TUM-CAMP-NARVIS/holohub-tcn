@@ -541,7 +541,8 @@ class GDinoTrtDetector:
         self.box_threshold = float(box_threshold)
         data = np.load(text_npz, allow_pickle=True)
         self._baked_prompts = [str(p) for p in list(data["prompts"])]
-        self._token_class_ids_baked = cp.asarray(data["token_class_ids"])
+        with cp.cuda.Device(self.device.index):
+            self._token_class_ids_baked = cp.asarray(data["token_class_ids"])
         self._prompt_key = None
         self.prompts = None
         self.num_classes = 0
