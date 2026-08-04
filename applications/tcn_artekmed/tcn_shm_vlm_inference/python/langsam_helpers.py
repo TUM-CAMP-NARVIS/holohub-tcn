@@ -168,3 +168,42 @@ def gdino_postprocess_batch(logits, boxes, class_masks, img_hw, xp=np):
     xyxy = xp.stack([(cx - bw / 2) * w, (cy - bh / 2) * h,
                      (cx + bw / 2) * w, (cy + bh / 2) * h], axis=-1)   # (N,Q,4) pixels
     return xyxy, best_cls, best_score
+
+
+def build_prompt_remap(baked_prompts, active_prompts):
+    """Baked class ids -> active class ids, for a prompt set the engine can already express.
+
+    The TRT engine bakes the prompt TOKENS (input_ids, text_token_mask, fixed L), but the
+    prompt->class mapping lives entirely in token_class_ids, where class i+1 is baked prompt i
+    (see docs/gdino_trt_export.py build_text). So any subset and/or reordering of the baked
+    prompts is expressible by renumbering alone -- no tokenizer, no re-export.
+
+    Returns an int64 array of length len(baked_prompts)+1: index 0 (background) maps to 0, and
+    index i+1 maps to the 1-based position of baked prompt i in active_prompts, or 0 if that
+    prompt was dropped. Apply as `remap[token_class_ids]`.
+
+    Raises ValueError if active_prompts is empty, contains duplicates after normalisation, or
+    contains a term that is not baked into the engine -- that term's tokens simply are not in
+    the engine's input_ids, so it requires a re-export + rebuild.
+    """
+    def _norm(p):
+        return str(p).strip().lower()
+
+    baked = [_norm(p) for p in baked_prompts]
+    active = [_norm(p) for p in active_prompts]
+    if not active:
+        raise ValueError("active prompt set is empty; at least one prompt is required")
+    if len(set(active)) != len(active):
+        raise ValueError(f"duplicate prompts after normalisation: {active}")
+    unknown = [p for p in active if p not in baked]
+    if unknown:
+        raise ValueError(
+            f"prompts {unknown} are not baked into the GDINO TRT engine (baked: {baked}). "
+            f"Only a subset or reordering of the baked prompts can be applied at runtime; a new "
+            f"term needs a re-export and rebuild:\n"
+            f"  host:      python3 gdino_trt_export.py --stage export --prompts {' '.join(active)} ...\n"
+            f"  container: python3 gdino_trt_export.py --stage build --out /srv/models/active/groundingdino")
+    remap = np.zeros(len(baked) + 1, np.int64)
+    for i, p in enumerate(baked):
+        remap[i + 1] = active.index(p) + 1 if p in active else 0
+    return remap
