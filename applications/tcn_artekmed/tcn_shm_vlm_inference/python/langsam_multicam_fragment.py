@@ -65,8 +65,8 @@ class LangSamBatchOp(Operator):
                 # Catch a stale/undersized engine at construction, before the whole Holoscan
                 # graph is composed and every model is loaded -- detect_batch would otherwise
                 # only raise this deep inside compute() on the first tick.
-                if len(self.cameras) > self.gdino_trt.max_batch:
-                    raise ValueError(self.gdino_trt.max_batch_error(len(self.cameras)))
+                if len(self.cameras) > self.gdino_trt.engine_batch:
+                    raise ValueError(self.gdino_trt.batch_error(len(self.cameras)))
             else:
                 self.gdino = GDINO(
                     model_ckpt_path=langsam_cfg.get("gdino_model_ckpt_path"),

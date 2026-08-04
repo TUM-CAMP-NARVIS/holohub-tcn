@@ -70,6 +70,36 @@ def test_empty_active_set_raises():
     raise AssertionError("expected ValueError for an empty prompt set")
 
 
+from langsam_helpers import plan_batch_padding
+
+
+def test_padding_exact_fit_needs_no_padding():
+    assert plan_batch_padding(3, 3) == 0
+
+
+def test_padding_pads_a_smaller_worker():
+    assert plan_batch_padding(2, 3) == 1
+    assert plan_batch_padding(1, 3) == 2
+
+
+def test_padding_rejects_more_frames_than_the_engine_batch():
+    try:
+        plan_batch_padding(4, 3)
+    except ValueError as e:
+        assert "4" in str(e) and "3" in str(e)
+        return
+    raise AssertionError("expected ValueError when frames exceed the engine batch")
+
+
+def test_padding_rejects_empty_and_bad_engine_batch():
+    for args in ((0, 3), (3, 0)):
+        try:
+            plan_batch_padding(*args)
+        except ValueError:
+            continue
+        raise AssertionError("expected ValueError for %r" % (args,))
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     bad = 0

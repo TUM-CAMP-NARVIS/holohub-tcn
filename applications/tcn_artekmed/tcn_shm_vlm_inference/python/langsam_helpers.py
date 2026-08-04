@@ -207,3 +207,24 @@ def build_prompt_remap(baked_prompts, active_prompts):
     for i, p in enumerate(baked):
         remap[i + 1] = active.index(p) + 1 if p in active else 0
     return remap
+
+
+def plan_batch_padding(n_frames, engine_batch):
+    """Dummy slices needed to fill a fixed-batch GDINO engine.
+
+    The engine's batch is baked at ONNX trace time, so it runs at exactly `engine_batch`
+    images -- never fewer, never more. A worker with fewer cameras pads; the padded slices are
+    computed and discarded. Returns the number of pad slices.
+
+    Raises ValueError if there are no frames, if the engine batch is nonsensical, or if there
+    are more frames than the engine can take -- the last needs a re-export at the new batch,
+    not a runtime workaround.
+    """
+    n, b = int(n_frames), int(engine_batch)
+    if n < 1:
+        raise ValueError("no frames to detect")
+    if b < 1:
+        raise ValueError(f"engine batch must be >= 1, got {b}")
+    if n > b:
+        raise ValueError(f"{n} frames but the engine is built for batch {b}")
+    return b - n

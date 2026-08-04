@@ -36,6 +36,7 @@ from langsam_helpers import (  # noqa: F401
     gdino_postprocess_batch,
     build_class_token_masks,
     build_prompt_remap,
+    plan_batch_padding,
 )
 
 
@@ -556,6 +557,7 @@ class GDinoTrtDetector:
             logger = trt.Logger(trt.Logger.ERROR)
             with open(engine_path, "rb") as f:
                 self.engine = trt.Runtime(logger).deserialize_cuda_engine(f.read())
+            self._engine_path = engine_path
             if self.engine is None:
                 # Most often a TRT version mismatch: engines are version-locked, so one built
                 # outside this container will not deserialize here (see the "Version tag does not
@@ -577,14 +579,17 @@ class GDinoTrtDetector:
             self._mean = torch.tensor(self.IMAGENET_MEAN, device=self.device).view(1, 3, 1, 1)
             self._std = torch.tensor(self.IMAGENET_STD, device=self.device).view(1, 3, 1, 1)
 
-            # Profile max batch: how many cameras one execution can cover. Read from the engine
-            # so a stale batch-1 engine is reported clearly instead of failing deep in TRT.
+            # The engine runs at exactly one batch size (baked at ONNX trace time), so min and
+            # max of its profile are equal; read either.
             try:
-                self.max_batch = int(self.engine.get_tensor_profile_shape("img", 0)[2][0])
+                pr = self.engine.get_tensor_profile_shape("img", 0)
+                self.engine_batch = int(pr[0][0])
+                if int(pr[2][0]) != self.engine_batch:
+                    print(f"WARNING: GDINO engine profile is not a fixed batch "
+                          f"({tuple(pr[0])}..{tuple(pr[2])}); using {self.engine_batch}")
             except Exception as e:
-                print(f"Failed to read GDINO TRT engine profile shape (falling back to "
-                      f"max_batch=1): {e}")
-                self.max_batch = 1
+                print(f"Failed to read GDINO TRT engine profile shape (assuming batch=1): {e}")
+                self.engine_batch = 1
             self.set_prompts(prompts)
 
     @staticmethod
@@ -612,19 +617,17 @@ class GDinoTrtDetector:
         self.prompts = list(active)
         self._prompt_key = key
 
-    def max_batch_error(self, n):
-        """Error text for 'n cameras requested but engine profile allows <= max_batch'.
-
-        Shared by detect_batch (caught deep inside compute(), the first time a worker actually
-        runs) and LangSamBatchOp.__init__ (caught at construction, before the graph even starts)
-        so a user sees the identical instruction regardless of when the mismatch is caught.
-        """
+    def batch_error(self, n):
+        """Error text for 'n cameras but the engine is built for a different fixed batch'."""
         return (
-            f"{n} cameras requested but the GDINO engine's profile allows batch <= "
-            f"{self.max_batch}. Rebuild it INSIDE the container with a wider profile:\n"
-            f"  python3 <holohub>/applications/tcn_artekmed/tcn_shm_vlm_inference/docs/"
-            f"gdino_trt_export.py --stage build --hw {self.H} {self.W} "
-            f"--batch 1 {n} {max(n, 5)} --out /srv/models/active/groundingdino")
+            f"{n} cameras requested but the GDINO engine is built for batch "
+            f"{self.engine_batch}. The batch is baked at ONNX TRACE time, so this needs a "
+            f"re-export AND a rebuild, both at --batch {n}:\n"
+            f"  host:      python3 gdino_trt_export.py --stage export --prompts <...> "
+            f"--hw {self.H} {self.W} --batch {n}\n"
+            f"  container: python3 gdino_trt_export.py --stage build --hw {self.H} {self.W} "
+            f"--batch {n} --out {os.path.dirname(self._engine_path)}\n"
+            f"Or set langsam_inference.gdino_backend: \"pytorch\" to fall back.")
 
     def _text_for_batch(self, n):
         """Baked text tensors replicated to batch n, cached per n (they never change)."""
@@ -650,8 +653,10 @@ class GDinoTrtDetector:
         if not frames:
             return []
         n = len(frames)
-        if n > self.max_batch:
-            raise ValueError(self.max_batch_error(n))
+        try:
+            pad = plan_batch_padding(n, self.engine_batch)
+        except ValueError as e:
+            raise ValueError(f"{e}\n{self.batch_error(n)}") from None
         with torch.cuda.device(self.device), cp.cuda.Device(self.device.index):
             hw0 = [(int(f.shape[0]), int(f.shape[1])) for f in frames]
             chw = [torch.nn.functional.interpolate(
@@ -660,9 +665,14 @@ class GDinoTrtDetector:
                        antialias=True)
                    for f in frames]
             img = ((torch.cat(chw, dim=0) - self._mean) / self._std).contiguous()
+            if pad:
+                # Fixed-batch engine: fill the unused slices. Their outputs are discarded, so
+                # the content does not matter -- zeros avoid copying a real frame.
+                img = torch.cat([img, torch.zeros((pad,) + tuple(img.shape[1:]),
+                                                  device=img.device, dtype=img.dtype)], dim=0)
             self.ctx.set_input_shape("img", tuple(img.shape))
             self.ctx.set_tensor_address("img", img.data_ptr())
-            for k, t in self._text_for_batch(n).items():
+            for k, t in self._text_for_batch(self.engine_batch).items():
                 self.ctx.set_input_shape(k, tuple(t.shape))
                 self.ctx.set_tensor_address(k, t.data_ptr())
             outs = {}
