@@ -62,6 +62,11 @@ class LangSamBatchOp(Operator):
                     langsam_cfg["gdino_trt_engine"], langsam_cfg["gdino_trt_text"],
                     self.prompts, self.device, self.box_threshold, hw,
                 )
+                # Catch a stale/undersized engine at construction, before the whole Holoscan
+                # graph is composed and every model is loaded -- detect_batch would otherwise
+                # only raise this deep inside compute() on the first tick.
+                if len(self.cameras) > self.gdino_trt.max_batch:
+                    raise ValueError(self.gdino_trt.max_batch_error(len(self.cameras)))
             else:
                 self.gdino = GDINO(
                     model_ckpt_path=langsam_cfg.get("gdino_model_ckpt_path"),
@@ -84,10 +89,11 @@ class LangSamBatchOp(Operator):
         panoptic map). The TRT detector accepts any subset/reordering of its baked prompts and
         raises otherwise; the pytorch backend tokenises per call and accepts anything.
         """
-        self.prompts = list(prompts)
-        self._cmap = class_id_map(self.prompts)
+        prompts = list(prompts)
         if self.gdino_trt is not None:
-            self.gdino_trt.set_prompts(self.prompts)
+            self.gdino_trt.set_prompts(prompts)      # raises first, before any state moves
+        self.prompts = prompts
+        self._cmap = class_id_map(self.prompts)
 
     def setup(self, spec: OperatorSpec):
         spec.input("color_input")

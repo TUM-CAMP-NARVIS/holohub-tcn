@@ -253,40 +253,45 @@ def parity_gate(ser, text, img, s_pt, b_pt, image_path, min_iou=0.99, min_detect
 
 def batch_consistency_gate(ser, text, img, s_ref, b_ref, batch, min_iou=0.99,
                            max_score_delta=0.01):
-    """Every slice of a batched run must agree with the batch-1 result.
+    """Every slice of a batched run must agree with the batch-1 result, at EVERY distinct batch
+    size the profile admits (not just OPT).
 
     The ONNX was TRACED at batch 1. GroundingDINO is full of reshape/view ops that can bake a
     literal batch dimension even though dynamic_axes marks it dynamic; the failure mode is
     silently wrong output for slices 1..N-1, which would look like random detection dropouts on
-    some cameras. So replicate the parity image to the profile's opt batch and check each slice.
+    some cameras. A worker actually runs the engine at whatever batch size matches its camera
+    count -- which need not be OPT (e.g. a 2-camera worker runs batch 2 even when OPT is 3) -- so
+    every distinct batch size in the profile other than 1 (batch 1 is already covered by
+    parity_gate) is replayed here and every slice is checked.
 
     Bit-exactness is NOT required -- batch>1 legitimately selects different kernels -- so this
     reuses the batch-1 parity criterion: top-box IoU and top-score agreement.
     """
-    b = int(batch[1])
-    if b < 2:
-        print("batch-consistency gate: opt batch < 2, nothing to check")
+    sizes = sorted({int(x) for x in batch} - {1})
+    if not sizes:
+        print("batch-consistency gate: nothing to check")
         return
-    feed = {"img": img.repeat(b, 1, 1, 1)}
-    for k, v in text.items():
-        feed[k] = v.repeat(*([b] + [1] * (v.dim() - 1)))
-    o = _run_engine(ser, feed)
-    worst_iou, worst_ds = 1.0, 0.0
-    for i in range(b):
-        s_i, b_i = _top_box(o["logits"][i:i + 1], o["boxes"][i:i + 1])
-        iou = _iou(b_ref, b_i)
-        ds = abs(float(s_i) - float(s_ref))
-        worst_iou = min(worst_iou, iou)
-        worst_ds = max(worst_ds, ds)
-        if iou < min_iou or ds > max_score_delta:
-            raise SystemExit(
-                f"BATCH CONSISTENCY GATE FAILED at slice {i}/{b}: IoU {iou:.4f} (need "
-                f">= {min_iou}), |score delta| {ds:.4f} (need <= {max_score_delta}).\n"
-                f"The ONNX was traced at batch 1 and appears to have baked that batch "
-                f"dimension, so batching is NOT safe with this ONNX. Re-export on the host "
-                f"with a batch>1 dummy input, then rebuild.")
-    print(f"batch-consistency gate OK (batch {b}: worst IoU {worst_iou:.4f}, "
-          f"worst |score delta| {worst_ds:.4f})")
+    for b in sizes:
+        feed = {"img": img.repeat(b, 1, 1, 1)}
+        for k, v in text.items():
+            feed[k] = v.repeat(*([b] + [1] * (v.dim() - 1)))
+        o = _run_engine(ser, feed)
+        worst_iou, worst_ds = 1.0, 0.0
+        for i in range(b):
+            s_i, b_i = _top_box(o["logits"][i:i + 1], o["boxes"][i:i + 1])
+            iou = _iou(b_ref, b_i)
+            ds = abs(float(s_i) - float(s_ref))
+            worst_iou = min(worst_iou, iou)
+            worst_ds = max(worst_ds, ds)
+            if iou < min_iou or ds > max_score_delta:
+                raise SystemExit(
+                    f"BATCH CONSISTENCY GATE FAILED at batch {b}, slice {i}/{b}: IoU {iou:.4f} "
+                    f"(need >= {min_iou}), |score delta| {ds:.4f} (need <= {max_score_delta}).\n"
+                    f"The ONNX was traced at batch 1 and appears to have baked that batch "
+                    f"dimension, so batching is NOT safe with this ONNX. Re-export on the host "
+                    f"with a batch>1 dummy input, then rebuild.")
+        print(f"batch-consistency gate OK (batch {b}: worst IoU {worst_iou:.4f}, "
+              f"worst |score delta| {worst_ds:.4f})")
 
 
 def save_parity_ref(path, img, s_pt, b_pt, image_path, H, W):

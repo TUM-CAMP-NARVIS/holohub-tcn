@@ -178,9 +178,13 @@ update the YAML.
    `WARNING: N caption categories vs M prompts`: it means the caption did not split into one
    category per prompt (usually a prompt containing a `.`). Do not ship a build that prints it.
 3. Re-run **stage 2** in the container (same command as above — the filenames do not change).
-4. Update `text_prompts.prompts` in `tcn_shm_vlm_inference.yaml` to the **same list in the same
-   order**. The runtime compares it against the npz and fails fast on any mismatch
-   (`GDINO TRT engine text prompts [...] != configured [...]`).
+4. Update `text_prompts.prompts` in `tcn_shm_vlm_inference.yaml`. It does not need to be an exact
+   copy of what you just baked: at runtime `GDinoTrtDetector.set_prompts` (`build_prompt_remap`
+   in `langsam_helpers.py`) accepts **any subset and/or reordering** of the engine's baked
+   prompts and renumbers the class ids to match, with no rebuild. Only a term that was never
+   baked into the engine at all raises, e.g.:
+   `prompts ['robot'] are not baked into the GDINO TRT engine (baked: ['floor', 'person'])`.
+   That case needs the re-export + rebuild shown above (with the new term included).
 
 > **Filename caveat:** `gdino_swint_prompts.npz` encodes neither the prompts nor the resolution,
 > and the parity ref / ONNX / engine encode only `HxW`. Two different prompt sets in the same
@@ -238,9 +242,13 @@ langsam_inference:
   gdino_trt_hw: [512, 672]     # must match the engine build size
 ```
 
-**The prompts in `text_prompts.prompts` must match the engine's baked prompts** (order
-included) — the runtime verifies this and fails fast otherwise. Changing prompts or the input
-resolution requires re-running this tool.
+**`text_prompts.prompts` may be any subset and/or reordering of the engine's baked prompts.**
+`GDinoTrtDetector.set_prompts` (`build_prompt_remap` in `langsam_helpers.py`) renumbers the
+class ids to match at runtime — no rebuild needed. Only a prompt term the engine never baked
+raises (`ValueError: prompts [...] are not baked into the GDINO TRT engine ...`), and only that
+case requires re-running this tool (both stages), with the new term included. Changing the input
+resolution always requires re-running this tool (both stages), since `(H, W)` is baked into the
+ONNX.
 
 ## FP16 (optional, later)
 

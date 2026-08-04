@@ -521,12 +521,15 @@ class GDINO:
 
 class GDinoTrtDetector:
     """Runtime Grounding DINO via a prebuilt TensorRT engine (built offline by
-    docs/gdino_trt_export.py). Loads the engine + baked constant text tensors once; per frame
-    it GPU-preprocesses the image, runs one execute_async_v3, and returns detections.
+    docs/gdino_trt_export.py). Loads the engine + baked constant text tensors once; the engine's
+    batch-dynamic optimization profile means one execute_async_v3 covers an entire WORKER's
+    cameras, not one per frame.
 
-    detect(rgb_gpu) -> (boxes_xyxy_gpu, class_ids_list, scores_gpu), boxes in the ORIGINAL
-    camera resolution (pixel xyxy). Class ids are 1-based (prompt order); background is never
-    returned.
+    detect_batch(frames) -> list of (boxes_xyxy_gpu, class_ids_list, scores_gpu), one per frame
+    in input order; boxes are in that frame's ORIGINAL camera resolution (pixel xyxy). Class ids
+    are 1-based (active-prompt order; see set_prompts); background is never returned. This is the
+    entry point used by LangSamBatchOp. detect(rgb_gpu) is a single-frame convenience wrapper
+    around detect_batch, for callers with exactly one frame.
     """
 
     IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -578,7 +581,9 @@ class GDinoTrtDetector:
             # so a stale batch-1 engine is reported clearly instead of failing deep in TRT.
             try:
                 self.max_batch = int(self.engine.get_tensor_profile_shape("img", 0)[2][0])
-            except Exception:
+            except Exception as e:
+                print(f"Failed to read GDINO TRT engine profile shape (falling back to "
+                      f"max_batch=1): {e}")
                 self.max_batch = 1
             self.set_prompts(prompts)
 
@@ -607,6 +612,20 @@ class GDinoTrtDetector:
         self.prompts = list(active)
         self._prompt_key = key
 
+    def max_batch_error(self, n):
+        """Error text for 'n cameras requested but engine profile allows <= max_batch'.
+
+        Shared by detect_batch (caught deep inside compute(), the first time a worker actually
+        runs) and LangSamBatchOp.__init__ (caught at construction, before the graph even starts)
+        so a user sees the identical instruction regardless of when the mismatch is caught.
+        """
+        return (
+            f"{n} cameras requested but the GDINO engine's profile allows batch <= "
+            f"{self.max_batch}. Rebuild it INSIDE the container with a wider profile:\n"
+            f"  python3 <holohub>/applications/tcn_artekmed/tcn_shm_vlm_inference/docs/"
+            f"gdino_trt_export.py --stage build --hw {self.H} {self.W} "
+            f"--batch 1 {n} {max(n, 5)} --out /srv/models/active/groundingdino")
+
     def _text_for_batch(self, n):
         """Baked text tensors replicated to batch n, cached per n (they never change)."""
         t = self._text_batched.get(n)
@@ -632,12 +651,7 @@ class GDinoTrtDetector:
             return []
         n = len(frames)
         if n > self.max_batch:
-            raise ValueError(
-                f"{n} cameras requested but the GDINO engine's profile allows batch <= "
-                f"{self.max_batch}. Rebuild it INSIDE the container with a wider profile:\n"
-                f"  python3 <holohub>/applications/tcn_artekmed/tcn_shm_vlm_inference/docs/"
-                f"gdino_trt_export.py --stage build --hw {self.H} {self.W} "
-                f"--batch 1 {n} {max(n, 5)} --out /srv/models/active/groundingdino")
+            raise ValueError(self.max_batch_error(n))
         with torch.cuda.device(self.device), cp.cuda.Device(self.device.index):
             hw0 = [(int(f.shape[0]), int(f.shape[1])) for f in frames]
             chw = [torch.nn.functional.interpolate(
