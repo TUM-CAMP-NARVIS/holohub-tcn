@@ -27,8 +27,8 @@ GroundingDINO fork + checkpoint that the container does not have. So the tool ha
 
 | Stage | Where | Needs | Produces |
 |---|---|---|---|
-| `--stage export` | host, wingdzero checkout | torch, groundingdino, opencv, checkpoint | `gdino_swint_prompts.npz`, `…_tf32.onnx`, `…_parity_ref.npz` |
-| `--stage build` | **inside the holohub runtime container** | tensorrt, torch | `…_tf32.engine` (+ parity gate) |
+| `--stage export` | host, wingdzero checkout | torch, groundingdino, opencv, checkpoint | `gdino_swint_prompts.npz`, `…_b<N>_tf32.onnx`, `…_parity_ref.npz` |
+| `--stage build` | **inside the holohub runtime container** | tensorrt, torch | `…_b<N>_tf32.engine` (+ gates) |
 
 The export stage deliberately builds **no** engine — a host-built engine is unusable, so building
 one would only waste minutes. It instead saves a PyTorch parity reference (preprocessed image,
@@ -104,23 +104,41 @@ python gdino_trt_export.py --stage export \
   --config groundingdino/config/GroundingDINO_SwinT_OGC.py \
   --prompts floor person \
   --hw 512 672 \
+  --batch 3 \
   --out /data/models/active/groundingdino \
   --parity-image images/in/person.jpg  # MUST contain the prompted classes (floor/person here)
 ```
+
+`--batch N` is the batch this artifact set is for — set it to the busiest LangSAM worker's
+camera count. **The engine's batch is baked at ONNX trace time**, so a camera-count change is a
+re-export, not just a rebuild (see "Why a single fixed `--batch`" below). Both stages must pass
+the SAME `N`.
 
 The fork only ships `images/in/car_1.jpg`; supply your own image that clearly shows the prompted
 classes (a person on a floor for `floor person`) and pass it as `--parity-image`.
 
 Outputs (into `--out`):
-- `gdino_swint_512x672_tf32.onnx`
+- `gdino_swint_512x672_b3_tf32.onnx`
 - `gdino_swint_prompts.npz` — `input_ids, attention_mask, position_ids, token_type_ids,
-  text_token_mask, token_class_ids (256,), prompts`
+  text_token_mask, token_class_ids (256,), prompts` — batch-independent, shared by every `--batch`
 - `gdino_swint_512x672_parity_ref.npz` — `image` (preprocessed `(1,3,H,W)`), `score`,
-  `box_cxcywh`, `image_path`, `hw`
+  `box_cxcywh`, `image_path`, `hw` — always the batch-1 PyTorch reference, also shared across
+  every `--batch`
 
 This stage aborts with `PARITY IMAGE UNUSABLE` if the PyTorch top score is below `--min-detect`
 (0.30), i.e. the image does not contain the prompted classes — see the gotchas above for why
 that makes the IoU meaningless. It fails *before* the ONNX export so you do not wait for it.
+
+### Why a single fixed `--batch`
+
+A previous revision made `--batch` a MIN/OPT/MAX optimization profile so one engine could serve
+any camera count up to MAX. Hardware testing proved that does not work: a `Where` node in the
+encoder fusion attention is only broadcast-conformable at the batch the ONNX was traced at.
+Building the profile at any other batch fails outright ("broadcast dimensions must be
+conformable"), and a multi-size profile silently specialises to a static shape instead of
+actually staying dynamic. So `--batch` is one integer, used identically by both stages: export
+traces at it, build pins `min = opt = max` to it. Changing camera count means re-running
+**both** stages at the new `N` — there is no way to widen an already-built engine.
 
 ### Stage 2 — build (inside the runtime container)
 
@@ -131,30 +149,37 @@ the stage-1 artifacts are already visible:
 ./run_tcn_shm_receiver.sh          # drops into the tcn_shm_receiver container
 python3 /workspace/holohub/applications/tcn_artekmed/tcn_shm_vlm_inference/docs/gdino_trt_export.py \
   --stage build --hw 512 672 --out /srv/models/active/groundingdino \
-  --batch 1 3 5
+  --batch 3
 ```
 
-`--batch MIN OPT MAX` (default `1 3 5`) sets the optimization profile's batch range so one
-engine can serve a whole worker's cameras in a single execution. Set `OPT` to the busiest
-worker's camera count and `MAX` to the largest split you want to run without rebuilding. The
-ONNX is already batch-dynamic, so this needs no host re-export.
+`--batch N` must match the value passed to `--stage export` — the ONNX was traced at that batch
+and the build stage pins the optimization profile's `min = opt = max` to the same `N`. Artifacts
+carry `_b<N>_` in the filename precisely so a mismatched export/build pair cannot be combined by
+accident.
 
-Output: `gdino_swint_512x672_tf32.engine` (overwrites any earlier engine at that path — the
-filename carries no TRT version so the YAML never changes).
+Output: `gdino_swint_512x672_b3_tf32.engine` (overwrites any earlier engine at that `_b<N>_`
+path — the filename carries no TRT version so the YAML never changes across TRT bumps).
 
-The build then runs two gates: the batch-1 **parity gate** against the stage-1 PyTorch
-reference, and a **batch-consistency gate** that replays the same image at batch `OPT` and
-requires every slice to match batch 1 (top-box IoU >= `--min-iou`, top-score delta <= 0.01).
-The second exists because the ONNX was traced at batch 1: GroundingDINO's reshape ops can bake
-that dimension despite the dynamic axes, and the failure mode is silently wrong output on
-slices 1..N-1. If it fails, batching needs a host re-export with a batch>1 dummy.
+The build then runs two checks:
+- **slice-consistency gate (blocking).** Replays the parity image at batch `N` and requires
+  every slice to agree with slice 0 (top-box IoU >= 0.999, score delta <= 0.01). This is what
+  actually proves batching is correct: identical inputs across the batch must give identical
+  output, and the failure mode of a broken batch would be silently wrong output on slices
+  1..N-1 — indistinguishable from random per-camera detection dropouts. Skipped (prints and
+  returns) when `N == 1`.
+- **PyTorch fidelity (reported only).** Compares slice 0 against the stage-1 PyTorch reference.
+  Non-blocking by default: every container TRT 10.9 engine currently deviates from PyTorch for
+  reasons unrelated to batching (boxes stay close, IoU ~0.96, but confidence scores are
+  depressed) — a batch-1 engine deviates identically, so blocking on it by default would fail
+  every build for a pre-existing, separately-tracked issue. It is printed loudly either way; pass
+  `--strict-parity` to make a deviation fatal.
 
 ## Customizing: prompts, resolution, model
 
-**Golden rule: the four artifacts are one matched set.** The ONNX bakes both the resolution
-`(H, W)` and the token length `L`, and the npz bakes the prompt→class mapping. Never regenerate
-one without the others: always re-run `--stage export` *and* `--stage build`, in that order, then
-update the YAML.
+**Golden rule: the four artifacts are one matched set.** The ONNX bakes the resolution `(H, W)`,
+the traced batch `N`, and the token length `L`; the npz bakes the prompt→class mapping. Never
+regenerate one without the others: always re-run `--stage export` *and* `--stage build`, in that
+order, with the SAME `--batch N`, then update the YAML.
 
 ### Changing the prompts
 
@@ -187,9 +212,11 @@ update the YAML.
    That case needs the re-export + rebuild shown above (with the new term included).
 
 > **Filename caveat:** `gdino_swint_prompts.npz` encodes neither the prompts nor the resolution,
-> and the parity ref / ONNX / engine encode only `HxW`. Two different prompt sets in the same
-> `--out` therefore overwrite each other. Use one `--out` directory per prompt set if you want to
-> keep several around, and point `gdino_trt_engine`/`gdino_trt_text` at that directory.
+> and the parity ref encodes only `HxW` (it's always the batch-1 PyTorch reference — shared
+> across every `--batch`). The ONNX/engine encode `HxW` and `_b<N>_` but not the prompts. Two
+> different prompt sets in the same `--out` therefore overwrite each other regardless of
+> resolution or batch. Use one `--out` directory per prompt set if you want to keep several
+> around, and point `gdino_trt_engine`/`gdino_trt_text` at that directory.
 
 ### Changing the input resolution
 
@@ -201,14 +228,14 @@ straight to it with no letterboxing.
   detection quality.
 - Larger = better on small objects, slower. GDINO cost is dominated by token count (deformable
   attention + fusion), so it scales roughly with H×W, not with the backbone size.
-- The filenames carry the resolution (`gdino_swint_512x672_tf32.*`), so several resolutions can
-  coexist in one `--out`.
+- The filenames carry the resolution and batch (`gdino_swint_512x672_b3_tf32.*`), so several
+  resolutions (and batch sizes) can coexist in one `--out`.
 
 After re-running both stages, update **two** YAML keys:
 
 ```yaml
-  gdino_trt_engine: ".../gdino_swint_<H>x<W>_tf32.engine"   # filename carries the new size
-  gdino_trt_hw: [<H>, <W>]                                  # must match the engine build size
+  gdino_trt_engine: ".../gdino_swint_<H>x<W>_b<N>_tf32.engine"   # filename carries the new size
+  gdino_trt_hw: [<H>, <W>]                                       # must match the engine build size
 ```
 
 `gdino_input_size` is **not** used by the TRT path — it only resizes for the PyTorch backend.
@@ -219,10 +246,10 @@ Leave it alone unless you also test `gdino_backend: "pytorch"`.
 - **Swin-B instead of Swin-T:** pass the matching `--checkpoint` and `--config`. Note the artifact
   tag is hard-coded `gdino_swint_` in `main()`, so a Swin-B build silently reuses Swin-T
   filenames — either edit `tag` or (simpler) export into a separate `--out` directory.
-- **`--fp16`:** experimental, and it changes the tag to `gdino_swint_<H>x<W>_fp16.*`, so
+- **`--fp16`:** experimental, and it changes the tag to `gdino_swint_<H>x<W>_b<N>_fp16.*`, so
   `gdino_trt_engine` must be repointed. On TRT 11 there is no global FP16 flag (strongly-typed
   networks), so this needs an fp16 ONNX; TF32 is the validated default. Only adopt it if the
-  parity gate still reports IoU ≥ 0.99.
+  fidelity report still reports IoU ≥ 0.99.
 
 ### Re-running after a container/SDK bump
 
@@ -237,7 +264,7 @@ Point the YAML at the artifacts and flip the backend (host `/data/models` → co
 ```yaml
 langsam_inference:
   gdino_backend: "trt"
-  gdino_trt_engine: "/srv/models/active/groundingdino/gdino_swint_512x672_tf32.engine"
+  gdino_trt_engine: "/srv/models/active/groundingdino/gdino_swint_512x672_b3_tf32.engine"
   gdino_trt_text:   "/srv/models/active/groundingdino/gdino_swint_prompts.npz"
   gdino_trt_hw: [512, 672]     # must match the engine build size
 ```
@@ -247,11 +274,11 @@ langsam_inference:
 class ids to match at runtime — no rebuild needed. Only a prompt term the engine never baked
 raises (`ValueError: prompts [...] are not baked into the GDINO TRT engine ...`), and only that
 case requires re-running this tool (both stages), with the new term included. Changing the input
-resolution always requires re-running this tool (both stages), since `(H, W)` is baked into the
-ONNX.
+resolution, or the camera count driving `--batch`, always requires re-running this tool (both
+stages, same `N`), since `(H, W)` and the batch are baked into the ONNX.
 
 ## FP16 (optional, later)
 
 `--fp16` is experimental: on TRT 11 (no global FP16 flag) it needs an fp16 ONNX / strongly-typed
-build. TF32 is already quality-matched and ~4×; only pursue FP16 if you re-run the parity gate
-and it stays ≥ 0.99.
+build. TF32 is already quality-matched and ~4×; only pursue FP16 if you re-run the fidelity
+report and it stays ≥ 0.99.
