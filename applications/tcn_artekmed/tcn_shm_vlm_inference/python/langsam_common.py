@@ -33,6 +33,9 @@ from langsam_helpers import (  # noqa: F401
     panoptic_class,
     panoptic_instance,
     gdino_postprocess,
+    gdino_postprocess_batch,
+    build_class_token_masks,
+    build_prompt_remap,
 )
 
 
@@ -536,13 +539,15 @@ class GDinoTrtDetector:
         self.device = device if isinstance(device, torch.device) else torch.device(f"cuda:{int(device)}")
         self.H, self.W = int(hw[0]), int(hw[1])
         self.box_threshold = float(box_threshold)
-        self.num_classes = len(prompts)
         data = np.load(text_npz, allow_pickle=True)
-        saved = [str(p) for p in list(data["prompts"])]
-        if saved != [str(p) for p in prompts]:
-            raise ValueError(
-                f"GDINO TRT engine text prompts {saved} != configured {list(prompts)}; re-export the engine")
-        self.token_class_ids = cp.asarray(data["token_class_ids"])
+        self._baked_prompts = [str(p) for p in list(data["prompts"])]
+        self._token_class_ids_baked = cp.asarray(data["token_class_ids"])
+        self._prompt_key = None
+        self.prompts = None
+        self.num_classes = 0
+        self.token_class_ids = None
+        self._class_masks = None
+        self._text_batched = {}
         with torch.cuda.device(self.device):
             logger = trt.Logger(trt.Logger.ERROR)
             with open(engine_path, "rb") as f:
@@ -568,36 +573,112 @@ class GDinoTrtDetector:
             self._mean = torch.tensor(self.IMAGENET_MEAN, device=self.device).view(1, 3, 1, 1)
             self._std = torch.tensor(self.IMAGENET_STD, device=self.device).view(1, 3, 1, 1)
 
+            # Profile max batch: how many cameras one execution can cover. Read from the engine
+            # so a stale batch-1 engine is reported clearly instead of failing deep in TRT.
+            try:
+                self.max_batch = int(self.engine.get_tensor_profile_shape("img", 0)[2][0])
+            except Exception:
+                self.max_batch = 1
+            self.set_prompts(prompts)
+
     @staticmethod
     def _torch_dtype(np_t):
         return {np.int32: torch.int32, np.int64: torch.int64, np.float32: torch.float32,
                 np.float16: torch.float16, np.bool_: torch.bool}[np_t]
 
-    def detect(self, rgb_gpu):
-        """rgb_gpu: (H0, W0, 3) uint8 CUDA tensor (RGB)."""
+    def set_prompts(self, active):
+        """Switch the active prompt set, adapting the baked class mapping where possible.
+
+        Cached on the normalised prompt tuple: an unchanged set is a tuple build plus a
+        comparison, which is what makes it safe to hoist the class-token masks out of the
+        per-frame path. A subset and/or reordering of the baked prompts is applied by
+        renumbering token_class_ids; anything else raises (see build_prompt_remap).
+        """
+        key = tuple(str(p).strip().lower() for p in active)
+        if key == self._prompt_key:
+            return
+        remap = build_prompt_remap(self._baked_prompts, list(active))
+        with cp.cuda.Device(self.device.index):
+            self.token_class_ids = cp.asarray(remap)[self._token_class_ids_baked]
+            self.num_classes = len(active)
+            self._class_masks = build_class_token_masks(
+                self.token_class_ids, self.num_classes, xp=cp)
+        self.prompts = list(active)
+        self._prompt_key = key
+
+    def _text_for_batch(self, n):
+        """Baked text tensors replicated to batch n, cached per n (they never change)."""
+        t = self._text_batched.get(n)
+        if t is None:
+            t = {k: (v if n == 1 else v.repeat(*([n] + [1] * (v.dim() - 1)))).contiguous()
+                 for k, v in self._text.items()}
+            self._text_batched[n] = t
+        return t
+
+    def detect_batch(self, frames):
+        """All of one worker's cameras in ONE engine execution.
+
+        frames: list of (H0,W0,3) uint8 CUDA tensors (RGB). Returns a list of
+        (boxes_xyxy_gpu, class_ids_list, scores_gpu), one per frame, in input order; boxes are
+        pixel xyxy in that frame's ORIGINAL resolution.
+
+        Exactly two synchronisation points per call regardless of camera count: the stream sync
+        after the execution, and one device->host copy of the class ids and scores. The
+        per-camera version cost ~5 apiece (stream sync, a D2H per class inside the decode, cupy
+        boolean indexing, and cls.get()).
+        """
+        if not frames:
+            return []
+        n = len(frames)
+        if n > self.max_batch:
+            raise ValueError(
+                f"{n} cameras requested but the GDINO engine's profile allows batch <= "
+                f"{self.max_batch}. Rebuild it INSIDE the container with a wider profile:\n"
+                f"  python3 <holohub>/applications/tcn_artekmed/tcn_shm_vlm_inference/docs/"
+                f"gdino_trt_export.py --stage build --hw {self.H} {self.W} "
+                f"--batch 1 {n} {max(n, 5)} --out /srv/models/active/groundingdino")
         with torch.cuda.device(self.device), cp.cuda.Device(self.device.index):
-            H0, W0 = int(rgb_gpu.shape[0]), int(rgb_gpu.shape[1])
-            img = rgb_gpu.permute(2, 0, 1).unsqueeze(0).to(torch.float32).div(255.0)
-            img = torch.nn.functional.interpolate(
-                img, size=(self.H, self.W), mode="bilinear", align_corners=False, antialias=True)
-            img = ((img - self._mean) / self._std).contiguous()
+            hw0 = [(int(f.shape[0]), int(f.shape[1])) for f in frames]
+            chw = [torch.nn.functional.interpolate(
+                       f.permute(2, 0, 1).unsqueeze(0).to(torch.float32).div(255.0),
+                       size=(self.H, self.W), mode="bilinear", align_corners=False,
+                       antialias=True)
+                   for f in frames]
+            img = ((torch.cat(chw, dim=0) - self._mean) / self._std).contiguous()
             self.ctx.set_input_shape("img", tuple(img.shape))
             self.ctx.set_tensor_address("img", img.data_ptr())
-            for n, t in self._text.items():
-                self.ctx.set_input_shape(n, tuple(t.shape))
-                self.ctx.set_tensor_address(n, t.data_ptr())
+            for k, t in self._text_for_batch(n).items():
+                self.ctx.set_input_shape(k, tuple(t.shape))
+                self.ctx.set_tensor_address(k, t.data_ptr())
             outs = {}
             for i in range(self.engine.num_io_tensors):
-                n = self.engine.get_tensor_name(i)
-                if self.engine.get_tensor_mode(n) == self.trt.TensorIOMode.OUTPUT:
-                    outs[n] = torch.empty(tuple(self.ctx.get_tensor_shape(n)),
-                                          device=self.device, dtype=torch.float32)
-                    self.ctx.set_tensor_address(n, outs[n].data_ptr())
+                nm = self.engine.get_tensor_name(i)
+                if self.engine.get_tensor_mode(nm) == self.trt.TensorIOMode.OUTPUT:
+                    outs[nm] = torch.empty(tuple(self.ctx.get_tensor_shape(nm)),
+                                           device=self.device, dtype=torch.float32)
+                    self.ctx.set_tensor_address(nm, outs[nm].data_ptr())
             self.ctx.execute_async_v3(torch.cuda.current_stream().cuda_stream)
-            torch.cuda.current_stream().synchronize()
-            logits = cp.from_dlpack(outs["logits"][0])   # (900,256)
-            boxes = cp.from_dlpack(outs["boxes"][0])      # (900,4) cxcywh
-            xyxy, cls, sc = gdino_postprocess(
-                logits, boxes, self.token_class_ids, self.num_classes,
-                self.box_threshold, H0, W0, xp=cp)
-            return xyxy, [int(c) for c in cls.get()], sc
+            torch.cuda.current_stream().synchronize()          # sync 1 of 2
+            logits = cp.from_dlpack(outs["logits"])            # (N,900,256)
+            boxes = cp.from_dlpack(outs["boxes"])              # (N,900,4) cxcywh
+            xyxy, best_cls, best_score = gdino_postprocess_batch(
+                logits, boxes, self._class_masks, hw0, xp=cp)
+            # sync 2 of 2: one copy for the whole batch. Stacked so it is a single transfer;
+            # class ids are small ints, exact in float32.
+            head = cp.asnumpy(cp.stack([best_cls.astype(cp.float32), best_score]))  # (2,N,Q)
+            cls_h, score_h = head[0], head[1]
+            results = []
+            for i in range(n):
+                keep = np.nonzero(score_h[i] > self.box_threshold)[0]
+                if len(keep) == 0:
+                    results.append((xyxy[i][:0], [], best_score[i][:0]))
+                    continue
+                gidx = cp.asarray(keep)      # integer (not boolean) indexing -> no sync
+                results.append((xyxy[i][gidx],
+                                [int(c) for c in cls_h[i][keep]],
+                                best_score[i][gidx]))
+            return results
+
+    def detect(self, rgb_gpu):
+        """Single-frame convenience wrapper. rgb_gpu: (H0, W0, 3) uint8 CUDA tensor (RGB)."""
+        return self.detect_batch([rgb_gpu])[0]
