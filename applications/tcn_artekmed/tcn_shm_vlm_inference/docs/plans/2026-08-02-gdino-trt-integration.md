@@ -360,7 +360,11 @@ git add -u && git commit -m "feat(tcn_artekmed): wire gdino_backend config + sin
 
 **Files:** none (verification).
 
-- [ ] **Step 1:** Copy the engine + `.npz` to the container-visible `/data/models/active/groundingdino/`.
+- [ ] **Step 1:** Put the ONNX + `.npz` + parity ref in the container-visible
+  `/data/models/active/groundingdino/` (host `--stage export`), then build the engine **inside the
+  container** with `--stage build`. A host-built engine will NOT load: TRT engines are
+  version-locked (host TRT 11.2.1.2 / serialization 243 vs the container's 239), which is why the
+  export tool is split into an export stage and a container build stage. See `gdino_trt_export.md`.
 - [ ] **Step 2:** Run single-GPU (`langsam_multicam` one worker) with `gdino_backend: pytorch`,
   then `trt`; confirm the tiled masks and panoptic output match visually (same detections/colors).
 - [ ] **Step 3:** With `timing`/nsys, confirm the `gdino` NVTX range drops from ~230 ms toward

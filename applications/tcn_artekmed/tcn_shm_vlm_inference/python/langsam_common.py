@@ -7,6 +7,7 @@
 # pure helper functions, imported by both langsam2operator.py (single-camera) and
 # langsam_multicam_fragment.py (multi-camera).
 
+import os
 import time
 
 import cupy as cp
@@ -547,7 +548,17 @@ class GDinoTrtDetector:
             with open(engine_path, "rb") as f:
                 self.engine = trt.Runtime(logger).deserialize_cuda_engine(f.read())
             if self.engine is None:
-                raise RuntimeError(f"Failed to load GDINO TRT engine: {engine_path}")
+                # Most often a TRT version mismatch: engines are version-locked, so one built
+                # outside this container will not deserialize here (see the "Version tag does not
+                # match ... Serialized Engine Version" line TRT logs just above).
+                raise RuntimeError(
+                    f"Failed to load GDINO TRT engine: {engine_path}\n"
+                    f"Runtime TensorRT is {trt.__version__}. A serialized engine only loads in the "
+                    f"TRT that built it -- rebuild it INSIDE this container from the exported ONNX:\n"
+                    f"  python3 <holohub>/applications/tcn_artekmed/tcn_shm_vlm_inference/docs/"
+                    f"gdino_trt_export.py --stage build --hw {self.H} {self.W} "
+                    f"--out {os.path.dirname(engine_path)}\n"
+                    f"Or set langsam_inference.gdino_backend: \"pytorch\" to fall back.")
             self.ctx = self.engine.create_execution_context()
             self._text = {}
             for n in ("input_ids", "attention_mask", "position_ids", "token_type_ids", "text_token_mask"):

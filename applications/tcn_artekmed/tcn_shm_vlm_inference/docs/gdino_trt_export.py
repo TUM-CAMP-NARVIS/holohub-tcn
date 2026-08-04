@@ -3,33 +3,48 @@
 LangSAM pipeline, with baked text tensors for fixed prompts and a PyTorch-vs-engine parity
 gate. See gdino_trt_export.md for the environment + usage.
 
-Run this INSIDE an IDEA-Research GroundingDINO checkout, in a dedicated venv with
-transformers 4.x, tensorrt, onnx and opencv (NOT the Depth-Anything-3 venv). Produces:
-  <out>/gdino_swint_<H>x<W>_tf32.engine
-  <out>/gdino_swint_prompts.npz   (input_ids, attention_mask, position_ids, token_type_ids,
-                                   text_token_mask, token_class_ids, prompts)
+TWO STAGES, because a serialized TensorRT engine is version-locked and can only be loaded by
+the TRT that built it, while the two halves of the toolchain live in different environments:
+
+  --stage export   host, inside the wingdzero GroundingDINO fork checkout (torch + opencv +
+                   groundingdino). Writes the text tensors, the ONNX, and a PyTorch parity
+                   reference. Builds NO engine -- the host TRT is not the runtime TRT.
+                     <out>/gdino_swint_prompts.npz          (input_ids, attention_mask,
+                         position_ids, token_type_ids, text_token_mask, token_class_ids, prompts)
+                     <out>/gdino_swint_<H>x<W>_tf32.onnx
+                     <out>/gdino_swint_<H>x<W>_parity_ref.npz  (preprocessed image, top score,
+                         top box) -- lets the build stage run the same faithfulness gate without
+                         torch weights or the GroundingDINO checkout.
+                   Requires: --prompts.
+
+  --stage build    INSIDE the holohub runtime container (tensorrt + torch), so the engine
+                   matches the TRT that will deserialize it at run time. Reads the three
+                   artifacts above, writes the engine, and re-runs the parity gate against the
+                   saved reference.
+                     <out>/gdino_swint_<H>x<W>_tf32.engine
+
+Both stages compare against the SAME PyTorch reference, so the full model -> ONNX -> engine
+chain stays gated even though no single environment can run all of it.
 """
 from __future__ import annotations
 import argparse
 import os
 
-import cv2
 import numpy as np
 import tensorrt as trt
 import torch
-
-from groundingdino.models import build_model
-from groundingdino.util.slconfig import SLConfig
-from groundingdino.util.utils import clean_state_dict
-from groundingdino.models.GroundingDINO.bertwarper import (
-    generate_masks_with_special_tokens_and_transfer_map,
-)
 
 MAX_TEXT_LEN = 256
 INPUT_NAMES = ["img", "input_ids", "attention_mask", "position_ids", "token_type_ids", "text_token_mask"]
 
 
 def load_model(config_file: str, checkpoint_path: str):
+    # Imported lazily: the build stage runs in the runtime container, which has no
+    # GroundingDINO checkout and no checkpoint.
+    from groundingdino.models import build_model
+    from groundingdino.util.slconfig import SLConfig
+    from groundingdino.util.utils import clean_state_dict
+
     args = SLConfig.fromfile(config_file)
     args.device = "cpu"
     # Both must be off: gradient checkpointing wraps encoder layers in
@@ -46,6 +61,10 @@ def load_model(config_file: str, checkpoint_path: str):
 
 def build_text(model, prompts):
     """Return (caption, text_tensors dict, token_class_ids[256], L) for the fixed prompts."""
+    from groundingdino.models.GroundingDINO.bertwarper import (
+        generate_masks_with_special_tokens_and_transfer_map,
+    )
+
     caption = ". ".join(p.strip().strip(".").strip() for p in prompts) + " ."
     tok = model.tokenizer([caption], padding="longest", return_tensors="pt")
     specials = model.tokenizer.convert_tokens_to_ids(["[CLS]", "[SEP]", ".", "?"])
@@ -172,6 +191,8 @@ def _run_engine(ser, feed_cpu):
 
 
 def _load_parity_img(image_path, H, W):
+    import cv2  # export stage only; the build stage reads the preprocessed tensor from the ref npz
+
     bgr = cv2.imread(image_path)
     if bgr is None:
         raise SystemExit(f"parity image not found: {image_path}")
@@ -223,16 +244,99 @@ def parity_gate(ser, text, img, s_pt, b_pt, image_path, min_iou=0.99, min_detect
     print("parity gate OK")
 
 
+def save_parity_ref(path, img, s_pt, b_pt, image_path, H, W):
+    """Persist the PyTorch reference so the build stage can gate without torch weights."""
+    np.savez(path, image=img.numpy(), score=np.float32(s_pt), box_cxcywh=np.asarray(b_pt, np.float32),
+             image_path=np.array(image_path), hw=np.array([H, W], np.int64))
+    print(f"parity reference written: {path}")
+
+
+def load_parity_ref(path, H, W):
+    if not os.path.exists(path):
+        raise SystemExit(
+            f"parity reference not found: {path}\nRun the export stage on the host first:\n"
+            f"  python3 gdino_trt_export.py --stage export --prompts <...> --hw {H} {W}")
+    d = np.load(path, allow_pickle=False)
+    rh, rw = (int(x) for x in d["hw"])
+    if (rh, rw) != (H, W):
+        raise SystemExit(f"parity reference is {rh}x{rw} but --hw is {H}x{W}; re-run the export stage")
+    return (torch.from_numpy(d["image"]).float(), float(d["score"]), d["box_cxcywh"],
+            str(d["image_path"]))
+
+
+def load_text_npz(path):
+    """Return (text_tensors dict, L) from the exported prompt tensors."""
+    if not os.path.exists(path):
+        raise SystemExit(
+            f"text tensors not found: {path}\nRun the export stage on the host first.")
+    d = np.load(path, allow_pickle=True)
+    text = {n: torch.from_numpy(np.ascontiguousarray(d[n])) for n in INPUT_NAMES[1:]}
+    return text, int(text["input_ids"].shape[1])
+
+
+def stage_export(args, H, W, onnx_path, npz_path, ref_path):
+    print("Loading model (CPU) ...")
+    model = load_model(args.config, args.checkpoint)
+    caption, text, tcid, L = build_text(model, args.prompts)
+    print(f"caption='{caption}'  L={L}  token_class_ids nonzero={int((tcid > 0).sum())}")
+
+    # Capture the PyTorch reference BEFORE export_onnx corrupts the model's first forward.
+    ref_img, s_pt, b_pt = pytorch_reference(model, text, H, W, args.parity_image)
+    print(f"pytorch reference: top score={s_pt:.3f} on {args.parity_image}")
+    if s_pt < args.min_detect:
+        raise SystemExit(
+            f"PARITY IMAGE UNUSABLE: PyTorch top score {s_pt:.3f} < {args.min_detect} -- the parity "
+            f"image '{args.parity_image}' does not contain the prompted classes, so top-box IoU is "
+            f"not a valid faithfulness check. Supply --parity-image with an image that clearly "
+            f"shows the prompted classes (e.g. a person on a floor for --prompts floor person).")
+
+    np.savez(npz_path,
+             input_ids=text["input_ids"].numpy(), attention_mask=text["attention_mask"].numpy(),
+             position_ids=text["position_ids"].numpy(), token_type_ids=text["token_type_ids"].numpy(),
+             text_token_mask=text["text_token_mask"].numpy(), token_class_ids=tcid,
+             prompts=np.array(args.prompts, dtype=object))
+    print(f"text tensors written: {npz_path}")
+
+    save_parity_ref(ref_path, ref_img, s_pt, b_pt, args.parity_image, H, W)
+    export_onnx(model, text, H, W, onnx_path)
+    print(f"\nDONE (export). Now build the engine INSIDE the runtime container:\n"
+          f"  python3 gdino_trt_export.py --stage build --hw {H} {W} --out <container path>")
+
+
+def stage_build(args, H, W, onnx_path, engine_path, npz_path, ref_path):
+    if not os.path.exists(onnx_path):
+        raise SystemExit(
+            f"ONNX not found: {onnx_path}\nRun the export stage on the host first.")
+    text, L = load_text_npz(npz_path)
+    ref_img, s_pt, b_pt, ref_image_path = load_parity_ref(ref_path, H, W)
+    print(f"TensorRT {trt.__version__}  |  L={L}  |  pytorch reference: top score={s_pt:.3f} "
+          f"on {ref_image_path}")
+
+    ser = build_engine(onnx_path, engine_path, H, W, L, fp16=args.fp16)
+    parity_gate(ser, text, ref_img, s_pt, b_pt, ref_image_path,
+                min_iou=args.min_iou, min_detect=args.min_detect)
+    print(f"\nDONE. Engine: {engine_path}\n      Text:   {npz_path}")
+
+
 def main():
-    ap = argparse.ArgumentParser(description="GDINO -> ONNX -> TRT engine + parity gate")
+    ap = argparse.ArgumentParser(
+        description="GDINO -> ONNX (host) -> TRT engine (container) + parity gate",
+        epilog="A TRT engine only loads in the TRT that built it: run --stage build inside the "
+               "runtime container, never on the host.")
+    ap.add_argument("--stage", required=True, choices=("export", "build"),
+                    help="'export' (host, GroundingDINO checkout): text tensors + ONNX + parity "
+                         "reference, no engine. 'build' (runtime container): ONNX -> engine + "
+                         "parity gate against the saved reference.")
     ap.add_argument("--checkpoint", default="weights/groundingdino_swint_ogc.pth")
     ap.add_argument("--config", default="groundingdino/config/GroundingDINO_SwinT_OGC.py")
-    ap.add_argument("--prompts", nargs="+", required=True, help='e.g. --prompts floor person')
+    ap.add_argument("--prompts", nargs="+", help='export stage only; e.g. --prompts floor person')
     ap.add_argument("--hw", nargs=2, type=int, default=[512, 672], metavar=("H", "W"))
-    ap.add_argument("--out", default="/data/models/active/groundingdino")
+    ap.add_argument("--out", default="/data/models/active/groundingdino",
+                    help="artifact directory; inside the container this is the mounted path, "
+                         "e.g. /srv/models/active/groundingdino")
     ap.add_argument("--parity-image", default="images/in/person.jpg",
-                    help="must contain the prompted classes (see --min-detect); default suits "
-                         "--prompts floor person")
+                    help="export stage only; must contain the prompted classes (see "
+                         "--min-detect); default suits --prompts floor person")
     ap.add_argument("--min-iou", type=float, default=0.99)
     ap.add_argument("--min-detect", type=float, default=0.30,
                     help="PyTorch top score the parity image must reach for the IoU check to be "
@@ -246,28 +350,14 @@ def main():
     onnx_path = os.path.join(args.out, tag + ".onnx")
     engine_path = os.path.join(args.out, tag + ".engine")
     npz_path = os.path.join(args.out, "gdino_swint_prompts.npz")
+    ref_path = os.path.join(args.out, f"gdino_swint_{H}x{W}_parity_ref.npz")
 
-    print("Loading model (CPU) ...")
-    model = load_model(args.config, args.checkpoint)
-    caption, text, tcid, L = build_text(model, args.prompts)
-    print(f"caption='{caption}'  L={L}  token_class_ids nonzero={int((tcid > 0).sum())}")
-
-    # Capture the PyTorch reference BEFORE export_onnx corrupts the model's first forward.
-    ref_img, s_pt, b_pt = pytorch_reference(model, text, H, W, args.parity_image)
-    print(f"pytorch reference: top score={s_pt:.3f} on {args.parity_image}")
-
-    np.savez(npz_path,
-             input_ids=text["input_ids"].numpy(), attention_mask=text["attention_mask"].numpy(),
-             position_ids=text["position_ids"].numpy(), token_type_ids=text["token_type_ids"].numpy(),
-             text_token_mask=text["text_token_mask"].numpy(), token_class_ids=tcid,
-             prompts=np.array(args.prompts, dtype=object))
-    print(f"text tensors written: {npz_path}")
-
-    export_onnx(model, text, H, W, onnx_path)
-    ser = build_engine(onnx_path, engine_path, H, W, L, fp16=args.fp16)
-    parity_gate(ser, text, ref_img, s_pt, b_pt, args.parity_image,
-                min_iou=args.min_iou, min_detect=args.min_detect)
-    print(f"\nDONE. Engine: {engine_path}\n      Text:   {npz_path}")
+    if args.stage == "export":
+        if not args.prompts:
+            ap.error("--stage export requires --prompts")
+        stage_export(args, H, W, onnx_path, npz_path, ref_path)
+    else:
+        stage_build(args, H, W, onnx_path, engine_path, npz_path, ref_path)
 
 
 if __name__ == "__main__":
