@@ -1,202 +1,156 @@
 # Batched Grounding DINO inference (design)
 
-Batch the Grounding DINO TensorRT engine across a worker's cameras, and batch the
-post-process with it, so one Holoscan tick issues **one** engine execution and **two** device
-syncs instead of one execution and ~5 syncs *per camera*.
+Run the Grounding DINO TensorRT engine once per camera **worker** instead of once per camera.
 
-Follows [2026-08-02-gdino-trt-integration-design.md](./2026-08-02-gdino-trt-integration-design.md),
-which brought the engine up. This spec is about the time *around* the engine.
+> **Revision 2 (2026-08-04, after hardware validation).** Revision 1 was written from a profile
+> reading that turned out to be wrong, and proposed an engine shape TensorRT will not build for
+> this model. Both are corrected below; the sections that changed are marked. Revision 1's
+> Tasks 1-5 are implemented, reviewed and committed — they remain correct, but they are no
+> longer where the win comes from.
 
-## Motivation (measured)
+## What revision 1 got wrong
 
-From the 2026-08-04 nsys trace (588.3 s steady state, 5072 ticks, 2-GPU split with
-2 cameras on GPU0 / 3 on GPU1, `sam_compile: false`):
+**1. The overhead estimate.** Revision 1 read the nsys `myelinGraphExecute` range (5.96 ms x 2
+per camera = 11.9 ms) as the engine's total execution time, and concluded that the remaining
+~27 ms of the 39.3 ms per-camera `gdino` stage was removable overhead from ~5 GPU->CPU
+synchronisations. That was wrong: `myelinGraphExecute` covers only the Myelin-fused subgraphs.
+Direct benchmarking (median of 20, container TRT 10.9.0.34) measures **38.64 ms per batch-1
+execution** — essentially the entire stage. There is very little sync overhead to remove.
 
-| observation | value |
-|---|---|
-| pipeline | 5 cameras @ ~4.3-4.5 fps, tick period 221.8 ms |
-| bottleneck | worker B (3 cam, GPU1): 215.2 ms of stage work per 221.9 ms period = **97% saturated** |
-| `gdino` stage | 118.0 ms (B) = **39.3 ms/camera**; 96.5 ms (A) = 48.2 ms/camera |
-| TRT engine execution | `myelinGraphExecute` 5.96 ms x 2 per camera = **~11.9 ms/camera** |
-| **non-engine time** | **~27 ms/camera on B, ~36 ms on A** — the target of this spec |
-| GPU utilisation | GPU0 51.2%, GPU1 62.4% — neither saturated, so this is CPU/latency-bound |
+The sync-elimination work (batched decode, hoisted class-token masks, single device->host
+transfer) is correct and harmless, and it still removes ~5 syncs per camera. It is simply not
+worth the ~34 ms/tick that revision 1 attributed to it.
 
-The 2-GPU split itself is healthy (99.8% overlap between workers; GDINO in TRT is no longer
-GIL-bound), and the engine hit its predicted ~38 ms/camera. The remaining cost is per-camera
-CPU round-trips, not compute.
+**2. The engine shape.** Revision 1 specified one batch-dynamic engine, `min 1 / opt 3 / max 5`.
+TensorRT will not produce that for this model. Measured:
 
-### Where the syncs are, per camera, today
-
-1. `langsam_common.py:597` — explicit `torch.cuda.current_stream().synchronize()` after
-   `execute_async_v3`.
-2. `langsam_helpers.py:119` — `bool(mask.any())` once **per class**, a D2H on
-   `token_class_ids`, which is a compile-time constant that never changes.
-3. `langsam_helpers.py:124` — `boxes[keep]`; cupy boolean indexing must size the output, so it
-   syncs.
-4. `langsam_common.py:603` — `cls.get()`.
-
-On the 3-camera worker that is ~15 syncs per tick.
-
-## Design
-
-### 1. Export tool: batch-dynamic optimization profile
-
-`docs/gdino_trt_export.py`, build stage only.
-
-`build_engine` takes a `batch=(min, opt, max)` triple, exposed as `--batch MIN OPT MAX`
-(default `1 3 5`), and applies it to every binding:
-
-```
-img              (1,3,H,W) / (3,3,H,W) / (5,3,H,W)
-input_ids        (1,L)     / (3,L)     / (5,L)
-attention_mask   (1,L)     / (3,L)     / (5,L)
-position_ids     (1,L)     / (3,L)     / (5,L)
-token_type_ids   (1,L)     / (3,L)     / (5,L)
-text_token_mask  (1,L,L)   / (3,L,L)   / (5,L,L)
-```
-
-`opt=3` matches the bottleneck worker; `max=5` covers any split of the five cameras, so
-changing the worker assignment needs no rebuild. One engine file, so the YAML keys
-(`gdino_trt_engine`, `gdino_trt_text`, `gdino_trt_hw`) are unchanged.
-
-**No host re-export.** The ONNX already declares `batch_size` dynamic on all six inputs and
-both outputs (`gdino_trt_export.py:90-99`); only the engine profile pinned batch=1. This is a
-container-side `--stage build` re-run.
-
-### 2. Export tool: batch-consistency gate
-
-After the existing batch-1 parity gate, run the same parity image replicated to batch `opt`
-and require **every** output slice to agree with the batch-1 result. Batch>1 may select
-different TRT kernels, so bit-exactness is not a valid requirement; the gate reuses the same
-criterion as the batch-1 parity gate instead:
-
-- top-box IoU per slice ≥ `--min-iou` (0.99), via the existing `_top_box` / `_iou` helpers
-- top-score delta per slice ≤ 0.01
-
-Abort the build on any slice failing either. This is the detector for the primary risk below,
-so it must run on every build, not behind a flag.
-
-This exists because of the primary risk below. It is cheap and reuses the stage-1 reference.
-
-### 3. Runtime: `GDinoTrtDetector.detect_batch`
-
-```python
-detect_batch(frames: list[uint8 CUDA (H0,W0,3)]) -> list[(xyxy_gpu, class_ids: list[int], scores_gpu)]
-```
-
-- resize + normalize each frame to `(3,H,W)`, `torch.stack` → `(N,3,H,W)`
-- text tensors expanded to batch `N`, cached per `N` (`self._text_batched[N]`) so the expand
-  and `.contiguous()` happen once per batch size, not once per tick
-- one `set_input_shape` pass, one `execute_async_v3`, **one** `synchronize()`
-- outputs `(N,900,256)` logits and `(N,900,4)` boxes
-
-`detect(frame)` is retained as `detect_batch([frame])[0]`.
-
-Each frame's own `(H0,W0)` is carried through so box→pixel scaling stays per camera (frames
-are the same size today, but the per-camera contract is kept).
-
-Fail fast in `__init__` if the engine's profile max batch is smaller than the worker's camera
-count, naming the `--batch` rebuild command — the same ergonomics as the existing TRT version
-mismatch message.
-
-### 4. Runtime: batched post-process
-
-New `gdino_postprocess_batch(logits, boxes, ...)` in `langsam_helpers.py` — the numpy/cupy
-agnostic module, so it unit-tests on the host.
-
-- **Per-class token masks hoisted** out of the per-camera path: the `tcid == c` masks and
-  their `.any()` are computed once and cached **keyed on the active prompt set** (see
-  "Prompt updates" below), removing sync (2) entirely. They are not treated as immortal
-  constants — a prompt change invalidates the cache.
-- Scores, per-class max, argmax and threshold computed for all `N` images in one set of GPU
-  ops.
-- **One D2H per tick**: transfer `best_cls` and `best_score`, both `(N,900)` (~14 KB), and do
-  the keep-index arithmetic on the host; then gather boxes on the GPU by index. This replaces
-  syncs (3) and (4). Boxes never leave the device, so SAM's `_prep_prompts` contract is
-  unchanged.
-
-The existing per-image `gdino_postprocess` stays (it is the reference the batched version is
-tested against, and the pytorch backend path may still use it).
-
-### 5. Prompt updates
-
-The engine bakes the prompt *tokens* (`input_ids`, `text_token_mask`, `L=6`), but the
-prompt→class *mapping* is applied entirely in post-process via `token_class_ids`. That split
-decides what a runtime prompt change can and cannot do:
-
-| new prompt set | possible? | why |
+| ONNX traced at | build result | engine accepts |
 |---|---|---|
-| subset of the baked prompts | **yes** | drop a class by zeroing its token slots |
-| reordering of the baked prompts | **yes** | permute the class ids |
-| both (subset + reorder) | **yes** | same mechanism |
-| contains any term not baked | **no** | its tokens are not in the engine's `input_ids`; needs re-export + rebuild |
+| batch 1 | succeeds, silently specialises | **only** batch 1 |
+| batch 1, forced `min=opt=max=2` | **fails**: `IISelectLayer /transformer/encoder/fusion_layers.0/attn/Where_1: broadcast dimensions must be conformable` | — |
+| batch 3 | succeeds | **only** batch 3 (`set_input_shape` returns False for 1, 2, 5) |
 
-`GDinoTrtDetector.set_prompts(active: list[str])`:
+`torch.onnx.export`'s `dynamic_axes` declares `batch_size` symbolic — the ONNX and the parsed
+TensorRT network both show `(-1, 3, -1, -1)` — but a `Where` in the text-image fusion attention
+bakes a broadcast that is only conformable at the traced batch. **The trace's batch is the
+engine's batch.** A profile spanning several batch sizes is not achievable; TensorRT either
+fails the build or silently specialises to a static shape.
 
-- Normalizes with the existing convention (`str(p).strip().lower()`, matching
-  `class_id_map`, `langsam_helpers.py:28`); requires uniqueness after normalization.
-- Cached on `tuple(normalized)`. Unchanged input is a dict lookup — negligible per tick, and
-  it is what keeps the hoisted masks valid.
-- On change, derives a `remap` array of length `C_baked+1` (`remap[0]=0`; baked prompt `i`
-  → its position in `active`, or 0 if dropped) and produces the new `token_class_ids` as a
-  single GPU gather `remap[token_class_ids_baked]`. No tokenizer, no re-export — everything
-  is derivable from the npz, since class `i+1` corresponds to baked prompt `i`.
-- Any active prompt absent from the baked set raises, naming the baked prompts and the exact
-  `--stage export` + `--stage build` commands — the same ergonomics as the existing TRT
-  version-mismatch message.
+## What the win actually is
 
-`__init__` calls `set_prompts(prompts)`, which subsumes today's equality check
-(`langsam_common.py:541-544`) and relaxes it from "must match exactly" to "must be
-expressible".
+Same benchmark, both engines, pure engine execution:
 
-**Caller consistency.** `LangSamBatchOp` derives two other things from the prompt list:
-`self._cmap = class_id_map(self.prompts)` for the panoptic map and `self.prompts[c-1]` for
-SAM labels (`langsam_multicam_fragment.py:45,127`). Both must be recomputed whenever the
-active set changes, or class ids and colours will disagree with the detector. The operator
-owns that; the detector only owns `token_class_ids`.
+| | per execution | 3 cameras |
+|---|---|---|
+| batch-1 engine | 38.64 ms | **115.91 ms** (3 executions) |
+| batch-3 engine | 81.03 ms | **81.03 ms** (1 execution) |
 
-**Out of scope:** actually adding a `text_prompts` input port to the multicam path. Today
-only the single-camera `LangSAM2Operator` has one (`langsam2operator.py:101`), and it uses
-the PyTorch backend, which tokenizes per call and is unaffected. This spec makes the TRT path
-*ready* for such a port and safe against silent misbehaviour; wiring it is separate work.
+**34.88 ms/tick saved on a 3-camera worker (30% of engine time)** — because the batched engine
+is more efficient per camera (27.0 vs 38.6 ms), not because syncs were removed.
 
-### 6. Caller
+Worker B (3 cameras, GPU 1) sets the frame rate at 97% of a 221.8 ms tick, so this is roughly
+**4.5 -> 5.3 fps, about +19%**.
 
-`langsam_multicam_fragment.py:121-128`: the per-camera `for i, im in enumerate(rgb_gpu)` loop
-becomes a single `detect_batch(rgb_gpu)` call; the existing partition-into-SAM logic is
-unchanged.
+Batching is numerically sound. All three slices of a batch-3 run are identical to each other and
+match the batch-1 engine at **IoU 0.999611** (score delta 0.0055) on the parity image.
+
+## Design (revised)
+
+### 1. One engine, built at exactly N = the largest worker's camera count
+
+`N = max(len(w.cameras) for w in langsam_multicam.workers)` — 3 for the current 2/3 split.
+Every worker uses the same engine and **pads** its frame list to N.
+
+Padding costs the smaller worker a little: worker A runs 3 slices for 2 cameras, 81.0 ms instead
+of today's 77.3 ms. It sits at 73.6% busy and does not set the frame rate, so the system still
+gains. The alternative — one engine per distinct camera count — is optimal for both workers but
+doubles exports, builds and artifacts (~2.7 GB); rejected as not worth it for ~4 ms on a
+non-bottleneck worker.
+
+### 2. Export stage: `--trace-batch N`
+
+The host export stage traces the dummy inputs at batch N (image `(N,3,H,W)`, text tensors
+repeated to N). Everything else is unchanged, including the requirement to call
+`unset_image_tensor()` before tracing.
+
+Filenames encode the batch so a mismatched pair cannot be combined silently:
+
+```
+gdino_swint_<H>x<W>_b<N>_tf32.onnx
+gdino_swint_<H>x<W>_b<N>_tf32.engine
+gdino_swint_<H>x<W>_parity_ref.npz     (unchanged — the reference is batch-1 PyTorch)
+gdino_swint_prompts.npz                (unchanged)
+```
+
+### 3. Build stage: `--batch N` (a single integer, replacing `MIN OPT MAX`)
+
+Profile `min = opt = max = N`, matching the ONNX's traced batch. Revision 1's three-value
+`--batch` and its "widen the profile" rationale are removed — they describe a shape TensorRT
+will not build.
+
+### 4. Gates (revised)
+
+Two checks, because they answer different questions and have different thresholds:
+
+- **Slice-consistency gate (strict, blocking).** Run the parity image replicated to N; every
+  slice must agree with slice 0 to IoU >= 0.999 and score delta <= 0.01. This is what proves
+  batching is correct. Measured 0.999611 / 0.0055, so it passes with margin.
+- **PyTorch fidelity check (reported, non-blocking by default).** Compare slice 0 against the
+  stage-1 PyTorch reference and print the IoU and score delta. `--strict-parity` makes it fatal.
+
+The fidelity check is non-blocking because it currently fails for reasons unrelated to
+batching: **every container-built (TRT 10.9) engine has depressed confidence scores** — IoU
+~0.9637 and score 0.52-0.82 against PyTorch's 0.889, while boxes stay close. A batch-1 engine
+fails it identically, and the 0.9994 recorded on 2026-08-03 came from a **host TRT 11.2** build.
+Making it blocking by default would block every build for a pre-existing, separately-tracked
+problem. It is printed loudly on every build so it cannot be forgotten.
+
+> Open issue, out of scope here: why TRT 10.9 depresses scores. Boxes remain accurate, so strong
+> detections clear `box_threshold: 0.3` comfortably and masks look correct, but marginal
+> detections may be lost. First experiments to try: build with TF32 disabled, and check whether
+> the INT64 inputs TensorRT warns about (`input_ids`, `position_ids`, `token_type_ids`) are
+> being truncated to INT32.
+
+### 5. Runtime: pad to the engine's exact batch
+
+`GDinoTrtDetector` reads the engine's batch from its profile (min == max == N) and exposes it as
+`engine_batch`. `detect_batch(frames)`:
+
+- `len(frames) > engine_batch` -> raise, naming the rebuild command (as today).
+- `len(frames) < engine_batch` -> pad the stacked image tensor to N, run, and **return only the
+  first `len(frames)` results**. Padded slices are never surfaced.
+- Text tensors are cached at N only (one entry, not per batch size).
+
+`LangSamBatchOp.__init__` keeps its construction-time guard, now against `engine_batch`.
+
+### 6. What carries over unchanged from revision 1
+
+`gdino_postprocess_batch`, `build_class_token_masks`, `build_prompt_remap`, `set_prompts`, the
+single device->host transfer, `_apply_prompts`, and the operator calling `detect_batch` once per
+tick. All implemented, reviewed and committed; all still correct. Section 5 of revision 1
+(prompt updates) is unaffected and remains in force.
 
 ## Testing
 
 | test | where | gate |
 |---|---|---|
-| `gdino_postprocess_batch` vs looping `gdino_postprocess` | host, numpy, no GPU | numerically identical for random logits/boxes, several N and threshold values, including the zero-detection case |
-| prompt remap derivation | host, numpy, no GPU | identity set is a no-op; a subset zeroes exactly the dropped class's token slots; a reordering permutes ids so detections keep their labels; an unbaked term raises |
-| batch-consistency | container, `--stage build` | batch-`opt` slices match batch-1 |
-| end-to-end masks | container | detections/colours visually unchanged vs the current engine |
-| `gdino` NVTX stage | container, nsys | compare against today's 118.0 ms (B) / 96.5 ms (A) |
+| existing host suites (`test_gdino_postprocess`, `test_prompt_remap`, `test_langsam_multicam`) | host, numpy | must stay 7/7, 7/7, 9/9 |
+| padding logic: N-camera engine with fewer frames returns exactly `len(frames)` results, in order | host, numpy-only fake | new |
+| slice-consistency gate | container, `--stage build` | IoU >= 0.999 across slices |
+| end-to-end masks | container | detections/colours unchanged |
+| `gdino` NVTX stage | container, nsys | vs 118.0 ms (worker B) / 96.5 ms (worker A) |
 
 ## Risks
 
-**Primary: the ONNX was traced at batch 1.** GroundingDINO contains many reshape/view ops that
-can bake a literal batch dimension despite `dynamic_axes`. The failure mode is either a build
-error or — worse — silently wrong results for slices 1..N-1. The batch-consistency gate exists
-to catch exactly this. If it trips, the fallback is re-running `--stage export` on the host
-with a batch>1 dummy, which requires the wingdzero GroundingDINO checkout again; that is a
-host-side change and would extend this work.
-
-**Secondary: activation memory.** A max-batch-5 profile reserves more workspace on both GPUs.
-Report the engine size and build-time workspace after the build; drop `max` to 3 if it is
-material.
-
-**Non-risk (measured):** TRT Myelin graph load/unload churn was suspected but totals 1.5 s over
-588 s (0.25%) — not worth addressing.
+- **A camera-count change requires a re-export, not just a rebuild**, because the batch is baked
+  at trace time. The filename encodes N and the runtime guard fails fast, so the failure mode is
+  loud rather than silent.
+- **Padding wastes compute on smaller workers.** Bounded and measured (~4 ms on worker A).
+- The fidelity gap above remains open and is deliberately not blocking.
 
 ## Out of scope
 
-- Reclaiming `sam_compile` via fixed-batch padding (~18 ms/tick, ~+9% fps). Deferred until this
-  lever lands, being several times smaller.
-- Batching GDINO *across* workers — they are on different GPUs by design.
-- Any change to the SAM path.
-- Adding a `text_prompts` input port to the multicam path (see section 5). This spec makes the
-  TRT backend safe and adaptive for one; wiring it is separate work.
+- The TRT 10.9 score-depression investigation.
+- Reclaiming `sam_compile` via fixed-batch padding (~18 ms/tick).
+- Per-worker engines.
+- Adding a `text_prompts` port to the multicam path.
