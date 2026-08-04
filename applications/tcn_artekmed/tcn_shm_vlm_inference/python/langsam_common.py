@@ -684,13 +684,16 @@ class GDinoTrtDetector:
                     self.ctx.set_tensor_address(nm, outs[nm].data_ptr())
             self.ctx.execute_async_v3(torch.cuda.current_stream().cuda_stream)
             torch.cuda.current_stream().synchronize()          # sync 1 of 2
-            logits = cp.from_dlpack(outs["logits"])            # (N,900,256)
-            boxes = cp.from_dlpack(outs["boxes"])              # (N,900,4) cxcywh
+            # Basic slicing is a view (no sync, no copy): drop the padded slices here so the
+            # post-process (and the sync-2 device->host copy below) sees exactly the n real
+            # frames, matching hw0.
+            logits = cp.from_dlpack(outs["logits"])[:n]        # (n,900,256)
+            boxes = cp.from_dlpack(outs["boxes"])[:n]          # (n,900,4) cxcywh
             xyxy, best_cls, best_score = gdino_postprocess_batch(
                 logits, boxes, self._class_masks, hw0, xp=cp)
             # sync 2 of 2: one copy for the whole batch. Stacked so it is a single transfer;
             # class ids are small ints, exact in float32.
-            head = cp.asnumpy(cp.stack([best_cls.astype(cp.float32), best_score]))  # (2,N,Q)
+            head = cp.asnumpy(cp.stack([best_cls.astype(cp.float32), best_score]))  # (2,n,Q)
             cls_h, score_h = head[0], head[1]
             results = []
             for i in range(n):
