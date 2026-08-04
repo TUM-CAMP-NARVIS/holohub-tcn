@@ -104,9 +104,10 @@ mismatch message.
 New `gdino_postprocess_batch(logits, boxes, ...)` in `langsam_helpers.py` — the numpy/cupy
 agnostic module, so it unit-tests on the host.
 
-- **Constant per-class token masks hoisted** into `GDinoTrtDetector.__init__`: the
-  `tcid == c` masks and their `.any()` are computed once at construction, removing sync (2)
-  entirely.
+- **Per-class token masks hoisted** out of the per-camera path: the `tcid == c` masks and
+  their `.any()` are computed once and cached **keyed on the active prompt set** (see
+  "Prompt updates" below), removing sync (2) entirely. They are not treated as immortal
+  constants — a prompt change invalidates the cache.
 - Scores, per-class max, argmax and threshold computed for all `N` images in one set of GPU
   ops.
 - **One D2H per tick**: transfer `best_cls` and `best_score`, both `(N,900)` (~14 KB), and do
@@ -117,7 +118,49 @@ agnostic module, so it unit-tests on the host.
 The existing per-image `gdino_postprocess` stays (it is the reference the batched version is
 tested against, and the pytorch backend path may still use it).
 
-### 5. Caller
+### 5. Prompt updates
+
+The engine bakes the prompt *tokens* (`input_ids`, `text_token_mask`, `L=6`), but the
+prompt→class *mapping* is applied entirely in post-process via `token_class_ids`. That split
+decides what a runtime prompt change can and cannot do:
+
+| new prompt set | possible? | why |
+|---|---|---|
+| subset of the baked prompts | **yes** | drop a class by zeroing its token slots |
+| reordering of the baked prompts | **yes** | permute the class ids |
+| both (subset + reorder) | **yes** | same mechanism |
+| contains any term not baked | **no** | its tokens are not in the engine's `input_ids`; needs re-export + rebuild |
+
+`GDinoTrtDetector.set_prompts(active: list[str])`:
+
+- Normalizes with the existing convention (`str(p).strip().lower()`, matching
+  `class_id_map`, `langsam_helpers.py:28`); requires uniqueness after normalization.
+- Cached on `tuple(normalized)`. Unchanged input is a dict lookup — negligible per tick, and
+  it is what keeps the hoisted masks valid.
+- On change, derives a `remap` array of length `C_baked+1` (`remap[0]=0`; baked prompt `i`
+  → its position in `active`, or 0 if dropped) and produces the new `token_class_ids` as a
+  single GPU gather `remap[token_class_ids_baked]`. No tokenizer, no re-export — everything
+  is derivable from the npz, since class `i+1` corresponds to baked prompt `i`.
+- Any active prompt absent from the baked set raises, naming the baked prompts and the exact
+  `--stage export` + `--stage build` commands — the same ergonomics as the existing TRT
+  version-mismatch message.
+
+`__init__` calls `set_prompts(prompts)`, which subsumes today's equality check
+(`langsam_common.py:541-544`) and relaxes it from "must match exactly" to "must be
+expressible".
+
+**Caller consistency.** `LangSamBatchOp` derives two other things from the prompt list:
+`self._cmap = class_id_map(self.prompts)` for the panoptic map and `self.prompts[c-1]` for
+SAM labels (`langsam_multicam_fragment.py:45,127`). Both must be recomputed whenever the
+active set changes, or class ids and colours will disagree with the detector. The operator
+owns that; the detector only owns `token_class_ids`.
+
+**Out of scope:** actually adding a `text_prompts` input port to the multicam path. Today
+only the single-camera `LangSAM2Operator` has one (`langsam2operator.py:101`), and it uses
+the PyTorch backend, which tokenizes per call and is unaffected. This spec makes the TRT path
+*ready* for such a port and safe against silent misbehaviour; wiring it is separate work.
+
+### 6. Caller
 
 `langsam_multicam_fragment.py:121-128`: the per-camera `for i, im in enumerate(rgb_gpu)` loop
 becomes a single `detect_batch(rgb_gpu)` call; the existing partition-into-SAM logic is
@@ -128,6 +171,7 @@ unchanged.
 | test | where | gate |
 |---|---|---|
 | `gdino_postprocess_batch` vs looping `gdino_postprocess` | host, numpy, no GPU | numerically identical for random logits/boxes, several N and threshold values, including the zero-detection case |
+| prompt remap derivation | host, numpy, no GPU | identity set is a no-op; a subset zeroes exactly the dropped class's token slots; a reordering permutes ids so detections keep their labels; an unbaked term raises |
 | batch-consistency | container, `--stage build` | batch-`opt` slices match batch-1 |
 | end-to-end masks | container | detections/colours visually unchanged vs the current engine |
 | `gdino` NVTX stage | container, nsys | compare against today's 118.0 ms (B) / 96.5 ms (A) |
@@ -154,3 +198,5 @@ material.
   lever lands, being several times smaller.
 - Batching GDINO *across* workers — they are on different GPUs by design.
 - Any change to the SAM path.
+- Adding a `text_prompts` input port to the multicam path (see section 5). This spec makes the
+  TRT backend safe and adaptive for one; wiring it is separate work.
