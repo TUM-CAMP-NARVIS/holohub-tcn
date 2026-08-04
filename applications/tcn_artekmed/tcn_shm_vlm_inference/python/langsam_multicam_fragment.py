@@ -42,7 +42,6 @@ class LangSamBatchOp(Operator):
         self.cameras = list(cameras)
         self.device = device if isinstance(device, torch.device) else torch.device(f"cuda:{int(device)}")
         self.prompts = list(prompts)
-        self._cmap = class_id_map(self.prompts)
         self.box_threshold = float(langsam_cfg.get("box_threshold", 0.3))
         self.text_threshold = float(langsam_cfg.get("text_threshold", 0.25))
         self.gdino_backend = langsam_cfg.get("gdino_backend", "pytorch")
@@ -73,6 +72,22 @@ class LangSamBatchOp(Operator):
                     compile_model=bool(langsam_cfg.get("gdino_compile", False)),
                 )
                 self.gdino.build_model()
+
+            self._apply_prompts(self.prompts)
+
+    def _apply_prompts(self, prompts):
+        """Single point of truth for prompt-derived state.
+
+        Three things are derived from the prompt list and MUST move together, or class ids and
+        mask colours silently disagree with the detections: the detector's token->class map,
+        `self.prompts` (used to label boxes for SAM), and `self._cmap` (used to build the
+        panoptic map). The TRT detector accepts any subset/reordering of its baked prompts and
+        raises otherwise; the pytorch backend tokenises per call and accepts anything.
+        """
+        self.prompts = list(prompts)
+        self._cmap = class_id_map(self.prompts)
+        if self.gdino_trt is not None:
+            self.gdino_trt.set_prompts(self.prompts)
 
     def setup(self, spec: OperatorSpec):
         spec.input("color_input")
@@ -119,10 +134,10 @@ class LangSamBatchOp(Operator):
             sam_imgs, sam_boxes, sam_labels, sam_idx = [], [], [], []
             torch.cuda.nvtx.range_push("gdino")
             if self.gdino_backend == "trt":
-                for i, im in enumerate(rgb_gpu):
-                    boxes, cls, _ = self.gdino_trt.detect(im)   # xyxy px (GPU), class ids, scores
+                # One engine execution for every camera on this worker (see detect_batch).
+                for i, (boxes, cls, _) in enumerate(self.gdino_trt.detect_batch(rgb_gpu)):
                     if len(cls) > 0:
-                        sam_imgs.append(im)
+                        sam_imgs.append(rgb_gpu[i])
                         sam_boxes.append(boxes)
                         sam_labels.append([self.prompts[c - 1] for c in cls])
                         sam_idx.append(i)
