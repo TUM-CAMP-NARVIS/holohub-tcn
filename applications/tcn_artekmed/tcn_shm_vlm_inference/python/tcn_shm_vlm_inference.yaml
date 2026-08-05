@@ -109,7 +109,7 @@ langsam_inference:
   # forward compilation is heavy on host RAM and can OOM (SIGKILL/-9), especially GDINO.
   # Enable ONE at a time and watch memory; sam_compile is the safer/cleaner target.
   gdino_compile: false
-  # sam_compile MUST stay false while `langsam_multicam.workers` has more than one worker.
+  # sam_compile MUST stay false while `gpu_workers.workers` has more than one worker.
   # Dynamo's tracer and the autocast cache are PROCESS-global: one worker tracing the SAM
   # encoder while another leaves the global torch.autocast context can deadlock both
   # permanently (hard hang, only SIGKILL recovers).
@@ -136,7 +136,7 @@ langsam_inference:
   #
   # The _b<N>_ in the engine name is its FIXED batch, baked at ONNX trace time (a Where in the
   # encoder fusion attention is only broadcast-conformable at the traced batch). N must be >=
-  # every worker's camera count in langsam_multicam below; smaller workers pad up to it and
+  # every worker's camera count in gpu_workers above; smaller workers pad up to it and
   # discard the extra slices. Changing a worker's camera count above N needs a re-export AND a
   # rebuild, both at --batch <new N> -- the runtime fails fast at startup with the command.
 #  gdino_backend: "pytorch"
