@@ -308,3 +308,17 @@ stages, same `N`), since `(H, W)` and the batch are baked into the ONNX.
 `--fp16` is experimental: on TRT 11 (no global FP16 flag) it needs an fp16 ONNX / strongly-typed
 build. TF32 is already quality-matched and ~4×; only pursue FP16 if you re-run the fidelity
 report and it stays ≥ 0.99.
+
+## Build-stage gates
+
+The build stage runs three checks, in this order:
+
+1. **Image independence** (blocking). Mirrors the parity image and requires the logits to change.
+   `GroundingDINO.forward` caches backbone features, so a trace taken after any prior forward can
+   bake them in as constants and drop `img` from the graph — producing an engine that returns the
+   same detections for every frame. This matters especially with `--from-config`, where one
+   process traces the same model once per batch. It is deliberately independent of the PyTorch
+   comparison below, so the container's TRT-vs-PyTorch deviation can neither mask it nor trip it.
+2. **Slice consistency** (blocking). Every slice of a batched run must agree with slice 0.
+3. **PyTorch fidelity** (reported, non-blocking). See below.
+

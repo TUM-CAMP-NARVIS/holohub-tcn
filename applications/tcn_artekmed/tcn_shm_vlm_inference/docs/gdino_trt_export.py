@@ -273,6 +273,45 @@ def run_at_batch(ser, text, img, B):
     return [_top_box(o["logits"][i:i + 1], o["boxes"][i:i + 1]) for i in range(B)]
 
 
+def image_independence_gate(ser, text, img, batch, min_rel_diff=1e-3):
+    """BLOCKING. The engine must actually depend on its image input.
+
+    `GroundingDINO.forward` caches backbone features in `self.features`/`self.poss` and only
+    recomputes them when absent, so a trace taken after ANY prior forward can bake those
+    features in as constants and drop `img` from the graph -- yielding an engine that returns
+    the same output for every image. Commit 5d046734e fixed exactly that and named this test as
+    the way to detect it: `np.allclose(engine(imgA), engine(imgB))` must be False.
+
+    It matters more now than it did then: with `--from-config` the same model instance is traced
+    once per batch in a single process, so batches 2..N are traced from an already-traced model.
+    `export_onnx` clears the cache first (and now hard-fails if it cannot), but this gate is what
+    proves it worked.
+
+    Deliberately independent of `fidelity_report`: that compares one image against PyTorch and
+    is non-blocking, because container TRT deviates from PyTorch for reasons unrelated to
+    tracing. This gate compares the engine against ITSELF on two different images, so the
+    TRT-vs-PyTorch deviation cannot mask it or trip it.
+    """
+    def logits_for(im):
+        feed = {"img": im.repeat(batch, 1, 1, 1)}
+        for k, v in text.items():
+            feed[k] = v.repeat(*([batch] + [1] * (v.dim() - 1)))
+        return np.nan_to_num(_run_engine(ser, feed)["logits"], neginf=0.0, posinf=0.0)
+
+    a = logits_for(img)
+    b = logits_for(img.flip(-1))          # horizontally mirrored: a real engine must react
+    scale = max(float(np.abs(a).max()), 1e-12)
+    rel = float(np.abs(a - b).max()) / scale
+    if rel < min_rel_diff:
+        raise SystemExit(
+            f"IMAGE INDEPENDENCE GATE FAILED: mirroring the input changed the logits by only "
+            f"{rel:.3e} (need >= {min_rel_diff}).\nThe engine is ignoring its image input -- the "
+            f"ONNX trace almost certainly baked cached backbone features as constants (see "
+            f"commit 5d046734e). Every frame would produce identical detections. Re-export this "
+            f"batch in a FRESH process so the model is traced only once.")
+    print(f"image-independence gate OK (mirrored input changed logits by {rel:.3e})")
+
+
 def slice_consistency_gate(slices, min_iou=0.999, max_score_delta=0.01):
     """BLOCKING. Every slice of a batched run must agree with slice 0.
 
@@ -424,6 +463,9 @@ def stage_build(args, H, W, onnx_path, engine_path, npz_path, ref_path, batch):
 
     ser = build_engine(onnx_path, engine_path, H, W, L, fp16=args.fp16, batch=batch)
     slices = run_at_batch(ser, text, ref_img, int(batch))
+    # Order matters: image-independence first. It is the one gate immune to the container's
+    # TRT-vs-PyTorch score deviation, so a stale-cache trace cannot hide behind it.
+    image_independence_gate(ser, text, ref_img, int(batch))
     slice_consistency_gate(slices)
     fidelity_report(slices[0], s_pt, b_pt, ref_image_path, min_iou=args.min_iou,
                     min_detect=args.min_detect, strict=args.strict_parity)
