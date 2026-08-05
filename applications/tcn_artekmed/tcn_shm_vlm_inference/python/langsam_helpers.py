@@ -8,19 +8,48 @@ in tests. Re-exported from ``langsam_common`` for convenience.
 import numpy as np
 
 
-def resolve_workers(multicam_cfg, all_color_cameras):
-    """Resolve the per-GPU worker assignment.
+def resolve_workers(cfg, all_color_cameras):
+    """Resolve the per-GPU worker assignment from the `gpu_workers` node.
 
     A worker is ``{"device": int, "cameras": [port, ...]}``. Empty/missing ``workers`` ->
-    a single worker on device 0 processing all color cameras.
+    a single worker on device 0 processing all color cameras. A worker's ENGINE BATCH is its
+    camera count (see `worker_batch`) -- it is derived, never configured, so the two cannot
+    disagree.
     """
-    workers = (multicam_cfg or {}).get("workers") or []
+    workers = (cfg or {}).get("workers") or []
     if not workers:
         return [{"device": 0, "cameras": list(all_color_cameras)}]
     return [
         {"device": int(w.get("device", 0)), "cameras": list(w.get("cameras") or [])}
         for w in workers
     ]
+
+
+def worker_batch(worker):
+    """The engine batch a worker needs: one slice per camera it owns."""
+    return len(worker["cameras"])
+
+
+def distinct_batches(workers):
+    """Sorted, deduplicated engine batches a worker list requires -> what to build."""
+    return sorted({worker_batch(w) for w in workers if worker_batch(w) > 0})
+
+
+def worker_engine_path(template, batch):
+    """Resolve an engine path template for one worker's batch.
+
+    `{batch}` is substituted; a template WITHOUT it formats to itself, so a single-engine
+    configuration keeps working while only some batches exist. Raises if the result still
+    contains a placeholder -- that means a typo'd field name, which would otherwise surface
+    much later as a confusing missing-file error.
+    """
+    if template is None:
+        return None
+    out = str(template).replace("{batch}", str(int(batch)))
+    if "{" in out or "}" in out:
+        raise ValueError(f"unresolved placeholder in engine path template: {template!r} "
+                         f"-> {out!r} (only {{batch}} is substituted)")
+    return out
 
 
 def class_id_map(prompts):
