@@ -95,11 +95,18 @@ Notes / gotchas (found during the spike + first real export):
 
 ### Stage 1 — export (host)
 
-Copy `gdino_trt_export.py` into the GroundingDINO checkout root and run:
+**Do NOT copy the tool into the checkout.** Run it **in place** from this repo, with the
+GroundingDINO checkout as the working directory. Copying it breaks `--from-config`: the tool
+locates `langsam_helpers` relative to its own file (`<tool dir>/../python`), so a copy sitting in
+the checkout root looks for `~/develop/vision/python` and fails with
+`ModuleNotFoundError: No module named 'langsam_helpers'`.
 
 ```bash
-export PYTHONPATH=$PWD            # so `import groundingdino` resolves (no pip install -e)
-python gdino_trt_export.py --stage export \
+cd ~/develop/vision/GroundingDINO-TensorRT-and-ONNX-Inference   # relative --config/--checkpoint/
+                                                               # --parity-image resolve from here
+PYTHONPATH=$PWD \                       # so `import groundingdino` resolves (no pip install -e)
+~/develop/vision/GroundingDINO/.venv-gdino-export/bin/python \
+  <repo>/applications/tcn_artekmed/tcn_shm_vlm_inference/docs/gdino_trt_export.py --stage export \
   --checkpoint weights/groundingdino_swint_ogc.pth \
   --config groundingdino/config/GroundingDINO_SwinT_OGC.py \
   --prompts floor person \
@@ -108,6 +115,16 @@ python gdino_trt_export.py --stage export \
   --out /data/models/active/groundingdino \
   --parity-image images/in/person.jpg  # MUST contain the prompted classes (floor/person here)
 ```
+
+Why each piece is needed:
+
+| piece | reason |
+|---|---|
+| `cd` into the checkout | `--config`, `--checkpoint` and `--parity-image` above are relative paths |
+| `PYTHONPATH=$PWD` | resolves `import groundingdino` to the wingdzero fork |
+| the `.venv-gdino-export` python | has torch, `transformers==4.44.2` and tensorrt |
+| the tool's **absolute repo path** | lets its own `sys.path` insert find `langsam_helpers` for `--from-config` |
+| `--out` is a **host** path | this is the host stage; `/srv/models` only exists in the container |
 
 `--batch N` is the batch this artifact set is for — set it to the busiest LangSAM worker's
 camera count. **The engine's batch is baked at ONNX trace time**, so a camera-count change is a
