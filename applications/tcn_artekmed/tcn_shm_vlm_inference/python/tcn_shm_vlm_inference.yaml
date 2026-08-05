@@ -89,11 +89,22 @@ langsam_inference:
   gdino_compile: false
   # sam_compile MUST stay false while `langsam_multicam.workers` has more than one worker.
   # Dynamo's tracer and the autocast cache are PROCESS-global: one worker tracing the SAM
-  # encoder while another leaves the global torch.autocast context deadlocks both permanently
-  # (hard hang, only SIGKILL recovers). The SAM batch size varies per tick (only cameras with
-  # a detection reach SAM), so Dynamo re-traces mid-run and reopens that window repeatedly --
-  # warming up every batch size at startup was measured NOT to prevent it. Cost of eager:
-  # ~18 ms/tick at batch 3 (45.5 ms vs 27.4 ms compiled), ~11 ms at batch 2, ~4 ms at batch 1.
+  # encoder while another leaves the global torch.autocast context can deadlock both
+  # permanently (hard hang, only SIGKILL recovers).
+  #
+  # MEASURED 2026-08-05 (sam_compile: true, 2 workers, batch-3 GDINO engine, 586 s run):
+  #  - The compiles are a STARTUP cost, NOT recurring mid-run re-traces as previously assumed:
+  #    4 stalls totalling 284 s, all inside the first 146 s (two graphs per worker, longest
+  #    single call 78 s), then none for the remaining ~440 s.
+  #  - Both workers compiled CONCURRENTLY (t=+0.3 s on both) -- exactly the deadlock condition.
+  #    That run survived it. That is luck, not a guarantee, and the window reopens every start.
+  #  - Steady-state gain is only +4.5% (period 194.5 -> 186.2 ms, 5.14 -> 5.37 fps): compile
+  #    speeds up the SAM ENCODER, but the per-image decode loop -- about half the sam stage --
+  #    is untouched. Effective throughput over the run was 3.96 fps, a 23% REGRESSION, because
+  #    of the startup stalls; break-even is around a one-hour run.
+  # Making it safe would need a CONSTANT SAM batch (one graph only) plus warmup in __init__,
+  # where operator construction is sequential and so closes the concurrency window. Not worth
+  # it for +4.5%: the SAM encoder is moving to TensorRT instead, which removes Dynamo entirely.
   sam_compile: false
   box_threshold: 0.3
   text_threshold: 0.25
