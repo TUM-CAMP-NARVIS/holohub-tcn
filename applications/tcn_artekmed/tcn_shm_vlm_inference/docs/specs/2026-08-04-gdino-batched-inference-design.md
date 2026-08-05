@@ -154,3 +154,46 @@ tick. All implemented, reviewed and committed; all still correct. Section 5 of r
 - Reclaiming `sam_compile` via fixed-batch padding (~18 ms/tick).
 - Per-worker engines.
 - Adding a `text_prompts` port to the multicam path.
+
+## Results (measured 2026-08-05)
+
+nsys, 587.7 s steady state, 5860 `gdino` ranges, batch-3 engine, 2-GPU split (2 cameras on
+GPU 0 which also drives Holoviz, 3 on GPU 1), `sam_compile: false`. Worker identity resolved by
+joining CUPTI kernel `deviceId` to the launching thread — the two workers' thread order is NOT
+stable between runs, so do not assume it.
+
+| worker | stage | before | after | change |
+|---|---|---|---|---|
+| GPU 1, 3 cameras | gdino | 118.0 ms | **69.0 ms** | **-49.0 ms (-41.5%)** |
+| GPU 0, 2 cameras (pads 2->3) | gdino | 96.5 ms | 95.5 ms | -1.0 ms |
+
+The 2-camera worker performs 50% more GDINO work (3 slices for 2 cameras) in the same wall
+time, so the padding cost is fully absorbed.
+
+| | before | after |
+|---|---|---|
+| tick total GPU1 / GPU0 | 215.2 / 170.6 ms | 175.4 / 172.1 ms |
+| period (p50) | 221.8 ms | 194.5 ms |
+| framerate | 4.51 fps | **5.14 fps (+14%)** |
+| GPU busy 0 / 1 | 51.2% / 62.4% | 61.4% / 56.8% |
+| engine | 703 MB batch-1 | 670 MiB batch-3 |
+
+The predicted -34.9 ms was beaten (-49.0 ms), but the overall gain was +14% rather than the
+predicted +19%: SAM and panoptic each drift up a few ms at the higher tick rate. The workers are
+now balanced (175.4 vs 172.1, previously 215.2 vs 170.6), so further gains require improving
+both, not just the ex-bottleneck.
+
+Build gates on the shipped engine: `slice-consistency gate OK (batch 3: worst IoU 1.000000,
+worst |score delta| 0.000000)` — batching is exact. `pytorch fidelity [DEVIATION]: IoU 0.9648,
+trt score 0.521 vs pytorch 0.889` — reported, non-blocking, the pre-existing TRT 10.9 issue.
+
+### Open: detection quality in corner cases
+
+Masks are correct in the common case but deviate in some corner cases, and there is no 1:1
+comparison against the PyTorch backend yet. The most likely cause is NOT batching (slices are
+bit-identical) but the TRT 10.9 score depression: boxes stay accurate (IoU ~0.96) while
+confidence collapses (0.52 vs 0.889 on the parity image). With `box_threshold: 0.3`, marginal
+detections that PyTorch scores just above the threshold can fall below it under TRT, which
+presents exactly as "mostly fine, occasional misses". To settle it: run the same scene with
+`gdino_backend: "pytorch"` and compare, and try a proportionally lower `box_threshold` for the
+TRT path.
