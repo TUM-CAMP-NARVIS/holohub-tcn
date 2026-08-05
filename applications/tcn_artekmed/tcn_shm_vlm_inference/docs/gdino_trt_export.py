@@ -117,11 +117,23 @@ def build_text(model, prompts):
 def export_onnx(model, text, H, W, onnx_path, batch=1):
     # CRITICAL: GroundingDINO.forward caches backbone features in self.features/self.poss and only
     # recomputes them from the image if those attrs are absent. Any prior forward (e.g. the parity
-    # reference) leaves them set, so the trace would bake those cached features as constants and
-    # never connect the `img` input -> an image-independent engine. Clear the cache first so the
-    # traced forward recomputes the backbone from the dummy image and wires img -> features -> out.
-    if hasattr(model, "unset_image_tensor"):
-        model.unset_image_tensor()
+    # reference, or -- since --from-config traces the SAME model instance once per batch -- an
+    # earlier batch's export) leaves them set, so the trace would bake those cached features as
+    # constants and never connect the `img` input -> an image-independent engine. Clear the cache
+    # first so the traced forward recomputes the backbone from the dummy image and wires
+    # img -> features -> out. This must be a hard failure, not a silent no-op: a model without
+    # this method would trace with stale features and the only downstream detector
+    # (fidelity_report) is non-blocking by default, so the defect would ship silently.
+    if not hasattr(model, "unset_image_tensor"):
+        raise SystemExit(
+            "model has no unset_image_tensor(): its cached backbone features "
+            "(self.features/self.poss) cannot be cleared before tracing, so a repeat trace of "
+            "this model instance would silently bake STALE features and ignore the `img` input "
+            "-- producing an engine that returns the same output for every image. Use a model "
+            "that provides unset_image_tensor() (the wingdzero fork), or build one batch per "
+            "process (a fresh --stage export per --batch) so each trace is the model's first "
+            "forward.")
+    model.unset_image_tensor()
     # The traced batch IS the engine's batch. dynamic_axes below declares batch_size symbolic
     # and TensorRT's parser reports -1, but a Where in the encoder fusion attention bakes a
     # broadcast that is only conformable at the traced batch: forcing a different batch fails
@@ -382,13 +394,20 @@ def stage_export_setup(args, H, W, npz_path, ref_path):
     return model, text
 
 
-def stage_export_batch(model, text, H, W, onnx_path, batch):
+def stage_export_batch(model, text, H, W, onnx_path, batch, print_hint=True):
     """Export the batch-DEPENDENT ONNX for one engine batch, reusing the model/text tensors
-    `stage_export_setup` already built."""
+    `stage_export_setup` already built.
+
+    `print_hint` prints the per-batch "now build the engine" follow-up naming this batch's
+    `--batch N`. The `--from-config` caller in `main` sets it False and prints ONE combined
+    hint after the whole loop instead -- naming `--batch N` per batch here would have a user
+    run the build stage once per batch by hand instead of once with the same `--from-config`.
+    """
     export_onnx(model, text, H, W, onnx_path, batch=batch)
-    print(f"\nDONE (export, batch {batch}). Now build the engine INSIDE the runtime "
-          f"container:\n  python3 gdino_trt_export.py --stage build --hw {H} {W} "
-          f"--batch {batch} --out <container path>")
+    if print_hint:
+        print(f"\nDONE (export, batch {batch}). Now build the engine INSIDE the runtime "
+              f"container:\n  python3 gdino_trt_export.py --stage build --hw {H} {W} "
+              f"--batch {batch} --out <container path>")
 
 
 def stage_build(args, H, W, onnx_path, engine_path, npz_path, ref_path, batch):
@@ -435,11 +454,12 @@ def main():
                     help="PyTorch top score the parity image must reach for the IoU check to be "
                          "valid (i.e. the image must actually contain a prompted class)")
     ap.add_argument("--fp16", action="store_true", help="experimental; TF32 is the validated default")
-    ap.add_argument("--batch", type=int, default=1,
+    ap.add_argument("--batch", type=int, default=None,
                     help="the engine's batch = the largest LangSAM worker's camera count. Both "
                          "stages need the SAME value: export traces at it (the traced batch is "
                          "baked into the graph) and build pins the profile to it. Artifacts are "
-                         "named _b<N>_ so a mismatched pair cannot be combined by accident.")
+                         "named _b<N>_ so a mismatched pair cannot be combined by accident. "
+                         "(default: 1; mutually exclusive with --from-config)")
     ap.add_argument("--from-config", default=None,
                     help="path to tcn_shm_vlm_inference.yaml; builds one engine per distinct "
                          "worker camera count in its gpu_workers node (mutually exclusive "
@@ -449,10 +469,18 @@ def main():
                     help="make the PyTorch fidelity deviation fatal (default: reported only)")
     args = ap.parse_args()
 
+    # A plain argparse mutually-exclusive group is NOT safe here: it flags a conflict only when
+    # the parsed value is not identical (by `is`) to the argument's default, and CPython caches
+    # small ints, so e.g. `--batch 1 --from-config ...` (1 happens to be this tool's default)
+    # would silently pass through uncaught. Checking `args.batch is not None` (its default is
+    # None, never a user-supplied value) sidesteps that entirely.
+    if args.batch is not None and args.from_config:
+        ap.error("argument --from-config: not allowed with argument --batch")
+
     if args.from_config:
         batches = batches_from_config(args.from_config)
     else:
-        batches = [int(args.batch)]
+        batches = [int(args.batch) if args.batch is not None else 1]
 
     H, W = args.hw
     os.makedirs(args.out, exist_ok=True)
@@ -471,7 +499,12 @@ def main():
         model, text = stage_export_setup(args, H, W, npz_path, ref_path)
         for batch in batches:
             onnx_path, _ = paths_for(batch)
-            stage_export_batch(model, text, H, W, onnx_path, batch)
+            stage_export_batch(model, text, H, W, onnx_path, batch, print_hint=not args.from_config)
+        if args.from_config:
+            print(f"\nDONE (export, batches {batches}). Now build the engines INSIDE the "
+                  f"runtime container, with the SAME --from-config:\n"
+                  f"  python3 gdino_trt_export.py --stage build --hw {H} {W} "
+                  f"--from-config {args.from_config} --out <container path>")
     else:
         for batch in batches:
             onnx_path, engine_path = paths_for(batch)

@@ -265,9 +265,10 @@ def mask_gate(sam, images_gpu, ref, trt_out, min_iou=0.99):
 def main():
     ap = argparse.ArgumentParser(description="SAM 2 image encoder -> ONNX -> TRT (in-container)")
     ap.add_argument("--sam-type", default="sam2.1_hiera_tiny", choices=sorted(SAM_MODELS))
-    ap.add_argument("--batch", type=int, default=3,
+    ap.add_argument("--batch", type=int, default=None,
                     help="engine batch = the largest LangSAM worker's camera count; the trace "
-                         "and the profile both use it, and the artifacts are named _b<N>_")
+                         "and the profile both use it, and the artifacts are named _b<N>_ "
+                         "(default: 3; mutually exclusive with --from-config)")
     ap.add_argument("--from-config", default=None,
                     help="path to tcn_shm_vlm_inference.yaml; builds one engine per distinct "
                          "worker camera count in its gpu_workers node (mutually exclusive "
@@ -280,10 +281,18 @@ def main():
     ap.add_argument("--min-iou", type=float, default=0.99)
     args = ap.parse_args()
 
+    # A plain argparse mutually-exclusive group is NOT safe here: it flags a conflict only when
+    # the parsed value is not identical (by `is`) to the argument's default, and CPython caches
+    # small ints, so `--batch 3 --from-config ...` (3 happens to be this tool's default) would
+    # silently pass through uncaught. Checking `args.batch is not None` (its default is None,
+    # never a user-supplied value) sidesteps that entirely.
+    if args.batch is not None and args.from_config:
+        ap.error("argument --from-config: not allowed with argument --batch")
+
     if args.from_config:
         batches = batches_from_config(args.from_config)
     else:
-        batches = [int(args.batch)]
+        batches = [int(args.batch) if args.batch is not None else 3]
 
     dev = torch.device("cuda:0")
     os.makedirs(args.out, exist_ok=True)
