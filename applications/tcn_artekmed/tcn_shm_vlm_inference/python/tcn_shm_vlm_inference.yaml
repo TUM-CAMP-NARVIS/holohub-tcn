@@ -141,12 +141,7 @@ langsam_inference:
   # rebuild, both at --batch <new N> -- the runtime fails fast at startup with the command.
 #  gdino_backend: "pytorch"
   gdino_backend: "trt"
-  # TEMPORARY: pinned to the b3 engine (no {batch}) so both workers share it while the
-  # batch-2 GDINO engine does not exist yet -- a path without the placeholder resolves to
-  # itself, which is what makes the per-batch migration incremental. Restore the {batch}
-  # template after building the b2 engine (host --stage export, then container --stage build,
-  # both with --from-config).
-  gdino_trt_engine: "/srv/models/active/groundingdino/gdino_swint_512x672_b3_tf32.engine"
+  gdino_trt_engine: "/srv/models/active/groundingdino/gdino_swint_512x672_b{batch}_tf32.engine"
   gdino_trt_text: "/srv/models/active/groundingdino/gdino_swint_prompts.npz"
   gdino_trt_hw: [512, 672]
   # Set true to log rolling GDINO-vs-SAM per-stage timing (to find the bottleneck).
