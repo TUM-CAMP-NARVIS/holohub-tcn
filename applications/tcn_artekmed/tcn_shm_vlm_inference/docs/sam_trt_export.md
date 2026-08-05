@@ -58,6 +58,23 @@ comparable width, which is exactly what the feature fidelity gate below checks f
 similarity / relative error, not bit-exactness, since FP16 and bf16 legitimately differ in
 their last bits).
 
+### Gotcha: `dynamo=False` is required
+
+`torch.onnx.export` is called with **`dynamo=False`**, the same as `gdino_trt_export.py`. Recent
+PyTorch defaults to the dynamo exporter, which for this model does three unhelpful things:
+
+1. requires an extra `onnxscript` dependency that the container does not ship;
+2. silently raises the opset to 18, then fails converting back down —
+   `RuntimeError: No Adapter To Version $17 for Resize`;
+3. hands the graph to onnxscript's constant folder, which evaluates the Hiera `Resize` nodes
+   through ONNX's **pure-Python** reference implementation (`onnx/reference/ops/op_resize.py`).
+   On 1024² feature maps that never completes — it presents as a hang at ~112% CPU with no
+   further output. (Diagnosed with `py-spy dump`; see `../optimization-playbook.md` §7.6.)
+
+The legacy tracer does none of this. If you ever see the export sitting at full CPU with no
+`ONNX written:` line, check that `dynamo=False` is still there before assuming the model is at
+fault. `onnxscript` is **not** needed.
+
 ## The three gates
 
 All three gates run against the batch produced by this same invocation and are **blocking** —

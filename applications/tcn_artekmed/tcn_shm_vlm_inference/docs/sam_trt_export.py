@@ -71,9 +71,16 @@ def build_sam(sam_type, device):
 def export_onnx(wrapper, onnx_path, batch, device):
     dummy = torch.randn(batch, 3, IMAGE_SIZE, IMAGE_SIZE, device=device)
     dyn = {"image": {0: "batch_size"}, **{n: {0: "batch_size"} for n in OUT_NAMES}}
+    # dynamo=False is REQUIRED (same as gdino_trt_export.py). Recent torch defaults to the
+    # dynamo exporter, which here: pulls in an onnxscript dependency, silently bumps to opset
+    # 18 and then fails converting back down ("No Adapter To Version 17 for Resize"), and --
+    # worst -- hands the graph to onnxscript's constant folder, which evaluates the Hiera
+    # Resize nodes through ONNX's pure-PYTHON reference implementation
+    # (onnx/reference/ops/op_resize.py). On 1024^2 feature maps that never finishes: observed
+    # as a hang at 112% CPU with no output. The legacy tracer does none of that.
     torch.onnx.export(wrapper, dummy, onnx_path, export_params=True, opset_version=17,
                       do_constant_folding=True, input_names=["image"],
-                      output_names=OUT_NAMES, dynamic_axes=dyn)
+                      output_names=OUT_NAMES, dynamic_axes=dyn, dynamo=False)
     print(f"ONNX written: {onnx_path}")
 
 
