@@ -83,11 +83,15 @@ SAM_MODELS = {
 
 class SAM:
 
-    def __init__(self, sam_type: str, ckpt_path: str | None = None, device: torch.device | None = None, compile_model: bool = False):
+    def __init__(self, sam_type: str, ckpt_path: str | None = None, device: torch.device | None = None, compile_model: bool = False,
+                 sam_backend: str = "pytorch", sam_trt_engine: str | None = None):
         self.sam_type = sam_type
         self.ckpt_path = ckpt_path
         self.device = device
         self.compile_model = compile_model
+        self.sam_backend = sam_backend
+        self.sam_trt_engine = sam_trt_engine
+        self.trt_encoder = None
         self.model = None
         self.mask_generator = None
         self.predictor = None
@@ -122,6 +126,11 @@ class SAM:
                 print("SAM2 image encoder compiled (torch.compile)")
             except Exception as e:
                 print(f"torch.compile(SAM image_encoder) failed; using eager. {e}")
+        if self.sam_backend == "trt":
+            if not self.sam_trt_engine:
+                raise ValueError('sam_backend: "trt" requires sam_trt_engine')
+            self.trt_encoder = SamTrtEncoder(self.sam_trt_engine, self.device)
+            print(f"SAM2 image encoder: TensorRT engine (batch {self.trt_encoder.engine_batch})")
 
     def _load_checkpoint(self, model: torch.nn.Module):
         if self.ckpt_path is None:
@@ -214,15 +223,18 @@ class SAM:
             dim=0,
         ).to(self.device)
         model = p.model
-        backbone_out = model.forward_image(batch)
-        _, vision_feats, _, _ = model._prepare_backbone_features(backbone_out)
-        if model.directly_add_no_mem_embed:
-            vision_feats[-1] = vision_feats[-1] + model.no_mem_embed
-        bsz = batch.shape[0]
-        feats = [
-            feat.permute(1, 2, 0).view(bsz, -1, *feat_size)
-            for feat, feat_size in zip(vision_feats[::-1], p._bb_feat_sizes[::-1])
-        ][::-1]
+        if self.trt_encoder is not None:
+            feats = self.trt_encoder.encode(batch)
+        else:
+            backbone_out = model.forward_image(batch)
+            _, vision_feats, _, _ = model._prepare_backbone_features(backbone_out)
+            if model.directly_add_no_mem_embed:
+                vision_feats[-1] = vision_feats[-1] + model.no_mem_embed
+            bsz = batch.shape[0]
+            feats = [
+                feat.permute(1, 2, 0).view(bsz, -1, *feat_size)
+                for feat, feat_size in zip(vision_feats[::-1], p._bb_feat_sizes[::-1])
+            ][::-1]
         p._features = {"image_embed": feats[-1], "high_res_feats": feats[:-1]}
         p._is_image_set = True
         p._is_batch = True
@@ -518,6 +530,80 @@ class GDINO:
         return results
 
 
+
+
+class SamTrtEncoder:
+    """SAM 2 Hiera image encoder as a prebuilt fixed-batch TensorRT engine.
+
+    Replaces the forward_image / _prepare_backbone_features / no_mem_embed / reshape block of
+    SAM._set_image_batch_gpu with one execute_async_v3. Inputs and outputs stay on the GPU, so
+    the decode path is unchanged. The engine runs at exactly `engine_batch` images (baked at
+    ONNX trace time); a worker with fewer cameras pads and the extra slices are discarded.
+    """
+
+    def __init__(self, engine_path, device):
+        import tensorrt as trt
+        self.trt = trt
+        self.device = device if isinstance(device, torch.device) else torch.device(f"cuda:{int(device)}")
+        self._engine_path = engine_path
+        with torch.cuda.device(self.device):
+            logger = trt.Logger(trt.Logger.ERROR)
+            with open(engine_path, "rb") as f:
+                self.engine = trt.Runtime(logger).deserialize_cuda_engine(f.read())
+            if self.engine is None:
+                raise RuntimeError(
+                    f"Failed to load SAM TRT engine: {engine_path}\n"
+                    f"Runtime TensorRT is {trt.__version__}. Engines only load in the TRT that "
+                    f"built them -- rebuild INSIDE this container:\n"
+                    f"  python3 <holohub>/applications/tcn_artekmed/tcn_shm_vlm_inference/docs/"
+                    f"sam_trt_export.py --batch <N> --out {os.path.dirname(engine_path)}\n"
+                    f"Or set langsam_inference.sam_backend: \"pytorch\" to fall back.")
+            self.ctx = self.engine.create_execution_context()
+            try:
+                self.engine_batch = int(self.engine.get_tensor_profile_shape("image", 0)[0][0])
+            except Exception as e:
+                print(f"Failed to read SAM TRT engine profile (assuming batch=1): {e}")
+                self.engine_batch = 1
+            self._out_names = [self.engine.get_tensor_name(i)
+                               for i in range(self.engine.num_io_tensors)
+                               if self.engine.get_tensor_mode(self.engine.get_tensor_name(i))
+                               == trt.TensorIOMode.OUTPUT]
+
+    def batch_error(self, n):
+        return (f"{n} images requested but the SAM encoder engine is built for batch "
+                f"{self.engine_batch}. The batch is baked at ONNX trace time, so rebuild at "
+                f"--batch {n}:\n"
+                f"  python3 <holohub>/applications/tcn_artekmed/tcn_shm_vlm_inference/docs/"
+                f"sam_trt_export.py --batch {n} --out {os.path.dirname(self._engine_path)}")
+
+    def encode(self, batch_gpu):
+        """batch_gpu: (n,3,1024,1024) float32 CUDA, already resized+normalised.
+
+        Returns [high_res_feats_0, high_res_feats_1, image_embed], each sliced back to n.
+        One execution and one stream sync regardless of n.
+        """
+        n = int(batch_gpu.shape[0])
+        try:
+            pad = plan_batch_padding(n, self.engine_batch)
+        except ValueError as e:
+            raise ValueError(f"{e}\n{self.batch_error(n)}") from None
+        with torch.cuda.device(self.device):
+            img = batch_gpu
+            if pad:
+                img = torch.cat([img, torch.zeros((pad,) + tuple(img.shape[1:]),
+                                                  device=img.device, dtype=img.dtype)], dim=0)
+            img = img.contiguous()
+            self.ctx.set_input_shape("image", tuple(img.shape))
+            self.ctx.set_tensor_address("image", img.data_ptr())
+            outs = {}
+            for nm in self._out_names:
+                outs[nm] = torch.empty(tuple(self.ctx.get_tensor_shape(nm)),
+                                       device=self.device, dtype=torch.float32)
+                self.ctx.set_tensor_address(nm, outs[nm].data_ptr())
+            self.ctx.execute_async_v3(torch.cuda.current_stream().cuda_stream)
+            torch.cuda.current_stream().synchronize()
+            return [outs["high_res_feats_0"][:n], outs["high_res_feats_1"][:n],
+                    outs["image_embed"][:n]]
 
 
 class GDinoTrtDetector:

@@ -83,6 +83,11 @@ langsam_inference:
   # Keep SAM masks on the GPU (avoids SAM2's full-res float mask device->host->device
   # roundtrip). Set false to use the stock numpy predict_batch path.
   sam_gpu_output: true
+  # SAM 2 image encoder backend: "pytorch" (eager) | "trt" (prebuilt engine from
+  # docs/sam_trt_export.py). The _b<N>_ in the engine name is its FIXED batch, baked at ONNX
+  # trace time; N must be >= every worker's camera count and smaller workers pad up to it.
+  sam_backend: "pytorch"
+  sam_trt_engine: "/srv/models/active/sam2/sam2.1_hiera_tiny_encoder_b3_fp16.engine"
   # torch.compile the GDINO model / SAM2 image encoder (no quality loss). WARNING: first-
   # forward compilation is heavy on host RAM and can OOM (SIGKILL/-9), especially GDINO.
   # Enable ONE at a time and watch memory; sam_compile is the safer/cleaner target.

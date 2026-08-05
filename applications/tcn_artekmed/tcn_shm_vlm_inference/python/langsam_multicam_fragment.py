@@ -52,6 +52,8 @@ class LangSamBatchOp(Operator):
                 langsam_cfg.get("sam_ckpt_path"),
                 device=self.device,
                 compile_model=bool(langsam_cfg.get("sam_compile", False)),
+                sam_backend=langsam_cfg.get("sam_backend", "pytorch"),
+                sam_trt_engine=langsam_cfg.get("sam_trt_engine"),
             )
             self.sam.build_model()
             self.gdino = None
