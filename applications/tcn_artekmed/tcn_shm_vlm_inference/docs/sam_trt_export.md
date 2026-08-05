@@ -77,14 +77,25 @@ fault. `onnxscript` is **not** needed.
 
 ## The three gates
 
-All three gates run against the batch produced by this same invocation and are **blocking** —
-any failure raises `SystemExit` before the engine is moved into place:
+All three gates run against the batch produced by this same invocation, and **all three always
+run and report** before anything aborts — the mask IoU is the decisive one and must not be
+hidden by a proxy gate failing first. If any gate failed, the engine is not moved into place
+and the run exits with the collected reasons.
 
 1. **Feature fidelity** (`feature_gate`). Compares the TRT engine's three output tensors
-   (`high_res_feats_0`, `high_res_feats_1`, `image_embed`) against the PyTorch reference
-   computed under the same `_autocast()`, per tensor, via cosine similarity (`>= 0.999`) and
-   relative L2 error (`<= 0.05`). Proves the ONNX export and the TRT build did not silently
-   change what the encoder computes.
+   (`high_res_feats_0`, `high_res_feats_1`, `image_embed`) against an **FP32** reference, and
+   requires the engine to be no further from it than the **bf16** autocast path already running
+   in production, times a `margin` of 1.5.
+
+   > The first version of this gate compared the engine against the bf16 reference with fixed
+   > thresholds (cosine `>= 0.999`, relative L2 `<= 0.05`). That was wrong twice over. bf16 has
+   > **fewer** mantissa bits (8) than the engine's FP16 (10), so the measurement conflated the
+   > engine's error with bf16's own — a few percent disagreement between two different narrow
+   > float formats is expected, not evidence of a bad engine. And the thresholds were arbitrary
+   > constants rather than anything derived from the system. Judging the engine against the
+   > precision regime you already ship is a criterion with meaning: *not a precision regression
+   > relative to what you already accept*. It also answers FP16-vs-TF32 directly — if the TRT
+   > error lands far outside bf16's, FP16 is genuinely too coarse and `--tf32` is the answer.
 
 2. **Slice consistency** (`slice_gate`). At `--batch N >= 2`, every image in the batch is the
    same test image, so every slice of every output tensor must be identical to slice 0
@@ -105,9 +116,14 @@ any failure raises `SystemExit` before the engine is moved into place:
 
 ## Artifacts move into place only after every gate passes
 
-The ONNX export and the TensorRT build both happen inside a `tempfile.TemporaryDirectory`
-under `--out`. Only after the feature, slice, and mask gates all pass does the tool
-`os.replace()` the temp engine onto the final path
-(`<out>/<sam_type>_encoder_b<N>_<fp16|tf32>.engine`). A failed run therefore can never leave a
-half-validated or corrupt engine sitting at the path the app would load — the failure mode the
-GDINO builder had before this design was adopted for it too.
+The ONNX export and the TensorRT build both happen inside a `build-<tag>-XXXX/` directory under
+`--out`. Only after the feature, slice, and mask gates all pass does the tool `os.replace()` the
+temp engine onto the final path (`<out>/<sam_type>_encoder_b<N>_<fp16|tf32>.engine`) and delete
+the directory. A failed run therefore can never leave a half-validated or corrupt engine sitting
+at the path the app would load — the failure mode the GDINO builder had before this design was
+adopted for it too.
+
+**On failure the directory is kept and its path printed.** An earlier version deleted it, which
+destroyed the ONNX — precisely the artifact needed to diagnose why the run failed. Not installing
+an unvalidated engine is the requirement; discarding the evidence was never part of it. Delete
+those `build-*` directories yourself once you are done with them.

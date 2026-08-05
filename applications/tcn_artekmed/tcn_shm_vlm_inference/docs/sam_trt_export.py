@@ -10,7 +10,7 @@ The encoder wrapper is derived from tier4's sam2_pytorch2onnx/export_sam2_onnx.p
 (Apache-2.0) and verified against SAM._set_image_batch_gpu in ../python/langsam_common.py.
 """
 from __future__ import annotations
-import argparse, os, sys, tempfile
+import argparse, os, shutil, sys, tempfile
 
 import numpy as np
 import tensorrt as trt
@@ -160,37 +160,61 @@ def preprocess(sam, images_gpu):
                         for im in images_gpu], dim=0).to(sam.device)
 
 
-def feature_gate(ref, trt_out, min_cos=0.999, max_rel=0.05):
-    """BLOCKING. FP16 vs bf16 differ in the last bits; require direction and magnitude to
-    agree, not bit-exactness."""
-    ok = True
-    for name, a, b in zip(OUT_NAMES, ref, trt_out):
-        a32, b32 = a.float().flatten(), b.float().flatten()
-        cos = torch.nn.functional.cosine_similarity(a32, b32, dim=0).item()
-        rel = ((a32 - b32).norm() / a32.norm().clamp_min(1e-12)).item()
-        flag = "OK" if (cos >= min_cos and rel <= max_rel) else "FAIL"
-        print(f"  feature {name:18} cos={cos:.6f} rel_err={rel:.4f}  [{flag}]")
-        ok = ok and flag == "OK"
-    if not ok:
-        raise SystemExit("FEATURE FIDELITY GATE FAILED")
-    print("feature fidelity gate OK")
+def _rel_err(ref32, other):
+    a = ref32.float().flatten()
+    b = other.float().flatten()
+    return ((a - b).norm() / a.norm().clamp_min(1e-12)).item()
+
+
+def feature_gate(ref_fp32, ref_bf16, trt_out, margin=1.5):
+    """Is the engine any further from full precision than the path we already ship?
+
+    An earlier version of this gate compared the engine against the bf16 reference with fixed
+    thresholds. That was wrong twice over: bf16 has FEWER mantissa bits (8) than the engine's
+    FP16 (10), so the measurement conflated the engine's error with bf16's own, and the
+    thresholds were arbitrary constants rather than anything derived from the system.
+
+    So: measure both against an FP32 reference, and require the engine to be no worse than the
+    bf16 autocast path already running in production, times `margin`. That is a criterion with
+    meaning -- "not a precision regression relative to what you already accept" -- and it also
+    answers FP16-vs-TF32 directly: if trt error lands far outside bf16's, FP16 is too coarse.
+
+    Returns a list of failure strings (empty when the gate passes) rather than raising, so every
+    gate can report before anything aborts; the mask IoU below is the decisive one and must not
+    be hidden by a proxy failing first.
+    """
+    fails = []
+    for name, f32, bf16, t in zip(OUT_NAMES, ref_fp32, ref_bf16, trt_out):
+        e_bf16 = _rel_err(f32, bf16)
+        e_trt = _rel_err(f32, t)
+        budget = max(e_bf16 * margin, 1e-3)
+        ratio = e_trt / max(e_bf16, 1e-12)
+        ok = e_trt <= budget
+        print(f"  feature {name:18} err_vs_fp32: bf16={e_bf16:.4f} trt={e_trt:.4f} "
+              f"({ratio:.2f}x bf16, budget {budget:.4f})  [{'OK' if ok else 'FAIL'}]")
+        if not ok:
+            fails.append(f"{name}: trt err {e_trt:.4f} > {margin}x the bf16 path's {e_bf16:.4f}")
+    print("feature fidelity gate " + ("OK" if not fails else "FAILED"))
+    return fails
 
 
 def slice_gate(trt_out, batch):
-    """BLOCKING. Identical inputs across the batch must give identical outputs."""
+    """Identical inputs across the batch must give identical outputs. Returns failures."""
     if batch < 2:
         print("slice-consistency gate: batch 1, nothing to compare")
-        return
+        return []
+    fails = []
     for name, t in zip(OUT_NAMES, trt_out):
         d = max((t[i] - t[0]).abs().max().item() for i in range(1, t.shape[0]))
         if d > 1e-4:
-            raise SystemExit(f"SLICE CONSISTENCY GATE FAILED: {name} differs by {d:.3e} "
-                             f"across slices; the engine baked its traced batch incorrectly.")
-    print(f"slice-consistency gate OK (batch {batch})")
+            fails.append(f"{name} differs by {d:.3e} across slices; the engine baked its "
+                         f"traced batch incorrectly")
+    print("slice-consistency gate " + (f"OK (batch {batch})" if not fails else "FAILED"))
+    return fails
 
 
 def mask_gate(sam, images_gpu, ref, trt_out, min_iou=0.99):
-    """BLOCKING, and the one that matters: same decoder, same boxes, features swapped."""
+    """The decisive gate: same decoder, same boxes, features swapped. Returns failures."""
     p = sam.predictor
     H, W = int(images_gpu[0].shape[0]), int(images_gpu[0].shape[1])
     box = np.array([[W * 0.2, H * 0.2, W * 0.65, H * 0.58]], dtype=np.float32)
@@ -212,10 +236,11 @@ def mask_gate(sam, images_gpu, ref, trt_out, min_iou=0.99):
         raise SystemExit(f"MASK GATE UNUSABLE: reference mask covers {cov:.1%} of the image; "
                          f"pass --image with a frame where the box contains a real object.")
     iou = ((a & b).sum().float() / (a | b).sum().float().clamp_min(1)).item()
-    print(f"mask IoU (pytorch vs trt features) = {iou:.4f}  [reference coverage {cov:.1%}]")
-    if iou < min_iou:
-        raise SystemExit(f"MASK GATE FAILED: IoU {iou:.4f} < {min_iou}")
-    print("mask gate OK")
+    print(f"  mask IoU (pytorch vs trt features) = {iou:.4f}  "
+          f"[reference coverage {cov:.1%}, need >= {min_iou}]")
+    fails = [] if iou >= min_iou else [f"mask IoU {iou:.4f} < {min_iou}"]
+    print("mask gate " + ("OK" if not fails else "FAILED"))
+    return fails
 
 
 def main():
@@ -243,22 +268,42 @@ def main():
 
     images = make_test_image(sam, args.batch, dev, args.image)
     batch_in = preprocess(sam, images)
+    # TWO references. fp32 is the ground truth the engine is judged against; bf16 is what the
+    # production path (SAM._autocast) already produces, and therefore the yardstick for how much
+    # deviation is acceptable. Comparing the engine only against bf16 -- which has FEWER
+    # mantissa bits than FP16 -- measured the wrong thing.
+    with torch.no_grad():
+        ref_fp32 = list(wrapper(batch_in))
     with torch.no_grad(), sam._autocast():
-        ref = list(wrapper(batch_in))
+        ref_bf16 = list(wrapper(batch_in))
 
-    # Build into a temp dir; move into place only after every gate passes, so a failed build
-    # can never leave an unvalidated engine on disk (the GDINO builder's defect).
-    with tempfile.TemporaryDirectory(dir=args.out) as tmp:
+    # Build into a temp dir and move into place only after every gate passes, so a failed run
+    # can never leave an unvalidated engine at the final path (the GDINO builder's defect).
+    # On failure the directory is KEPT and its path printed: deleting the ONNX along with it
+    # destroyed exactly the artifact needed to diagnose the failure.
+    tmp = tempfile.mkdtemp(dir=args.out, prefix=f"build-{tag}-")
+    ok = False
+    try:
         onnx_tmp = os.path.join(tmp, tag + ".onnx")
         eng_tmp = os.path.join(tmp, tag + ".engine")
         with torch.no_grad():
             export_onnx(wrapper, onnx_tmp, args.batch, dev)
         data = build_engine(onnx_tmp, eng_tmp, args.batch, fp16=not args.tf32)
         out = run_engine(data, batch_in)
-        feature_gate(ref, out)
-        slice_gate(out, int(args.batch))
-        mask_gate(sam, images, ref, out, min_iou=args.min_iou)
+        # Run every gate before deciding: the mask IoU is the decisive one and must not be
+        # hidden by a proxy gate aborting first.
+        fails = (feature_gate(ref_fp32, ref_bf16, out)
+                 + slice_gate(out, int(args.batch))
+                 + mask_gate(sam, images, ref_bf16, out, min_iou=args.min_iou))
+        if fails:
+            raise SystemExit("GATES FAILED:\n  - " + "\n  - ".join(fails))
         os.replace(eng_tmp, final_engine)
+        ok = True
+    finally:
+        if ok:
+            shutil.rmtree(tmp, ignore_errors=True)
+        else:
+            print(f"\nArtifacts kept for diagnosis: {tmp}")
     print(f"\nDONE. Engine: {final_engine}")
 
 
