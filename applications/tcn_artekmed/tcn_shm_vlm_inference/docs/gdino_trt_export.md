@@ -140,6 +140,32 @@ actually staying dynamic. So `--batch` is one integer, used identically by both 
 traces at it, build pins `min = opt = max` to it. Changing camera count means re-running
 **both** stages at the new `N` — there is no way to widen an already-built engine.
 
+### `--from-config`
+
+Instead of `--batch N`, pass `--from-config /path/to/tcn_shm_vlm_inference.yaml` to build one
+engine per **distinct worker camera count** in the app's `gpu_workers` node (mutually exclusive
+with `--batch`). Both stages need the **same** `--from-config`:
+
+```bash
+# host
+python gdino_trt_export.py --stage export --prompts floor person \
+  --hw 512 672 --out /data/models/active/groundingdino \
+  --parity-image images/in/person.jpg \
+  --from-config /path/to/tcn_shm_vlm_inference.yaml
+
+# container
+python3 /workspace/holohub/applications/tcn_artekmed/tcn_shm_vlm_inference/docs/gdino_trt_export.py \
+  --stage build --hw 512 672 --out /srv/models/active/groundingdino \
+  --from-config /path/to/tcn_shm_vlm_inference.yaml
+```
+
+With a `gpu_workers.workers` list of `[{cameras: [a, b]}, {cameras: [c, d, e]}]` this builds
+`gdino_swint_512x672_b2_tf32.*` and `gdino_swint_512x672_b3_tf32.*` — reading the *same*
+`gpu_workers` node the application reads at startup is the point: the engines that exist cannot
+drift from the GPU split that actually runs. The prompts npz and the parity-reference npz are
+batch-independent and are written **once** per export run, not once per batch. `--batch N` still
+works unchanged for building a single engine by hand.
+
 ### Stage 2 — build (inside the runtime container)
 
 The repo is mounted at `/workspace/holohub` and `/data/models` at `/srv/models`, so the tool and

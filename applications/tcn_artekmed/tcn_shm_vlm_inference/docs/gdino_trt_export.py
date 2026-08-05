@@ -29,13 +29,35 @@ chain stays gated even though no single environment can run all of it.
 from __future__ import annotations
 import argparse
 import os
+import sys
 
 import numpy as np
 import tensorrt as trt
 import torch
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
+from langsam_helpers import resolve_workers, distinct_batches      # noqa: E402
+
 MAX_TEXT_LEN = 256
 INPUT_NAMES = ["img", "input_ids", "attention_mask", "position_ids", "token_type_ids", "text_token_mask"]
+
+
+def batches_from_config(config_path):
+    """Distinct engine batches the configured GPU split needs.
+
+    Reading the same `gpu_workers` node the application reads is the point: the engines that
+    get built cannot drift from the split that runs.
+    """
+    import yaml
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    workers = resolve_workers(cfg.get("gpu_workers"), [])
+    batches = distinct_batches(workers)
+    if not batches:
+        raise SystemExit(f"no workers with cameras in {config_path}: nothing to build")
+    print(f"gpu_workers -> {[(w['device'], len(w['cameras'])) for w in workers]} "
+          f"-> building batches {batches}")
+    return batches
 
 
 def load_model(config_file: str, checkpoint_path: str):
@@ -326,7 +348,14 @@ def load_text_npz(path):
     return text, int(text["input_ids"].shape[1])
 
 
-def stage_export(args, H, W, onnx_path, npz_path, ref_path):
+def stage_export_setup(args, H, W, npz_path, ref_path):
+    """Load the model, build the fixed text tensors, capture the PyTorch parity reference, and
+    write the two batch-INDEPENDENT artifacts (prompts npz, parity ref) once.
+
+    Neither file's name nor content depends on the engine batch -- both are shared by every
+    `--batch` this run exports -- so this runs once per invocation, not once per batch (see
+    `stage_export_batch`, which the caller loops).
+    """
     print("Loading model (CPU) ...")
     model = load_model(args.config, args.checkpoint)
     caption, text, tcid, L = build_text(model, args.prompts)
@@ -350,13 +379,22 @@ def stage_export(args, H, W, onnx_path, npz_path, ref_path):
     print(f"text tensors written: {npz_path}")
 
     save_parity_ref(ref_path, ref_img, s_pt, b_pt, args.parity_image, H, W)
-    export_onnx(model, text, H, W, onnx_path, batch=args.batch)
-    print(f"\nDONE (export, batch {args.batch}). Now build the engine INSIDE the runtime "
+    return model, text
+
+
+def stage_export_batch(model, text, H, W, onnx_path, batch):
+    """Export the batch-DEPENDENT ONNX for one engine batch, reusing the model/text tensors
+    `stage_export_setup` already built."""
+    export_onnx(model, text, H, W, onnx_path, batch=batch)
+    print(f"\nDONE (export, batch {batch}). Now build the engine INSIDE the runtime "
           f"container:\n  python3 gdino_trt_export.py --stage build --hw {H} {W} "
-          f"--batch {args.batch} --out <container path>")
+          f"--batch {batch} --out <container path>")
 
 
-def stage_build(args, H, W, onnx_path, engine_path, npz_path, ref_path):
+def stage_build(args, H, W, onnx_path, engine_path, npz_path, ref_path, batch):
+    """Build and gate the engine for one batch. `npz_path`/`ref_path` are the batch-independent
+    artifacts the export stage wrote once; they are only READ here, so re-reading them per
+    batch (the caller loops this function once per distinct batch) is harmless."""
     if not os.path.exists(onnx_path):
         raise SystemExit(
             f"ONNX not found: {onnx_path}\nRun the export stage on the host first.")
@@ -365,8 +403,8 @@ def stage_build(args, H, W, onnx_path, engine_path, npz_path, ref_path):
     print(f"TensorRT {trt.__version__}  |  L={L}  |  pytorch reference: top score={s_pt:.3f} "
           f"on {ref_image_path}")
 
-    ser = build_engine(onnx_path, engine_path, H, W, L, fp16=args.fp16, batch=args.batch)
-    slices = run_at_batch(ser, text, ref_img, int(args.batch))
+    ser = build_engine(onnx_path, engine_path, H, W, L, fp16=args.fp16, batch=batch)
+    slices = run_at_batch(ser, text, ref_img, int(batch))
     slice_consistency_gate(slices)
     fidelity_report(slices[0], s_pt, b_pt, ref_image_path, min_iou=args.min_iou,
                     min_detect=args.min_detect, strict=args.strict_parity)
@@ -402,24 +440,42 @@ def main():
                          "stages need the SAME value: export traces at it (the traced batch is "
                          "baked into the graph) and build pins the profile to it. Artifacts are "
                          "named _b<N>_ so a mismatched pair cannot be combined by accident.")
+    ap.add_argument("--from-config", default=None,
+                    help="path to tcn_shm_vlm_inference.yaml; builds one engine per distinct "
+                         "worker camera count in its gpu_workers node (mutually exclusive "
+                         "with --batch). Pass the SAME --from-config to both --stage export "
+                         "and --stage build.")
     ap.add_argument("--strict-parity", action="store_true",
                     help="make the PyTorch fidelity deviation fatal (default: reported only)")
     args = ap.parse_args()
 
+    if args.from_config:
+        batches = batches_from_config(args.from_config)
+    else:
+        batches = [int(args.batch)]
+
     H, W = args.hw
     os.makedirs(args.out, exist_ok=True)
-    tag = f"gdino_swint_{H}x{W}_b{int(args.batch)}_{'fp16' if args.fp16 else 'tf32'}"
-    onnx_path = os.path.join(args.out, tag + ".onnx")
-    engine_path = os.path.join(args.out, tag + ".engine")
     npz_path = os.path.join(args.out, "gdino_swint_prompts.npz")
     ref_path = os.path.join(args.out, f"gdino_swint_{H}x{W}_parity_ref.npz")
+
+    def paths_for(batch):
+        tag = f"gdino_swint_{H}x{W}_b{int(batch)}_{'fp16' if args.fp16 else 'tf32'}"
+        return (os.path.join(args.out, tag + ".onnx"), os.path.join(args.out, tag + ".engine"))
 
     if args.stage == "export":
         if not args.prompts:
             ap.error("--stage export requires --prompts")
-        stage_export(args, H, W, onnx_path, npz_path, ref_path)
+        # Batch-independent (prompts npz, parity ref) is done ONCE; only the ONNX export --
+        # which bakes the traced batch -- repeats per batch.
+        model, text = stage_export_setup(args, H, W, npz_path, ref_path)
+        for batch in batches:
+            onnx_path, _ = paths_for(batch)
+            stage_export_batch(model, text, H, W, onnx_path, batch)
     else:
-        stage_build(args, H, W, onnx_path, engine_path, npz_path, ref_path)
+        for batch in batches:
+            onnx_path, engine_path = paths_for(batch)
+            stage_build(args, H, W, onnx_path, engine_path, npz_path, ref_path, batch)
 
 
 if __name__ == "__main__":

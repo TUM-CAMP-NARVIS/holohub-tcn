@@ -48,6 +48,27 @@ Changing camera count means re-running this tool at the new `N`; the artifact na
 (`<sam_type>_encoder_b<N>_<fp16|tf32>.engine`) so a mismatched engine cannot silently get used
 in its place.
 
+### `--from-config`
+
+Instead of `--batch N`, pass `--from-config /path/to/tcn_shm_vlm_inference.yaml` to build one
+engine per **distinct worker camera count** in the app's `gpu_workers` node (mutually exclusive
+with `--batch`):
+
+```bash
+python3 /workspace/holohub/applications/tcn_artekmed/tcn_shm_vlm_inference/docs/sam_trt_export.py \
+  --sam-type sam2.1_hiera_tiny \
+  --from-config /workspace/holohub/applications/tcn_artekmed/tcn_shm_vlm_inference/python/tcn_shm_vlm_inference.yaml \
+  --out /srv/models/active/sam2
+```
+
+With a `gpu_workers.workers` list of `[{cameras: [a, b]}, {cameras: [c, d, e]}]` this builds
+`..._encoder_b2_fp16.engine` and `..._encoder_b3_fp16.engine` in one run — reading the *same*
+`gpu_workers` node the application reads at startup is the point: the engines that exist cannot
+drift from the GPU split that actually runs. Model construction and the encoder wrapper are done
+once and reused across batches; only the test image, the preprocessed input and both gate
+references are recomputed per batch, since those are batch-shaped. `--batch N` still works
+unchanged for building a single engine by hand.
+
 ### Precision
 
 The engine is built **FP16** by default (`--tf32` switches to TF32 instead). FP16 is a

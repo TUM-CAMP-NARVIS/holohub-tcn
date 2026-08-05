@@ -19,9 +19,28 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
 from langsam_common import SAM, SAM_MODELS          # noqa: E402
+from langsam_helpers import resolve_workers, distinct_batches      # noqa: E402
 
 IMAGE_SIZE = 1024
 OUT_NAMES = ["high_res_feats_0", "high_res_feats_1", "image_embed"]
+
+
+def batches_from_config(config_path):
+    """Distinct engine batches the configured GPU split needs.
+
+    Reading the same `gpu_workers` node the application reads is the point: the engines that
+    get built cannot drift from the split that runs.
+    """
+    import yaml
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    workers = resolve_workers(cfg.get("gpu_workers"), [])
+    batches = distinct_batches(workers)
+    if not batches:
+        raise SystemExit(f"no workers with cameras in {config_path}: nothing to build")
+    print(f"gpu_workers -> {[(w['device'], len(w['cameras'])) for w in workers]} "
+          f"-> building batches {batches}")
+    return batches
 
 
 class SAM2EncoderWrapper(nn.Module):
@@ -249,6 +268,10 @@ def main():
     ap.add_argument("--batch", type=int, default=3,
                     help="engine batch = the largest LangSAM worker's camera count; the trace "
                          "and the profile both use it, and the artifacts are named _b<N>_")
+    ap.add_argument("--from-config", default=None,
+                    help="path to tcn_shm_vlm_inference.yaml; builds one engine per distinct "
+                         "worker camera count in its gpu_workers node (mutually exclusive "
+                         "with --batch)")
     ap.add_argument("--out", default="/srv/models/active/sam2")
     ap.add_argument("--image", default=None,
                     help="optional real frame for the mask gate; a synthetic structured image "
@@ -257,54 +280,62 @@ def main():
     ap.add_argument("--min-iou", type=float, default=0.99)
     args = ap.parse_args()
 
+    if args.from_config:
+        batches = batches_from_config(args.from_config)
+    else:
+        batches = [int(args.batch)]
+
     dev = torch.device("cuda:0")
-    tag = f"{args.sam_type}_encoder_b{int(args.batch)}_{'tf32' if args.tf32 else 'fp16'}"
-    final_engine = os.path.join(args.out, tag + ".engine")
     os.makedirs(args.out, exist_ok=True)
 
-    print(f"TensorRT {trt.__version__} | building {tag}")
+    print(f"TensorRT {trt.__version__} | sam-type {args.sam_type}")
     sam = build_sam(args.sam_type, dev)
     wrapper = SAM2EncoderWrapper(sam.model).eval().to(dev)
 
-    images = make_test_image(sam, args.batch, dev, args.image)
-    batch_in = preprocess(sam, images)
-    # TWO references. fp32 is the ground truth the engine is judged against; bf16 is what the
-    # production path (SAM._autocast) already produces, and therefore the yardstick for how much
-    # deviation is acceptable. Comparing the engine only against bf16 -- which has FEWER
-    # mantissa bits than FP16 -- measured the wrong thing.
-    with torch.no_grad():
-        ref_fp32 = list(wrapper(batch_in))
-    with torch.no_grad(), sam._autocast():
-        ref_bf16 = list(wrapper(batch_in))
+    for batch in batches:
+        tag = f"{args.sam_type}_encoder_b{int(batch)}_{'tf32' if args.tf32 else 'fp16'}"
+        final_engine = os.path.join(args.out, tag + ".engine")
 
-    # Build into a temp dir and move into place only after every gate passes, so a failed run
-    # can never leave an unvalidated engine at the final path (the GDINO builder's defect).
-    # On failure the directory is KEPT and its path printed: deleting the ONNX along with it
-    # destroyed exactly the artifact needed to diagnose the failure.
-    tmp = tempfile.mkdtemp(dir=args.out, prefix=f"build-{tag}-")
-    ok = False
-    try:
-        onnx_tmp = os.path.join(tmp, tag + ".onnx")
-        eng_tmp = os.path.join(tmp, tag + ".engine")
+        print(f"\nbuilding {tag}")
+        images = make_test_image(sam, batch, dev, args.image)
+        batch_in = preprocess(sam, images)
+        # TWO references. fp32 is the ground truth the engine is judged against; bf16 is what
+        # the production path (SAM._autocast) already produces, and therefore the yardstick for
+        # how much deviation is acceptable. Comparing the engine only against bf16 -- which has
+        # FEWER mantissa bits than FP16 -- measured the wrong thing.
         with torch.no_grad():
-            export_onnx(wrapper, onnx_tmp, args.batch, dev)
-        data = build_engine(onnx_tmp, eng_tmp, args.batch, fp16=not args.tf32)
-        out = run_engine(data, batch_in)
-        # Run every gate before deciding: the mask IoU is the decisive one and must not be
-        # hidden by a proxy gate aborting first.
-        fails = (feature_gate(ref_fp32, ref_bf16, out)
-                 + slice_gate(out, int(args.batch))
-                 + mask_gate(sam, images, ref_bf16, out, min_iou=args.min_iou))
-        if fails:
-            raise SystemExit("GATES FAILED:\n  - " + "\n  - ".join(fails))
-        os.replace(eng_tmp, final_engine)
-        ok = True
-    finally:
-        if ok:
-            shutil.rmtree(tmp, ignore_errors=True)
-        else:
-            print(f"\nArtifacts kept for diagnosis: {tmp}")
-    print(f"\nDONE. Engine: {final_engine}")
+            ref_fp32 = list(wrapper(batch_in))
+        with torch.no_grad(), sam._autocast():
+            ref_bf16 = list(wrapper(batch_in))
+
+        # Build into a temp dir and move into place only after every gate passes, so a failed
+        # run can never leave an unvalidated engine at the final path (the GDINO builder's
+        # defect). On failure the directory is KEPT and its path printed: deleting the ONNX
+        # along with it destroyed exactly the artifact needed to diagnose the failure.
+        tmp = tempfile.mkdtemp(dir=args.out, prefix=f"build-{tag}-")
+        ok = False
+        try:
+            onnx_tmp = os.path.join(tmp, tag + ".onnx")
+            eng_tmp = os.path.join(tmp, tag + ".engine")
+            with torch.no_grad():
+                export_onnx(wrapper, onnx_tmp, batch, dev)
+            data = build_engine(onnx_tmp, eng_tmp, batch, fp16=not args.tf32)
+            out = run_engine(data, batch_in)
+            # Run every gate before deciding: the mask IoU is the decisive one and must not be
+            # hidden by a proxy gate aborting first.
+            fails = (feature_gate(ref_fp32, ref_bf16, out)
+                     + slice_gate(out, int(batch))
+                     + mask_gate(sam, images, ref_bf16, out, min_iou=args.min_iou))
+            if fails:
+                raise SystemExit("GATES FAILED:\n  - " + "\n  - ".join(fails))
+            os.replace(eng_tmp, final_engine)
+            ok = True
+        finally:
+            if ok:
+                shutil.rmtree(tmp, ignore_errors=True)
+            else:
+                print(f"\nArtifacts kept for diagnosis: {tmp}")
+        print(f"\nDONE. Engine: {final_engine}")
 
 
 if __name__ == "__main__":
