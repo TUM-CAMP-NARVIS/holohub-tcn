@@ -149,3 +149,50 @@ achieved — or the engine is not worth its complexity.
 - The SAM 2 decoder as a TRT engine; tier4's ctypes runtime is CPU-in/out and would undo the
   GPU-resident path.
 - The GDINO TRT 10.9 score-depression investigation.
+
+## Results (measured 2026-08-05)
+
+Built in-container, TRT 10.9.0.34, `sam2.1_hiera_tiny`, batch 3, FP16, engine 56 MiB.
+
+### Gates — all passed
+
+```
+feature high_res_feats_0   err_vs_fp32: bf16=0.0156 trt=0.0037 (0.23x bf16)  [OK]
+feature high_res_feats_1   err_vs_fp32: bf16=0.0511 trt=0.0131 (0.26x bf16)  [OK]
+feature image_embed        err_vs_fp32: bf16=0.0436 trt=0.0124 (0.28x bf16)  [OK]
+slice-consistency gate OK (batch 3)
+mask IoU (pytorch vs trt features) = 0.9998   [reference coverage 14.4%]
+```
+
+**The FP16 engine is 3-4x MORE faithful to FP32 than the bf16 autocast path already in
+production.** This only became visible after the gate was fixed: the first version compared the
+engine against the *bf16* reference with fixed thresholds and failed at rel_err 0.0512 on
+`high_res_feats_1` -- which is almost exactly the 0.0511 that bf16 itself deviates from FP32.
+The original gate was measuring bf16's error and attributing it to the engine, and would have
+rejected an engine strictly better than what ships. Fixing the measurement, rather than relaxing
+the threshold, was what surfaced this.
+
+### Speed (median of 20, 5 warmups, 1536x2048 frames, batch 3, idle GPU)
+
+| SAM stage (`predict_batch_gpu`, encode + decode) | |
+|---|---|
+| eager PyTorch | 73.3 ms |
+| **TensorRT FP16 encoder** | **59.0 ms (-14.3 ms, -19.5%)** |
+
+Projected onto the app's `sam` stage: GPU 1 **93.3 -> ~75.1 ms**, which beats the **80.0 ms**
+that `torch.compile` achieved -- with no 146 s startup stall, no concurrent tracing, and no
+Dynamo deadlock class. The plan's adoption criterion is met.
+
+### Two hypotheses that did not hold
+
+- **"The TRT encoder returns fp32 and will cost the decoder its flash-attention kernel."** The
+  eager path also yields fp32 features (`vision_feats[-1] + no_mem_embed` promotes back to
+  fp32), so the SDPA fallback is pre-existing and not introduced by this change.
+- **"Casting the engine's outputs to bf16 will recover that kernel and pay off."** Measured:
+  bf16 57.9 ms, fp32 59.0 ms, fp16 59.5 ms. 1.1 ms (1.9%) for a precision reduction -- not worth
+  it. The engine's outputs stay fp32 as built.
+
+### Still open
+
+The per-image decode loop -- roughly half the `sam` stage and untouched here -- remains the
+largest single target inside SAM.
