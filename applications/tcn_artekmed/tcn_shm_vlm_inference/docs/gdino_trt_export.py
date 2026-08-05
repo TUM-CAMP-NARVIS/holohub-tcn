@@ -29,7 +29,9 @@ chain stays gated even though no single environment can run all of it.
 from __future__ import annotations
 import argparse
 import os
+import shutil
 import sys
+import tempfile
 
 import numpy as np
 import tensorrt as trt
@@ -461,14 +463,33 @@ def stage_build(args, H, W, onnx_path, engine_path, npz_path, ref_path, batch):
     print(f"TensorRT {trt.__version__}  |  L={L}  |  pytorch reference: top score={s_pt:.3f} "
           f"on {ref_image_path}")
 
-    ser = build_engine(onnx_path, engine_path, H, W, L, fp16=args.fp16, batch=batch)
-    slices = run_at_batch(ser, text, ref_img, int(batch))
-    # Order matters: image-independence first. It is the one gate immune to the container's
-    # TRT-vs-PyTorch score deviation, so a stale-cache trace cannot hide behind it.
-    image_independence_gate(ser, text, ref_img, int(batch))
-    slice_consistency_gate(slices)
-    fidelity_report(slices[0], s_pt, b_pt, ref_image_path, min_iou=args.min_iou,
-                    min_detect=args.min_detect, strict=args.strict_parity)
+    # Build into a temp dir and move into place only after every gate passes, so a failed run
+    # can never leave an unvalidated engine at the final path (the path the application loads
+    # from). This already cost a day once: a gate failure went unnoticed because the engine was
+    # on disk and the app started fine. On failure the directory is KEPT and its path printed --
+    # deleting it destroyed exactly the artifacts needed to diagnose the failure once already.
+    # Same filesystem as the destination (mkdtemp'd inside its directory) so os.replace cannot
+    # cross devices. Mirrors docs/sam_trt_export.py's main().
+    engine_dir = os.path.dirname(engine_path) or "."
+    tmp = tempfile.mkdtemp(dir=engine_dir, prefix="build-")
+    ok = False
+    try:
+        tmp_engine = os.path.join(tmp, os.path.basename(engine_path))
+        ser = build_engine(onnx_path, tmp_engine, H, W, L, fp16=args.fp16, batch=batch)
+        slices = run_at_batch(ser, text, ref_img, int(batch))
+        # Order matters: image-independence first. It is the one gate immune to the container's
+        # TRT-vs-PyTorch score deviation, so a stale-cache trace cannot hide behind it.
+        image_independence_gate(ser, text, ref_img, int(batch))
+        slice_consistency_gate(slices)
+        fidelity_report(slices[0], s_pt, b_pt, ref_image_path, min_iou=args.min_iou,
+                        min_detect=args.min_detect, strict=args.strict_parity)
+        os.replace(tmp_engine, engine_path)
+        ok = True
+    finally:
+        if ok:
+            shutil.rmtree(tmp, ignore_errors=True)
+        else:
+            print(f"\nArtifacts kept for diagnosis: {tmp}")
     print(f"\nDONE. Engine: {engine_path}\n      Text:   {npz_path}")
 
 

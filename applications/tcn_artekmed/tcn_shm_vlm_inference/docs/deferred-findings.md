@@ -20,36 +20,7 @@ Not repeated here (they have their own homes):
 
 ## 1. Correctness risk — low probability, real consequence
 
-### 1.1 `token_class_ids` indexes an array with no bound check
-
-`python/langsam_common.py`, `GDinoTrtDetector.set_prompts`:
-`cp.asarray(remap)[self._token_class_ids_baked]`, where `remap` has length `len(baked)+1`.
-
-The export tool only **warns** if the caption splits into more categories than prompts
-(`docs/gdino_trt_export.py`, `build_text`), so an id greater than `len(baked)` can reach the npz.
-NumPy would raise `IndexError`; **cupy advanced indexing does not bounds-check the same way**, so
-this can silently produce wrong class ids. Before the batching work the runtime never indexed
-with `tcid`, so the invariant existed but was unenforced.
-
-*Fix:* one guard in `__init__` —
-`if int(self._token_class_ids_baked.max()) > len(self._baked_prompts): raise ValueError(...)` —
-or make the export warning fatal (its doc already says "do not ship a build that prints it").
-
-### 1.2 The GDINO build stage installs its engine before gating it
-
-`docs/gdino_trt_export.py`, `stage_build`: `build_engine(...)` writes to the final `engine_path`,
-and only then do `image_independence_gate` / `slice_consistency_gate` / `fidelity_report` run. A
-failed gate therefore leaves an **unvalidated engine at the path the app loads**. This already
-cost a day once: a gate failure went unnoticed because the engine was on disk and the app ran.
-
-With `--from-config` it is worse: a run can end with `b2` present-but-ungated and `b3` missing
-entirely.
-
-*Fix:* adopt the pattern `docs/sam_trt_export.py` already uses — build into a temp directory,
-`os.replace` into place only after every gate passes, and keep the directory (printing its path)
-on failure.
-
-### 1.3 A legacy range-profile engine silently degrades to batch 1
+### 1.1 A legacy range-profile engine silently degrades to batch 1
 
 `python/langsam_common.py`: `engine_batch` is read from the profile **minimum**. An engine built
 before the fixed-batch work (e.g. with `--batch 1 3 5`) therefore reports `engine_batch = 1` and
@@ -58,7 +29,7 @@ Intended behaviour, but surprising for any pre-existing engine.
 
 *Fix (optional):* warn loudly when profile min != max, naming both.
 
-### 1.4 No minimum-batch guard
+### 1.2 No minimum-batch guard
 
 `docs/gdino_trt_export.py` accepts `--batch` values that make `min > 1`, but the runtime only
 reads the profile's min as an exact batch. An engine built that way would fail inside TensorRT
@@ -66,14 +37,14 @@ with a cryptic shape error for any worker below that batch.
 
 *Fix:* read both ends of the profile and check `n < min_batch` alongside the existing max check.
 
-### 1.5 An unrecognised backend value silently runs the eager path
+### 1.3 An unrecognised backend value silently runs the eager path
 
 Both `sam_backend` and `gdino_backend` compare against the literal `"trt"`, so a typo
 (`"tensorrt"`) quietly gives you the PyTorch path — you would only notice from the framerate.
 
 *Fix:* validate against the known set and raise on anything else.
 
-### 1.6 `set_prompts` mutates before committing its cache key
+### 1.4 `set_prompts` mutates before committing its cache key
 
 `python/langsam_common.py`: `token_class_ids` / `num_classes` / `_class_masks` are assigned before
 `_prompt_key`. If `build_class_token_masks` raised, a retry with the old prompt set would

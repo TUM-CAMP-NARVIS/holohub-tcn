@@ -635,6 +635,23 @@ class GDinoTrtDetector:
         self._baked_prompts = [str(p) for p in list(data["prompts"])]
         with cp.cuda.Device(self.device.index):
             self._token_class_ids_baked = cp.asarray(data["token_class_ids"])
+            # set_prompts indexes `cp.asarray(remap)[self._token_class_ids_baked]`, where remap
+            # has length len(self._baked_prompts) + 1, so valid ids are 0 .. len(baked_prompts).
+            # NumPy would raise IndexError on an out-of-range id; cupy advanced indexing does NOT
+            # bounds-check the same way, so it can silently produce wrong class ids for every
+            # detection with no error at all. Catch it here, once, at load time. .max()/.min()
+            # are a host sync, which is fine -- this runs once in the constructor.
+            tcid_max = int(self._token_class_ids_baked.max())
+            tcid_min = int(self._token_class_ids_baked.min())
+            if tcid_max > len(self._baked_prompts) or tcid_min < 0:
+                raise ValueError(
+                    f"token_class_ids in {text_npz} has values outside the valid range "
+                    f"[0, {len(self._baked_prompts)}] for {len(self._baked_prompts)} baked "
+                    f"prompts (found min={tcid_min}, max={tcid_max}). The likely cause is a "
+                    f"caption/prompt category mismatch during export -- gdino_trt_export.py's "
+                    f"build_text() prints a WARNING when the caption splits into a different "
+                    f"number of categories than prompts; do not ship a build that printed it. "
+                    f"Re-run --stage export with prompts that tokenize cleanly.")
         self._prompt_key = None
         self.prompts = None
         self.num_classes = 0
