@@ -493,6 +493,8 @@ half the time.
 ## 9. Related documents
 
 - [`gdino_trt_export.md`](./gdino_trt_export.md) — the two-stage export procedure and its gotchas
+- [`dataflow-and-pipelining-roadmap.md`](./dataflow-and-pipelining-roadmap.md) — the extracted
+  compute/data flow and the gated four-step plan for what remains
 - [`deferred-findings.md`](./deferred-findings.md) — review findings consciously not fixed, re-verified
 - [`sam_trt_export.md`](./sam_trt_export.md) — the single-stage SAM 2 encoder export and its gates
 - [`da3_onnx_export.md`](./da3_onnx_export.md) — the Depth-Anything-3 NHWC export

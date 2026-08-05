@@ -93,6 +93,11 @@ Unreachable from `langsam_multicam_fragment.py`, which always passes a device.
   tests import it directly from `langsam_helpers`, and the PyTorch backend uses HF's
   `post_process_grounded_object_detection`. It is now the *oracle* for the batched version's
   equivalence test, which is worth saying in its docstring.
+- **`build_label_map` has no runtime caller** — superseded by `build_panoptic_map` (flat class
+  ids vs the packed `(class << 8) | instance` map). Only the tests and a `langsam_common`
+  re-export reference it. Two near-identical functions in the same module is a trap when
+  optimising: see the warning in
+  [`dataflow-and-pipelining-roadmap.md`](./dataflow-and-pipelining-roadmap.md) step 2.
 - **`model = p.model`** is dead in the TRT branch of `SAM._set_image_batch_gpu`.
 - **`worker_batch` is imported but unused** in `langsam_multicam_fragment.py` (the file computes
   `self.batch = len(self.cameras)` inline).
