@@ -120,3 +120,47 @@ with it.
 - The SAM per-image decode loop (~48 ms) — the largest remaining untouched item.
 - The GDINO TRT 10.9 score-depression investigation.
 - Moving Holoviz off GPU 0 — there is no other GPU.
+
+## Results (measured 2026-08-05)
+
+Rolled out in two steps so each half could be attributed, with the other worker acting as a
+control. nsys, 600 s windows, 5 cameras, 2 GPUs.
+
+### Step 1 — SAM b2 only (GPU 1 still on b3 as control)
+
+| stage | GPU 1 (3 cam, control) | GPU 0 (2 cam, b2) |
+|---|---|---|
+| sam | 78.3 -> 80.8 (+2.5) | **72.8 -> 64.2 (-8.6)** |
+| total | 155.9 -> 159.6 | 172.8 -> 167.6 |
+
+Period 189.9 -> 185.3/186.2 ms, 5.27 -> 5.37/5.40 fps.
+
+### Step 2 — GDINO b2 as well (both models per-worker)
+
+| stage | GPU 0 (2 cam, b2/b2) | GPU 1 (3 cam, b3/b3) |
+|---|---|---|
+| **gdino** | **96.5 -> 75.2 (-21.3)** | 69.1 -> 69.6 (+0.5) |
+| sam | 64.2 -> 60.6 (-3.6) | 80.8 -> 87.5 (+6.7) |
+| panoptic | 6.9 -> 6.8 | 9.6 -> 7.1 (-2.5) |
+| **total** | **167.6 -> 142.6 (-25.0)** | 159.6 -> 164.2 (+4.6) |
+
+Period 185.3/186.2 -> **177.6/181.4 ms**; median-period fps 5.37/5.40 -> **5.51/5.63**; effective
+(stall-free) throughput 5.24 -> **5.38 fps/worker**. GPU busy 60.0/54.0% -> 47.6/56.3%.
+
+**The bottleneck flipped as intended: GPU 0 is now 142.6 ms against GPU 1's 164.2 ms.**
+
+### Where the estimate was wrong
+
+GPU 0's `gdino` was projected at ~60 ms and measured 75.2. **A batch-2 engine is not 2/3 the
+cost of a batch-3 one** -- per-camera cost RISES as the batch shrinks, because there is less to
+amortise. That is exactly the effect that made batching a win, running in reverse, and it caps
+what removing padding can return. Net gain was ~+2.7% effective rather than the projected +6%,
+the remainder absorbed by GPU 1 through contention as the pipeline sped up.
+
+### What this leaves
+
+GPU 1 is now the bottleneck at 164.2 ms, of which `sam` is 87.5 ms -- and roughly half of that
+is the per-image decode loop, still untouched. GPU utilisation FELL to 47.6/56.3%, so the
+pipeline is increasingly latency- and CPU-bound rather than compute-bound: the remaining wins
+are in removing serialisation (pipelining the stages across frames) rather than making kernels
+faster.
