@@ -460,7 +460,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-s",
         "--scheduler",
-        default="greedy",
+        default="event_based",
         help=("Set scheduler type [greedy,event_based]"),
     )
     parser.add_argument(
