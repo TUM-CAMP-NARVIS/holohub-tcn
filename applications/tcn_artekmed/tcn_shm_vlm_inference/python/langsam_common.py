@@ -26,6 +26,8 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 # Pure helpers live in a numpy-only module so they unit-test on the host.
 from langsam_helpers import (  # noqa: F401
     resolve_workers,
+    worker_batch,
+    worker_engine_path,
     class_id_map,
     class_id_for_label,
     build_label_map,

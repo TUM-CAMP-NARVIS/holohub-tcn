@@ -8,6 +8,7 @@ See docs/specs/2026-07-28-langsam-multicam-design.md.
 
 import logging
 import math
+import os
 
 import cupy as cp
 import numpy as np
@@ -18,8 +19,8 @@ from holoscan.core import Operator, OperatorSpec, Subgraph, IOSpec
 from holoscan.operators import HolovizOp
 
 from langsam_common import (
-    SAM, GDINO, GDinoTrtDetector, resolve_workers, class_id_map, build_panoptic_map,
-    build_panoptic_lut,
+    SAM, GDINO, GDinoTrtDetector, resolve_workers, worker_batch, worker_engine_path,
+    class_id_map, build_panoptic_map, build_panoptic_lut,
 )
 
 log = logging.getLogger(__name__)
@@ -40,6 +41,23 @@ class LangSamBatchOp(Operator):
 
     def __init__(self, fragment, *args, cameras, device, langsam_cfg, prompts, **kwargs):
         self.cameras = list(cameras)
+        # This worker's engines are built for exactly its camera count. Resolving the paths
+        # here -- rather than passing one fixed path for every worker -- is what lets a
+        # 2-camera worker stop paying 3-camera cost.
+        self.batch = len(self.cameras)
+        gdino_engine = worker_engine_path(langsam_cfg.get("gdino_trt_engine"), self.batch)
+        sam_engine = worker_engine_path(langsam_cfg.get("sam_trt_engine"), self.batch)
+        for kind, path in (("GDINO", gdino_engine), ("SAM", sam_engine)):
+            backend = langsam_cfg.get("gdino_backend" if kind == "GDINO" else "sam_backend",
+                                      "pytorch")
+            if backend == "trt" and path and not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"{kind} engine for batch {self.batch} not found: {path}\n"
+                    f"This worker owns {self.batch} cameras, so it needs a batch-{self.batch} "
+                    f"engine. Build it with --from-config, or for this batch alone:\n"
+                    f"  GDINO (host then container): gdino_trt_export.py --stage export "
+                    f"--batch {self.batch} ... ; --stage build --batch {self.batch} ...\n"
+                    f"  SAM (container):             sam_trt_export.py --batch {self.batch} ...")
         self.device = device if isinstance(device, torch.device) else torch.device(f"cuda:{int(device)}")
         self.prompts = list(prompts)
         self.box_threshold = float(langsam_cfg.get("box_threshold", 0.3))
@@ -53,7 +71,7 @@ class LangSamBatchOp(Operator):
                 device=self.device,
                 compile_model=bool(langsam_cfg.get("sam_compile", False)),
                 sam_backend=langsam_cfg.get("sam_backend", "pytorch"),
-                sam_trt_engine=langsam_cfg.get("sam_trt_engine"),
+                sam_trt_engine=sam_engine,
             )
             self.sam.build_model()
             self.gdino = None
@@ -61,7 +79,7 @@ class LangSamBatchOp(Operator):
             if self.gdino_backend == "trt":
                 hw = tuple(langsam_cfg.get("gdino_trt_hw", [512, 672]))
                 self.gdino_trt = GDinoTrtDetector(
-                    langsam_cfg["gdino_trt_engine"], langsam_cfg["gdino_trt_text"],
+                    gdino_engine, langsam_cfg["gdino_trt_text"],
                     self.prompts, self.device, self.box_threshold, hw,
                 )
                 # Catch a stale/undersized engine at construction, before the whole Holoscan
@@ -263,7 +281,7 @@ class LangSamMultiCamProcessingSubgraph(Subgraph):
 
     def compose(self):
         log.info("Compose subgraph: LangSamMultiCamProcessing")
-        multicam_cfg = self._get("langsam_multicam") or {}
+        multicam_cfg = self._get("gpu_workers") or {}
         langsam_cfg = self.kwargs("langsam_inference")
         prompts = (self._get("text_prompts") or {}).get("prompts", [])
         workers = resolve_workers(multicam_cfg, self.all_color_cameras)
