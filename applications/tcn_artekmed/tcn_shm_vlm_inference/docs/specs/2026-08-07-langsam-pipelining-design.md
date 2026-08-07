@@ -114,11 +114,16 @@ edit, and instantly revertible if the measurement disappoints.
 | test | where | gate |
 |---|---|---|
 | existing host suites | host, numpy | 8/8, 11/11, 7/7, 9/9 unchanged |
-| payload contract: keys and lengths line up between stages | host, numpy-only fakes | new |
-| `pipelined: false` still composes one operator per worker | host | new |
+| module parses; no stale references | host, `py_compile` + grep | the only host check possible |
 | masks identical, pipelined vs monolithic, same input | container | the correctness gate |
 | `gdino` / `sam` / `panoptic` NVTX + tick period | container, nsys | vs 69.1/86.9/6.9 and 177.2 ms |
 | end-to-end frame→mask latency | container, `--tracking` | expected to roughly double; quantify it |
+
+> **The operators cannot be host-tested.** They import torch, cupy and holoscan, so unlike
+> `langsam_helpers` there is no numpy-only surface to exercise off-GPU. An earlier draft of this
+> table claimed otherwise. The real correctness gate is therefore the container A/B: **masks
+> identical between `pipelined: false` and `pipelined: true` on the same input**. Everything pure
+> already lives in `langsam_helpers` and is unchanged by this work, so its suites still apply.
 
 ## Risks
 
