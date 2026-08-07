@@ -22,13 +22,11 @@ from langsam_common import (
     SAM, GDINO, GDinoTrtDetector, resolve_workers, worker_batch, worker_engine_path,
     class_id_map, build_panoptic_map, build_panoptic_lut,
 )
+# Shared with langsam_pipelined.py so the output-key convention can't drift between the
+# monolithic and split ops; imported directly (not via langsam_common's re-export list).
+from langsam_helpers import _mask_name
 
 log = logging.getLogger(__name__)
-
-
-def _mask_name(cam_port):
-    """`camera01_colorimage` -> `camera01_mask`."""
-    return cam_port.replace("_colorimage", "") + "_mask"
 
 
 class LangSamBatchOp(Operator):

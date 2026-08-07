@@ -24,13 +24,11 @@ from holoscan.core import Operator, OperatorSpec
 from langsam_common import (
     SAM, GDINO, GDinoTrtDetector, class_id_map, build_panoptic_map, worker_engine_path,
 )
+# Shared with langsam_multicam_fragment.py so the output-key convention can't drift between the
+# monolithic and split ops; imported directly (not via langsam_common's re-export list).
+from langsam_helpers import _mask_name
 
 log = logging.getLogger(__name__)
-
-
-def _mask_name(cam_port):
-    """`camera01_colorimage` -> `camera01_mask`. Mirrors langsam_multicam_fragment."""
-    return cam_port.replace("_colorimage", "") + "_mask"
 
 
 def _resolve_engine(langsam_cfg, path_key, backend_key, batch, kind):
@@ -41,10 +39,16 @@ def _resolve_engine(langsam_cfg, path_key, backend_key, batch, kind):
     """
     path = worker_engine_path(langsam_cfg.get(path_key), batch)
     if langsam_cfg.get(backend_key, "pytorch") == "trt" and path and not os.path.exists(path):
+        if kind == "GDINO":
+            build_cmd = (f"  GDINO (host then container): gdino_trt_export.py --stage export "
+                        f"--batch {batch} ... ; --stage build --batch {batch} ...")
+        else:
+            build_cmd = f"  SAM (container):             sam_trt_export.py --batch {batch} ..."
         raise FileNotFoundError(
             f"{kind} engine for batch {batch} not found: {path}\n"
             f"This worker owns {batch} cameras, so it needs a batch-{batch} engine. Build it "
-            f"with --from-config (docs/gdino_trt_export.py / docs/sam_trt_export.py).")
+            f"with --from-config, or for this batch alone:\n"
+            f"{build_cmd}")
     return path
 
 
@@ -149,8 +153,64 @@ class GdinoOp(Operator):
                         "sam_boxes": sam_boxes, "sam_labels": sam_labels}, "det")
 
 
+def _assert_stream_ordering_assumption(device):
+    """Fail fast if the legacy-default-stream assumption SamOp -> PanopticOp relies on (see the
+    comment above `SamOp`) does not hold in this process.
+    """
+    per_thread = os.environ.get("CUPY_CUDA_PER_THREAD_DEFAULT_STREAM", "0")
+    if per_thread not in ("", "0"):
+        raise RuntimeError(
+            "CUPY_CUDA_PER_THREAD_DEFAULT_STREAM is set. SamOp emits masks whose "
+            "device-to-device copies are only ENQUEUED, not complete (predict_batch_gpu runs "
+            "with timing=False, so it never synchronises), and PanopticOp may run on a "
+            "different EventBasedScheduler worker thread than SamOp. With per-thread default "
+            "streams, cupy's default stream on PanopticOp's thread no longer serialises "
+            "against SamOp's, so PanopticOp's reads can race SamOp's writes -- corrupting or "
+            "emptying panoptic maps intermittently, not crashing. Fix: unset this env var and "
+            "keep the shared legacy default stream, or make SamOp synchronise explicitly "
+            "(e.g. cp.cuda.Stream.null.synchronize()) before it emits.")
+    with torch.cuda.device(device):
+        current = torch.cuda.current_stream(device)
+        default = torch.cuda.default_stream(device)
+        if current != default:
+            raise RuntimeError(
+                f"SamOp is not running on torch's default CUDA stream on {device} (current "
+                f"stream {current} != default stream {default}). SamOp emits masks whose "
+                f"device-to-device copies are only ENQUEUED, not complete (predict_batch_gpu "
+                f"runs with timing=False, so it never synchronises), and PanopticOp may run on "
+                f"a different EventBasedScheduler worker thread than SamOp; correctness depends "
+                f"on both operators sharing the legacy default stream so PanopticOp's kernels "
+                f"are implicitly ordered after SamOp's. A Holoscan CudaStreamPool on this path, "
+                f"or any explicit non-default stream, breaks that. Fix: keep this path off "
+                f"non-default streams, or make SamOp synchronise explicitly before it emits.")
+
+
 class SamOp(Operator):
-    """Stage 2: detections in, masks out. Owns the SAM 2 model."""
+    """Stage 2: detections in, masks out. Owns the SAM 2 model.
+
+    Cross-thread stream-ordering assumption (SamOp -> PanopticOp): `SAM.predict_batch_gpu`
+    (langsam_common.py) does not call `torch.cuda.synchronize()` when `timing=False` (the mode
+    used below), so the device-to-device work it enqueues is only ENQUEUED when `compute()`
+    emits, not necessarily complete. In the monolithic `LangSamBatchOp` this was safe by
+    construction: gdino/sam/panoptic ran back-to-back on the SAME thread, hence the SAME CUDA
+    stream, so later work was implicitly ordered after it. Split into operators, `PanopticOp`
+    may run on a DIFFERENT thread of the `EventBasedScheduler(worker_thread_number=24)` pool.
+    It remains correct ONLY because torch's and cupy's per-thread "current stream" both default
+    to the shared LEGACY DEFAULT STREAM, which serialises against every other use of it --
+    so PanopticOp's kernels on its own thread still wait for SamOp's enqueued work on its own
+    thread. Any of the following would silently invalidate this, and the symptom would be
+    intermittently corrupt or empty panoptic maps, NOT a crash:
+      1. A Holoscan `CudaStreamPool` attached to this path (assigns non-default streams).
+      2. Code that creates and uses an explicit non-default `cp.cuda.Stream` / `torch.cuda.Stream`.
+      3. Setting `CUPY_CUDA_PER_THREAD_DEFAULT_STREAM=1` (cupy's default stream becomes
+         per-thread and no longer synchronises with other threads' default streams).
+    `_assert_stream_ordering_assumption` (above) checks for these at construction time and
+    raises rather than letting this go silently wrong. If one of the invalidating changes is
+    ever needed, make SamOp (or PanopticOp) synchronise explicitly across the edge instead of
+    removing the guard -- do NOT add an unconditional `synchronize()` to SamOp's hot path, since
+    that would block its thread on its own GPU work and destroy the overlap this split exists
+    to create.
+    """
 
     def __init__(self, fragment, *args, cameras, device, langsam_cfg, prompts, **kwargs):
         self.cameras = list(cameras)
@@ -169,6 +229,7 @@ class SamOp(Operator):
                 sam_trt_engine=sam_engine,
             )
             self.sam.build_model()
+            _assert_stream_ordering_assumption(self.device)
 
     def setup(self, spec: OperatorSpec):
         spec.input("det")

@@ -8,6 +8,14 @@ in tests. Re-exported from ``langsam_common`` for convenience.
 import numpy as np
 
 
+def _mask_name(cam_port):
+    """`camera01_colorimage` -> `camera01_mask`. Shared by langsam_multicam_fragment (the
+    monolithic op) and langsam_pipelined (the split ops) so the output-key convention can't
+    drift between them.
+    """
+    return cam_port.replace("_colorimage", "") + "_mask"
+
+
 def resolve_workers(cfg, all_color_cameras):
     """Resolve the per-GPU worker assignment from the `gpu_workers` node.
 
