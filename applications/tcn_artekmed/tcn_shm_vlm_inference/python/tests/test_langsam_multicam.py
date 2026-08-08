@@ -21,7 +21,7 @@ from langsam_helpers import (
     build_panoptic_map,
     panoptic_class,
     panoptic_instance,
-    _mask_name,
+    mask_name,
 )
 
 ALL = ["camera01_colorimage", "camera02_colorimage", "camera03_colorimage"]
@@ -113,12 +113,12 @@ def test_build_panoptic_map_overlap_highest_score_wins():
     assert panoptic_class(pm[2, 2]) == 1
 
 
-def test_mask_name_strips_colorimage_suffix():
-    assert _mask_name("camera01_colorimage") == "camera01_mask"
+def test_maskname_strips_colorimage_suffix():
+    assert mask_name("camera01_colorimage") == "camera01_mask"
 
 
-def test_mask_name_without_colorimage_suffix_just_appends():
-    assert _mask_name("camera01") == "camera01_mask"
+def test_maskname_without_colorimage_suffix_just_appends():
+    assert mask_name("camera01") == "camera01_mask"
 
 
 if __name__ == "__main__":

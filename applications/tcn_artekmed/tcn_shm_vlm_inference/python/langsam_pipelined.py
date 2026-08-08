@@ -26,7 +26,7 @@ from langsam_common import (
 )
 # Shared with langsam_multicam_fragment.py so the output-key convention can't drift between the
 # monolithic and split ops; imported directly (not via langsam_common's re-export list).
-from langsam_helpers import _mask_name
+from langsam_helpers import mask_name
 
 log = logging.getLogger(__name__)
 
@@ -153,9 +153,12 @@ class GdinoOp(Operator):
                         "sam_boxes": sam_boxes, "sam_labels": sam_labels}, "det")
 
 
-def _assert_stream_ordering_assumption(device):
-    """Fail fast if the legacy-default-stream assumption SamOp -> PanopticOp relies on (see the
-    comment above `SamOp`) does not hold in this process.
+def _assert_shared_default_stream_env():
+    """Fail fast if cupy is configured for per-thread default streams -- process-global (an env
+    var read at process start), so this is safe and sufficient to check once, at construction
+    time. See `SamOp`'s docstring for the full stream-ordering explanation this guards, and
+    `_stream_is_default` below for the OTHER half of that guard, which is thread-local and
+    cannot be checked here.
     """
     per_thread = os.environ.get("CUPY_CUDA_PER_THREAD_DEFAULT_STREAM", "0")
     if per_thread not in ("", "0"):
@@ -169,20 +172,18 @@ def _assert_stream_ordering_assumption(device):
             "emptying panoptic maps intermittently, not crashing. Fix: unset this env var and "
             "keep the shared legacy default stream, or make SamOp synchronise explicitly "
             "(e.g. cp.cuda.Stream.null.synchronize()) before it emits.")
+
+
+def _stream_is_default(device):
+    """True if torch's CURRENT stream on THIS thread is `device`'s default stream.
+
+    torch's "current stream" is THREAD-LOCAL, and so is whatever a Holoscan `CudaStreamPool`
+    hands out around `compute()` -- neither can be observed from `__init__`/`compose`, which
+    runs on a different thread than the `EventBasedScheduler` worker thread that later runs
+    `compute()`. Callers MUST invoke this from inside `compute()`, not from `__init__`.
+    """
     with torch.cuda.device(device):
-        current = torch.cuda.current_stream(device)
-        default = torch.cuda.default_stream(device)
-        if current != default:
-            raise RuntimeError(
-                f"SamOp is not running on torch's default CUDA stream on {device} (current "
-                f"stream {current} != default stream {default}). SamOp emits masks whose "
-                f"device-to-device copies are only ENQUEUED, not complete (predict_batch_gpu "
-                f"runs with timing=False, so it never synchronises), and PanopticOp may run on "
-                f"a different EventBasedScheduler worker thread than SamOp; correctness depends "
-                f"on both operators sharing the legacy default stream so PanopticOp's kernels "
-                f"are implicitly ordered after SamOp's. A Holoscan CudaStreamPool on this path, "
-                f"or any explicit non-default stream, breaks that. Fix: keep this path off "
-                f"non-default streams, or make SamOp synchronise explicitly before it emits.")
+        return torch.cuda.current_stream(device) == torch.cuda.default_stream(device)
 
 
 class SamOp(Operator):
@@ -200,16 +201,23 @@ class SamOp(Operator):
     so PanopticOp's kernels on its own thread still wait for SamOp's enqueued work on its own
     thread. Any of the following would silently invalidate this, and the symptom would be
     intermittently corrupt or empty panoptic maps, NOT a crash:
-      1. A Holoscan `CudaStreamPool` attached to this path (assigns non-default streams).
+      1. A Holoscan `CudaStreamPool` attached to this path -- assigns non-default streams
+         around `compute()`, well AFTER every operator's `__init__` has already returned.
       2. Code that creates and uses an explicit non-default `cp.cuda.Stream` / `torch.cuda.Stream`.
       3. Setting `CUPY_CUDA_PER_THREAD_DEFAULT_STREAM=1` (cupy's default stream becomes
          per-thread and no longer synchronises with other threads' default streams).
-    `_assert_stream_ordering_assumption` (above) checks for these at construction time and
-    raises rather than letting this go silently wrong. If one of the invalidating changes is
-    ever needed, make SamOp (or PanopticOp) synchronise explicitly across the edge instead of
-    removing the guard -- do NOT add an unconditional `synchronize()` to SamOp's hot path, since
-    that would block its thread on its own GPU work and destroy the overlap this split exists
-    to create.
+    What is actually checked, and where: #3 is process-global, so it is checked once, at
+    construction time (`_assert_shared_default_stream_env` in `SamOp.__init__`). #1 and #2 only
+    take effect once `compute()` is running on an `EventBasedScheduler` worker thread, so they
+    CANNOT be observed at construction time -- they are instead checked on each of SamOp's and
+    PanopticOp's first `compute()` call (`_stream_is_default`, gated by `self._stream_checked`
+    so it costs one boolean test per tick after the first). That first-tick check catches a
+    stream pool that is in effect for the whole run, which is the realistic failure mode; it
+    would NOT catch a pool that only starts handing out non-default streams partway through a
+    run. If one of the invalidating changes is ever needed, make SamOp (or PanopticOp)
+    synchronise explicitly across the edge instead of removing the guard -- do NOT add an
+    unconditional `synchronize()` to SamOp's hot path, since that would block its thread on its
+    own GPU work and destroy the overlap this split exists to create.
     """
 
     def __init__(self, fragment, *args, cameras, device, langsam_cfg, prompts, **kwargs):
@@ -229,13 +237,29 @@ class SamOp(Operator):
                 sam_trt_engine=sam_engine,
             )
             self.sam.build_model()
-            _assert_stream_ordering_assumption(self.device)
+            _assert_shared_default_stream_env()
+        self._stream_checked = False
 
     def setup(self, spec: OperatorSpec):
         spec.input("det")
         spec.output("seg")
 
     def compute(self, op_input, op_output, context):
+        if not self._stream_checked:
+            if not _stream_is_default(self.device):
+                raise RuntimeError(
+                    f"SamOp's compute() is not running on torch's default CUDA stream on "
+                    f"{self.device} (checked on its first tick). SamOp emits masks whose "
+                    f"device-to-device copies are only ENQUEUED, not complete "
+                    f"(predict_batch_gpu runs with timing=False, so it never synchronises), and "
+                    f"PanopticOp may run on a different EventBasedScheduler worker thread than "
+                    f"SamOp; correctness depends on both operators sharing the legacy default "
+                    f"stream on every worker thread so PanopticOp's kernels are implicitly "
+                    f"ordered after SamOp's. A Holoscan CudaStreamPool on this path, or any "
+                    f"explicit non-default stream, breaks that. Fix: keep this path off "
+                    f"non-default streams, or make SamOp synchronise explicitly before it "
+                    f"emits.")
+            self._stream_checked = True
         p = op_input.receive("det")
         out = {"names": p["names"], "hw": p["hw"], "sam_idx": p["sam_idx"],
                "sam_labels": p["sam_labels"], "masks": [], "scores": []}
@@ -252,12 +276,19 @@ class SamOp(Operator):
 
 
 class PanopticOp(Operator):
-    """Stage 3: masks in, packed (class<<8|instance) maps out. Owns the class-id map."""
+    """Stage 3: masks in, packed (class<<8|instance) maps out. Owns the class-id map.
+
+    Consumer side of the SamOp -> PanopticOp stream-ordering assumption -- see `SamOp`'s
+    docstring for the full explanation. This operator's reads must stay ordered after SamOp's
+    enqueued-but-not-complete writes via the shared default CUDA stream; `compute()` checks
+    that on its first tick, same as SamOp (see `self._stream_checked`).
+    """
 
     def __init__(self, fragment, *args, cameras, device, langsam_cfg, prompts, **kwargs):
         self.device = device if isinstance(device, torch.device) else torch.device(f"cuda:{int(device)}")
         self.prompts = list(prompts)
         self._cmap = class_id_map(self.prompts)
+        self._stream_checked = False
         super().__init__(fragment, *args, **kwargs)
 
     def setup(self, spec: OperatorSpec):
@@ -265,6 +296,17 @@ class PanopticOp(Operator):
         spec.output("masks")
 
     def compute(self, op_input, op_output, context):
+        if not self._stream_checked:
+            if not _stream_is_default(self.device):
+                raise RuntimeError(
+                    f"PanopticOp's compute() is not running on torch's default CUDA stream on "
+                    f"{self.device} (checked on its first tick). PanopticOp is the CONSUMER "
+                    f"side of the SamOp -> PanopticOp stream-ordering assumption described in "
+                    f"SamOp's docstring: masks cross that edge as enqueued-but-not-complete GPU "
+                    f"work, so this operator's reads must stay ordered after SamOp's writes via "
+                    f"the shared default stream. Fix: keep this path off non-default streams, "
+                    f"or make SamOp synchronise explicitly before it emits.")
+            self._stream_checked = True
         p = op_input.receive("seg")
         names, hw = p["names"], p["hw"]
         out = {}
@@ -282,5 +324,5 @@ class PanopticOp(Operator):
                         self._cmap, hw[0], hw[1], xp=cp)
                 torch.cuda.nvtx.range_pop()
             for i, cam in enumerate(names):
-                out[_mask_name(cam)] = hs.as_tensor(cp.ascontiguousarray(pmaps[i]))
+                out[mask_name(cam)] = hs.as_tensor(cp.ascontiguousarray(pmaps[i]))
         op_output.emit(out, "masks")

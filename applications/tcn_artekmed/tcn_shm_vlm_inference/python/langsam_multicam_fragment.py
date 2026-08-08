@@ -24,7 +24,7 @@ from langsam_common import (
 )
 # Shared with langsam_pipelined.py so the output-key convention can't drift between the
 # monolithic and split ops; imported directly (not via langsam_common's re-export list).
-from langsam_helpers import _mask_name
+from langsam_helpers import mask_name
 
 log = logging.getLogger(__name__)
 
@@ -191,7 +191,7 @@ class LangSamBatchOp(Operator):
                 torch.cuda.nvtx.range_pop()
 
             for i, cam in enumerate(names):
-                out[_mask_name(cam)] = hs.as_tensor(cp.ascontiguousarray(pmaps[i]))
+                out[mask_name(cam)] = hs.as_tensor(cp.ascontiguousarray(pmaps[i]))
         op_output.emit(out, "masks")
 
 
