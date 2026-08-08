@@ -25,6 +25,7 @@ from langsam_common import (
 # Shared with langsam_pipelined.py so the output-key convention can't drift between the
 # monolithic and split ops; imported directly (not via langsam_common's re-export list).
 from langsam_helpers import mask_name
+from langsam_pipelined import GdinoOp, SamOp, PanopticOp
 
 log = logging.getLogger(__name__)
 
@@ -289,14 +290,23 @@ class LangSamMultiCamProcessingSubgraph(Subgraph):
         colorize = LabelMapColorizeOp(self, name=self._n("colorize"), num_classes=len(prompts))
         self.add_flow(collector, colorize, {("masks", "masks")})
 
+        pipelined = bool(multicam_cfg.get("pipelined", False))
+        log.info(f"LangSAM worker structure: {'pipelined (3 ops)' if pipelined else 'monolithic'}")
         for i, w in enumerate(workers):
-            op = LangSamBatchOp(
-                self, name=self._n(f"worker{i}"),
-                cameras=w["cameras"], device=w["device"],
-                langsam_cfg=langsam_cfg, prompts=prompts,
-            )
-            self.add_flow(op, collector, {("masks", "receivers")})
-            self.add_input_interface_port("input", op, "color_input")
+            kw = dict(cameras=w["cameras"], device=w["device"],
+                      langsam_cfg=langsam_cfg, prompts=prompts)
+            if pipelined:
+                gd = GdinoOp(self, name=self._n(f"worker{i}_gdino"), **kw)
+                sm = SamOp(self, name=self._n(f"worker{i}_sam"), **kw)
+                pn = PanopticOp(self, name=self._n(f"worker{i}_panoptic"), **kw)
+                self.add_flow(gd, sm, {("det", "det")})
+                self.add_flow(sm, pn, {("seg", "seg")})
+                self.add_flow(pn, collector, {("masks", "receivers")})
+                self.add_input_interface_port("input", gd, "color_input")
+            else:
+                op = LangSamBatchOp(self, name=self._n(f"worker{i}"), **kw)
+                self.add_flow(op, collector, {("masks", "receivers")})
+                self.add_input_interface_port("input", op, "color_input")
 
         self.add_output_interface_port("output_masks", collector, "masks")
         self.add_output_interface_port("output_viz", colorize, "viz")

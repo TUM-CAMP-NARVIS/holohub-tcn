@@ -74,6 +74,11 @@ da3_inference:
 # Changing a split means rebuilding that batch; the app fails fast at startup with the command.
 # ---------------------------------------------------------------------------
 gpu_workers:
+  # Run each worker's gdino/sam/panoptic as three chained operators instead of one, so stages
+  # overlap across frames (period tends toward max(stage) rather than sum(stage)). Costs ~2 ticks
+  # of extra mask latency. false -> the original single LangSamBatchOp per worker.
+  # See docs/specs/2026-08-07-langsam-pipelining-design.md.
+  pipelined: false
   workers:
     - device: 0
       cameras: ["camera01_colorimage", "camera02_colorimage"]
