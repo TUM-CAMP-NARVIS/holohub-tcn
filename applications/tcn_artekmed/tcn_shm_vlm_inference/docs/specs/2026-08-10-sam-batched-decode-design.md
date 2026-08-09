@@ -168,3 +168,53 @@ index arithmetic can. As with the pipelining work, correctness comes from the co
 - Step 2: the panoptic CUDA kernel — a C++/CUDA operator matching `operators/tcn_artekmed/`.
 - The unverified FP32 `sm86_xmma_gemm_f32f32_tf32f32` observation (12.3 ms/tick under bf16
   autocast); separate investigation.
+
+## Results
+
+Measured 2026-08-10, container, `nsys` traces of both configs (5 prompts, monolithic
+`pipelined: false`, verified 2 stage threads not 6; 85 s steady-state analysis window; see
+`.superpowers/sdd/2026-08-10-sam-batched-decode/measured-results.md` for the full analysis). **The
++26% estimate in §Expected effect was explicitly not a measurement; the measured result is +9.7%.**
+
+| | off | on | delta |
+|---|---|---|---|
+| period | 187.6 ms | 171.0 ms | **-8.8%** |
+| fps (per worker) | 5.329 | 5.847 | **+9.7%** |
+| GPU util dev0 / dev1 | 48.4 / 62.5% | 54.4 / 68.7% | up |
+| kernels per frame, dev1 | 2469 | 1848 | -25% |
+| GPU busy per frame, dev1 | 117.2 ms | 117.5 ms | unchanged |
+
+GPU busy per frame is flat, confirming the batching removed launch and Python overhead rather than
+pixel work — exactly the premise §Expected effect argued from.
+
+**The batching demonstrably happened.** dev1 worker (3 cameras): sam wall 86.15 -> 51.77 ms (-40%),
+`cudaLaunchKernel`/tick 949.1 -> 406.4 (-57%), `cudaStreamSynchronize`/tick 43.0 -> 22.0, non-API
+(Python) time 48.86 -> 21.16 ms (-57%). dev0 worker (2 cameras): sam wall 61.09 -> 46.15 ms;
+launches 611.4 -> 388.0; syncs 29 -> 19. The reduction scales with camera count, which is the
+signature of the intended change, not a coincidental speedup. CONTROL: `gdino`, untouched by this
+change, measured 69.44 -> 69.45 ms (dev1) and 72.81 -> 72.75 ms (dev0), confirming the two runs are
+otherwise comparable.
+
+**panoptic got slower — accounting, not regression.** dev1 panoptic went 13.48 -> 28.52 ms. Its
+sync COUNT barely moved (43.8 -> 44.9/tick) but time spent in those syncs went 0.17 -> 7.50 ms. With
+the per-image loop gone, `sam` no longer forces its own GPU work to complete inside its own NVTX
+range (21 of its syncs disappeared), so the wait relocated downstream to whichever stage
+synchronized next. Net per worker, dev1: 169.07 -> 149.74 ms (-11.4%). The period improved 16.6 ms;
+the stage sum improved 19.3 ms — consistent.
+
+**Why the prediction overshot.** Predicted +26%, actual +9.7%. The estimate assumed sam's savings
+would land in full on the period. They did not, because (a) GPU pixel work never shrank, only
+overhead, and (b) roughly a third of what looked like sam's own CPU time was actually GPU wait that
+merely relocated to panoptic instead of disappearing. The lesson generalises: when a stage's wall
+time includes un-synchronized GPU work, predict from its non-API + launch time, not from its total
+stage wall time — see [`../optimization-playbook.md`](../optimization-playbook.md) §7.15.
+
+**New finding, out of scope for this step.** TRT engines issue ~1000 kernel launches per tick
+despite being a single engine execution (gdino: 569.9 `cuLaunchKernel` + 402.2 `cuLaunchKernelEx`,
+~20 ms/tick of pure overhead); CUDA graph capture would collapse that to one graph launch and
+applies to both the GDINO engine and the SAM TRT encoder. Tracked in
+[`../dataflow-and-pipelining-roadmap.md`](../dataflow-and-pipelining-roadmap.md).
+
+**Still outstanding.** Throughput is measured; mask quality is not. The §Design §3 correctness gate
+(per-mask IoU >= 0.999, unchanged mask count and labels, NOT byte-identity) has not been run.
+**The default stays `sam_batched_decode: false` until that gate is run and passes.**

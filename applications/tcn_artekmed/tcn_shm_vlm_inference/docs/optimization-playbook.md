@@ -281,6 +281,45 @@ explicit cross-edge event ordering. Full numbers and design context:
 > overlapping stages; a wall-time gate that treats stage duration as fixed can be wrong by triple
 > digits in the wrong direction when that duration is itself contention-dependent.
 
+### L8. SAM batched decode across cameras — POSITIVE, +9.7% (adopted pending correctness gate)
+
+Step 4a of the roadmap: replace `SAM.predict_batch_gpu`'s per-camera Python decode loop
+(`_prep_prompts` + `_predict`, once per image) with a single batched decoder call over all boxes
+from all cameras — no engine export, a pure restructure of existing Python. Measured 2026-08-10,
+5-prompt config, monolithic (`pipelined: false`):
+
+| | off | on | delta |
+|---|---|---|---|
+| period | 187.6 ms | 171.0 ms | **-8.8%** |
+| fps (per worker) | 5.329 | 5.847 | **+9.7%** |
+| GPU busy/frame, dev1 | 117.2 ms | 117.5 ms | unchanged |
+
+GPU busy per frame stayed flat — confirmation the win is launches and Python, not pixel work.
+Batching demonstrably happened and scaled with camera count: dev1 (3 cameras) sam launches/tick
+949.1 -> 406.4 (-57%), non-API time 48.86 -> 21.16 ms (-57%); dev0 (2 cameras) launches 611.4 ->
+388.0. `gdino`, untouched, served as a control at 69.44 -> 69.45 ms (dev1) / 72.81 -> 72.75 ms
+(dev0), confirming the two runs were otherwise comparable.
+
+Panoptic absorbed part of the win instead of it vanishing: dev1 panoptic wall rose 13.48 -> 28.52
+ms because sam's decode loop used to force its own GPU work to finish inside its own NVTX range (21
+of its syncs disappeared), and with the loop gone that wait relocated downstream — sync *count* on
+panoptic barely moved (43.8 -> 44.9/tick) but time *in* those syncs jumped 0.17 -> 7.50 ms. See
+§7.15.
+
+The design's own estimate, taken from the launch-count ratio rather than a measurement, was +26%;
+actual was +9.7% — see §7.15 for why relocation, not a wrong batching mechanism, explains the gap.
+Full analysis:
+[`specs/2026-08-10-sam-batched-decode-design.md`](./specs/2026-08-10-sam-batched-decode-design.md)
+§Results.
+
+> **Transferable:** a batching win measured by launch-count reduction alone will overstate the
+> period improvement whenever the un-batched stage was quietly finishing GPU work inside a
+> downstream stage's wait instead of its own. Predict from non-API + launch time, not stage wall
+> time (§7.15).
+
+**Still gated.** Throughput is measured; mask quality is not. Default stays
+`sam_batched_decode: false` until the per-mask IoU >= 0.999 gate is run.
+
 ### 4.2 The final batching step in detail
 
 | worker | gdino before | gdino after | change |
@@ -551,6 +590,33 @@ path is escaping autocast, or the kernels originate somewhere else entirely. Do 
 coverage from the `with torch.autocast(...):` block alone — check the actual kernel names in a
 trace for the precision you think you are getting.
 
+### 7.15 A stage's savings can relocate downstream instead of accruing to the period
+
+If a stage's measured wall time includes GPU work it never synchronized *inside its own NVTX
+range*, removing that stage's overhead does not land on the period in full. Some of what looked
+like the stage's own cost was actually GPU work whose completion-wait belonged to whichever
+downstream stage happened to synchronize next; cut the overhead and the wait does not disappear, it
+moves. We predicted the SAM batched-decode change (step 4a, §L8) at +26% from the launch-count
+ratio alone and measured +9.7%, because the per-image loop had been synchronizing SAM's own GPU
+work inside its own range 21 times/tick; remove the loop and that wait surfaced one stage later, in
+`panoptic` (dev1: 13.48 -> 28.52 ms).
+
+**Diagnostic: compare sync COUNT against time-IN-syncs, between runs, per stage.** A stage whose
+sync count is flat but whose time-in-syncs jumped is absorbing someone else's deferred work, not
+doing more of its own. Panoptic's sync count barely moved (43.8 -> 44.9/tick) while its time-in-
+syncs rose 44×  (0.17 -> 7.50 ms) — the signature of relocation, not regression. Meanwhile sam's own
+sync count fell 43 -> 22/tick, exactly the 21 that moved.
+
+**Predict from non-API + launch time, not total stage wall time**, when the stage you are shrinking
+does un-synced GPU work — total wall time is not decomposable into "this much is removable" without
+knowing where the rest of it will resurface.
+
+**Per-frame GPU busy time is the honest control for "did I remove work or just overhead."** It was
+flat at 117 ms across both step-4a runs, confirming the pixel work was unchanged and only overhead
+moved. **Launch-count scaling with the batch factor is how you prove a batching change actually
+took effect** — dev1's sam launches fell 57% at batch 3, dev0's fell more modestly at batch 2, and
+the untouched `gdino` stage (the control) did not move at all.
+
 ## 8. Checklist for the next network
 
 **Measure**
@@ -604,3 +670,4 @@ trace for the precision you think you are getting.
 - [`specs/2026-08-05-sam-encoder-trt-design.md`](./specs/2026-08-05-sam-encoder-trt-design.md) — SAM encoder → TRT, with the gate-design correction
 - [`specs/2026-08-05-per-worker-engines-design.md`](./specs/2026-08-05-per-worker-engines-design.md) — per-worker batches and the `gpu_workers` topology node
 - [`specs/2026-07-28-langsam-multicam-design.md`](./specs/2026-07-28-langsam-multicam-design.md) — the multi-camera architecture
+- [`specs/2026-08-10-sam-batched-decode-design.md`](./specs/2026-08-10-sam-batched-decode-design.md) — SAM mask-decoder batching across cameras (step 4a), with measured results

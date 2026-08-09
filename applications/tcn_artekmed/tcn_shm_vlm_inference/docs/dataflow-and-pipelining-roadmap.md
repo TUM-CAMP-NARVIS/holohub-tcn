@@ -338,24 +338,37 @@ estimate came in at half its projection (see `optimization-playbook.md` §3 L3).
 
 ### Step 4 — The SAM decode loop (~48 ms of GPU 1's 86.9 ms)
 
-**Now the top remaining priority**, promoted by the step 3 measurement above: sam is the stage
-that **sets the tick period** under pipelining (period tracked `max(stage)`, and sam was the max on
-both devices), and its inflation under stage-overlap split roughly **2:1 non-API-time to
-CUDA-API-time** — i.e. about two-thirds of its cost is GIL re-acquisition across its ~1000
-Python-driven launches per tick, not CUDA API/stream-queue time. That is a direct measurement of
-what this step already suspected qualitatively ("a burst of small torch ops"); it is no longer
-hidden behind step 3's overlap, since step 3 is not adopted. The largest single untouched item, and
-the current bottleneck's dominant half. Originally deliberately last because it is the hardest and
-because step 3 might have hidden part of it behind overlap — it did not.
+**STATUS (2026-08-10): option 1 below (batch the decoder across images) was built and measured as
+step 4a — DONE, adopted pending the correctness gate.** `sam_batched_decode: true|false`, default
+`false`. Measured on the 5-prompt monolithic config: period 187.6 -> 171.0 ms (**-8.8%**), fps
+5.329 -> 5.847 (**+9.7%**), GPU busy/frame flat at ~117 ms (confirms the win is launches and
+Python, not pixel work). Launch counts dropped in proportion to camera count (dev1, 3 cameras:
+`cudaLaunchKernel`/tick 949.1 -> 406.4, -57%) with `gdino` unchanged as a control (69.44 -> 69.45
+ms). The design below predicted +26% from the launch-count ratio; actual was +9.7% because part of
+sam's apparent cost was un-synced GPU work that relocated to `panoptic` rather than disappearing
+(dev1 panoptic 13.48 -> 28.52 ms) — see
+[`optimization-playbook.md`](./optimization-playbook.md) §7.15. **Default stays `false` until the
+per-mask IoU >= 0.999 correctness gate is run.** Full analysis:
+[`specs/2026-08-10-sam-batched-decode-design.md`](./specs/2026-08-10-sam-batched-decode-design.md)
+§Results. The 4a trace also surfaced a new lever, Step 5 below, which re-ranks what is left — see
+§Re-ranked priority.
+
+**Was the top remaining priority before 4a landed**, promoted by the step 3 measurement above: sam
+is the stage that **sets the tick period** under pipelining (period tracked `max(stage)`, and sam
+was the max on both devices), and its inflation under stage-overlap split roughly **2:1
+non-API-time to CUDA-API-time** — i.e. about two-thirds of its cost is GIL re-acquisition across
+its ~1000 Python-driven launches per tick, not CUDA API/stream-queue time. That is a direct
+measurement of what this step already suspected qualitatively ("a burst of small torch ops"); it is
+no longer hidden behind step 3's overlap, since step 3 is not adopted. Originally deliberately last
+because it is the hardest and because step 3 might have hidden part of it behind overlap — it did
+not.
 
 **Today:** `SAM.predict_batch_gpu` runs a **sequential Python loop** over images, calling SAM 2's
 `_prep_prompts` and `_predict` once per image. Each call is a burst of small torch ops. The
 encoder half is already a TRT engine; this is the other half.
 
-**Options, roughly in order of ambition:**
-1. **Batch the decoder across images.** Awkward because each image has a different number of
-   boxes; requires padding box counts and masking, and reimplementing enough of `_predict` to
-   accept a ragged batch.
+**Options, remaining after 4a (re-ranked in §Re-ranked priority below):**
+1. ~~Batch the decoder across images.~~ **DONE — see STATUS above (step 4a).**
 2. **Export the SAM 2 mask decoder to TensorRT.** The tier4 exporter at
    `/data/models/active/sam2_trt_inference/sam2_pytorch2onnx/export_sam2_onnx.py` has a
    `SAM2Decoder` wrapper and a documented I/O contract (`image_embed`, `feats0`, `feats1`,
@@ -365,6 +378,70 @@ encoder half is already a TRT engine; this is the other half.
    ([`sam_trt_export.md`](./sam_trt_export.md)).
 3. **Trim its syncs and Python overhead** without restructuring — the cheapest probe, and step 1's
    Recipe A will say whether this stage is CPU-bound enough to be worth it.
+
+---
+
+### Step 5 — CUDA graph capture for the GDINO and SAM-encoder TRT engines (new, surfaced by the 4a trace)
+
+**Finding (2026-08-10):** both fixed-batch TRT engines issue roughly 1000 kernel launches per tick
+despite each being a single engine execution. `gdino` alone: 569.9 `cuLaunchKernel` + 402.2
+`cuLaunchKernelEx` ≈ 972 launches/tick, costing ~8.8 ms of launch-API time plus ~11.0 ms non-API ≈
+**~20 ms/tick of pure overhead** for a stage whose real work is one engine call. The SAM TRT
+encoder has the same shape.
+
+**Lever:** CUDA graph capture collapses that whole per-tick launch sequence into a single graph
+launch. It requires static input/output shapes and stable IO buffer addresses across ticks — both
+of which the existing fixed-batch, per-worker engine work
+([`specs/2026-08-05-per-worker-engines-design.md`](./specs/2026-08-05-per-worker-engines-design.md))
+already provides, since each worker's engine always runs at exactly its own camera count. Applies
+to **both** engines: the GDINO detector and the SAM TRT encoder (`SamTrtEncoder.encode`), not just
+one.
+
+**Why it is worth trying before Step 4 option 2:** no export pipeline, no model surgery, no
+inlining upstream internals — it wraps the existing `execute_async_v3` call in a captured graph and
+replays it. That is categorically cheaper than exporting the SAM 2 mask decoder to TensorRT, which
+needs a full two-stage export, new tracing gotchas, and version-locked artifacts (see
+[`optimization-playbook.md`](./optimization-playbook.md) §3 L4). See §Re-ranked priority below.
+
+### Remaining budget (dev1, period 171.0 ms, GPU floor 117.5 ms)
+
+Measured 2026-08-10, from the same 4a trace:
+
+| stage | wall | of which sync (GPU wait) | addressable overhead | lever |
+|---|---|---|---|---|
+| gdino | 69.45 ms | 49.29 ms | ~20 ms | CUDA graphs (Step 5) |
+| sam | 51.77 ms | 25.33 ms | ~26 ms | CUDA graphs (encoder, Step 5) + Step 4 option 2 (decoder) |
+| panoptic | 28.52 ms | 7.50 ms | ~21 ms | C++/CUDA operator (Step 2) |
+
+~67 ms addressable against 54 ms of headroom to the GPU floor — expect less than linear stacking:
+some of what looks addressable in one stage may, as with panoptic in step 4a, turn out to be
+relocated GPU wait rather than removable overhead (see
+[`optimization-playbook.md`](./optimization-playbook.md) §7.15).
+
+### Re-ranked priority (2026-08-10)
+
+The step-4a measurement changes the order, not just the status, of what is left:
+
+1. **Step 2 — panoptic as one CUDA kernel.** Unchanged position: still the cheapest, most isolated
+   item (~21 ms + the last per-camera sync), already fully scoped, no new evidence against it.
+2. **Step 5 — CUDA graph capture (gdino + SAM encoder), promoted to co-top priority.** New
+   evidence: it is now the cheaper way to reach the ~20 ms of gdino overhead and part of the ~26 ms
+   of sam overhead than Step 4 option 2 is, because it costs an engine-side wrapper rather than an
+   export pipeline, and it pays out on *two* engines at once. It should be tried before funding
+   Step 4 option 2, not after — that option's real prize shrinks by however much of sam's ~26 ms
+   the encoder's share of CUDA graphs recovers, so measuring it accurately requires doing Step 5
+   first.
+3. **Step 4, option 2 — export the SAM 2 mask decoder to TensorRT, demoted.** Still the right move
+   for whatever decoder-side overhead survives Step 5, but it is the highest-effort remaining lever
+   (export pipeline, new gates, version-locked artifacts) for what is now a smaller and less
+   certain remaining prize. Re-measure sam's addressable overhead after Step 5 before committing to
+   it.
+4. **Step 3 retry (per-stage CUDA streams + event ordering) — still last.** Unchanged: it is the
+   largest rewrite on the board, it was already measured negative once (see Step 3 STATUS above),
+   and every other lever above is cheaper per addressable millisecond. Nothing in the 4a trace
+   changes that ranking; if anything, discovering that GPU work was relocating more than expected
+   *inside a single operator* ([`optimization-playbook.md`](./optimization-playbook.md) §7.15) is a
+   reason for more caution, not less, about a design whose whole thesis is inter-operator overlap.
 
 ---
 
