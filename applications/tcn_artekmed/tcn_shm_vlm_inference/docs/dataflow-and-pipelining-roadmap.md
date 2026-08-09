@@ -219,6 +219,14 @@ stage to attack with C++.
 
 Small, isolated, and it removes the only per-camera sync left in the tick.
 
+**Better motivated after the step 3 measurement (2026-08-09):** the pipelining trace showed
+panoptic's inflation under stage-overlap was **mostly stream-queue blocked**, not GIL — the
+opposite split from gdino and sam — and per-tick launch counts scale badly: panoptic issues
+**97–232 kernel launches/tick** on top of the per-camera `argsort().tolist()` sync already known
+about here. A single fused kernel removes both the sync *and* most of those launches, which is
+now a stronger case than "removes ~7 ms and N syncs" alone. See
+[`optimization-playbook.md`](./optimization-playbook.md) §7.11–§7.12 for how that was measured.
+
 **Today** (`python/langsam_helpers.py`): `argsort(scores).tolist()` (D2H sync), a host loop doing
 instance numbering, then one boolean-mask scatter per detection into the `(H,W)` uint16 map.
 
@@ -248,6 +256,41 @@ device), then a single kernel that paints `(M,H,W)` masks into the map in ascend
 ---
 
 ### Step 3 — Split GDINO into Preproc → `InferenceOp` → Postproc (gated on step 1)
+
+**STATUS (2026-08-09): the stage-level pipelining variant of this step was built and measured —
+DONE, but NOT ADOPTED.** Splitting `LangSamBatchOp` into three chained operators
+(`GdinoOp → SamOp → PanopticOp`, `python/langsam_pipelined.py`, gated behind
+`gpu_workers.pipelined`) produced **−12.2% fps** (195.0 → 221.9 ms tick period), against a gate
+that had predicted +55% to +72%. The pipelining mechanism worked exactly as designed — 100%
+within-worker stage overlap, period tracking `max(stage)` instead of `sum(stages)` — but each
+stage's own wall time inflated ~2.5× under overlap because all GPU work in both the monolithic and
+pipelined runs was already fully serialized on the shared legacy default stream
+(`concurrency = kernel_sum / kernel_union = 1.00` on every device, both runs). Overlapping stages
+therefore bought queueing contention on that one stream, not GPU parallelism. Full analysis:
+[`specs/2026-08-07-langsam-pipelining-design.md`](./specs/2026-08-07-langsam-pipelining-design.md)
+§Results and [`optimization-playbook.md`](./optimization-playbook.md) §7.11–§7.13. **Default
+stays `pipelined: false`**; the three-operator code remains as the structural foundation below.
+
+**A retry requires per-stage CUDA streams, not just per-stage operators.** Each of `GdinoOp`,
+`SamOp`, `PanopticOp` would need its own CUDA stream, with explicit CUDA events ordering the GPU
+work across the operator edges (SamOp's GPU work must be provably complete, via an event wait, not
+just enqueued, before PanopticOp's kernels that consume its output are launched — and equivalently
+GdinoOp→SamOp). **This deliberately invalidates the default-stream guard `SamOp` carries today** —
+see the docstring on `SamOp` in `python/langsam_pipelined.py`, which exists precisely because the
+current design's correctness depends on every operator sharing the one legacy default stream (item
+1 in that docstring: "A Holoscan `CudaStreamPool` attached to this path... would silently
+invalidate this"). Introducing per-stage streams is exactly that invalidating change. The guard
+must therefore be **replaced with real event-based ordering across the edges, not simply deleted**
+— deleting it without adding the event ordering would trade a loud, checked assumption for the
+silent corruption the docstring warns about (intermittently corrupt or empty panoptic maps, no
+crash).
+
+The original text below describes the `InferenceOp`-based variant of step 3 (GDINO's engine as a
+C++ operator) and was written before the above measurement; it is retained because it is a
+different, still-unexplored mechanism (GIL release via a C++ operator, rather than stage overlap on
+a shared stream) and may still be worth pursuing independently, but do not expect it alone to
+produce the sum→max win the original Motivation section projected — that projection is the one
+just measured wrong.
 
 Do this for **one worker first**, measure, then roll out.
 
@@ -295,8 +338,15 @@ estimate came in at half its projection (see `optimization-playbook.md` §3 L3).
 
 ### Step 4 — The SAM decode loop (~48 ms of GPU 1's 86.9 ms)
 
-The largest single untouched item, and the current bottleneck's dominant half. Deliberately last
-because it is the hardest and because step 3 may hide part of it behind overlap.
+**Now the top remaining priority**, promoted by the step 3 measurement above: sam is the stage
+that **sets the tick period** under pipelining (period tracked `max(stage)`, and sam was the max on
+both devices), and its inflation under stage-overlap split roughly **2:1 non-API-time to
+CUDA-API-time** — i.e. about two-thirds of its cost is GIL re-acquisition across its ~1000
+Python-driven launches per tick, not CUDA API/stream-queue time. That is a direct measurement of
+what this step already suspected qualitatively ("a burst of small torch ops"); it is no longer
+hidden behind step 3's overlap, since step 3 is not adopted. The largest single untouched item, and
+the current bottleneck's dominant half. Originally deliberately last because it is the hardest and
+because step 3 might have hidden part of it behind overlap — it did not.
 
 **Today:** `SAM.predict_batch_gpu` runs a **sequential Python loop** over images, calling SAM 2's
 `_prep_prompts` and `_predict` once per image. Each call is a burst of small torch ops. The

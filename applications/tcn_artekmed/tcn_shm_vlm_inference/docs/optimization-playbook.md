@@ -257,6 +257,30 @@ compute-bound and became latency-bound. That is a signal to change lever class, 
 tuning kernels: what remains is serialisation (the three stages run sequentially inside one
 operator's `compute`), not slow math.
 
+### L7. Stage-level pipelining across operators — NEGATIVE, −12.2% (recorded, not adopted)
+
+The obvious next lever from "serialisation, not slow math" above: split the one operator's three
+sequential stages (gdino/sam/panoptic) into three chained operators so a worker's stages overlap
+across ticks. A gate (the design's own Motivation section) predicted +55% to +72% from a GIL floor
+and a GPU floor over stage wall times treated as fixed. Measured: **period +13.8% (195.0 → 221.9
+ms), fps −12.2% (5.13 → 4.51)** — on its own 5-prompt A/B pair, not directly comparable to the
+2-prompt numbers in §4.1 below. The pipelining mechanism itself worked exactly as designed — 100%
+within-worker overlap of the smaller stage, and the period tracked `max(stage)` instead of
+`sum(stages)` as intended — but each stage's own wall time inflated ~2.5× under the overlap, so
+`max(inflated)` came out above `sum(original)`. Root cause was not primarily the GIL the gate's
+Risks section named, but ~2400 kernel launches/tick from three stages funnelling into one shared
+CUDA stream and backing up its queue (§7.10). Default stays `pipelined: false`; the three-operator
+code is kept as the structural foundation for a retry once each stage has its own CUDA stream with
+explicit cross-edge event ordering. Full numbers and design context:
+[`specs/2026-08-07-langsam-pipelining-design.md`](./specs/2026-08-07-langsam-pipelining-design.md)
+§Results.
+
+> **Transferable:** this is the general form of §7.9's warning — a lever chosen because
+> "utilisation fell" is not automatically a GPU-overlap win. Check whether the GPU work is already
+> serialized on a single stream (§7.10) *before* funding a rewrite whose entire thesis is
+> overlapping stages; a wall-time gate that treats stage duration as fixed can be wrong by triple
+> digits in the wrong direction when that duration is itself contention-dependent.
+
 ### 4.2 The final batching step in detail
 
 | worker | gdino before | gdino after | change |
@@ -448,6 +472,84 @@ stages, cutting syncs, shortening critical paths).
 Track utilisation alongside stage times for exactly this reason: it tells you *which class* of
 lever to reach for next, which is more useful than another 5% on a stage that is already idle
 half the time.
+
+### 7.10 `NVTX_EVENTS.text` holds the label — `textId`/`StringIds` silently gives you zero rows
+
+`nsys`'s SQLite export stores the pushed range name directly in `NVTX_EVENTS.text`. It is tempting
+to join `NVTX_EVENTS.textId` against `StringIds` instead, the way you would for other tables in the
+schema — that join runs without error and returns **zero stage ranges**, with nothing to say the
+query was wrong. Every query in §2.4 and §7.11 below filters on `text='gdino'` etc. directly; do
+the same. This one cost real time on the pipelining measurement before it was caught — budget for
+it if you copy a query from a different nsys table and forget to check which column carries the
+label.
+
+### 7.11 Before funding a stage-overlap rewrite, check `concurrency = kernel_sum / kernel_union`
+
+A design that promises a win by overlapping stages (pipelining across operators, moving a stage to
+a second thread, …) is implicitly betting that the GPU can run more than one stage's kernels at
+once. That bet is falsifiable *before you write any code*, from an existing trace:
+
+```python
+# per device: is any kernel time actually overlapping, or is everything serialized?
+rows("""SELECT deviceId, MIN(start), MAX(end), SUM(end-start), COUNT(*)
+        FROM CUPTI_ACTIVITY_KIND_KERNEL GROUP BY deviceId""")
+# concurrency = kernel_sum / kernel_union, where kernel_union is computed from the
+# merged (start,end) intervals for that device, not (max-min) -- a busy trace with gaps
+# will otherwise understate serialization.
+```
+
+`concurrency = 1.00` means the kernel-busy union equals the kernel-busy sum exactly: **zero overlap
+anywhere**, every kernel on that device runs strictly after the previous one finishes, regardless
+of which stream launched it. We measured exactly 1.00 on both devices in both the monolithic and
+the pipelined run here — all work was serialized on the shared legacy default stream — which means
+overlapping the *stages* could not buy any GPU overlap; it could only ever reduce Python/launch gaps
+between them, and it made those gaps worse instead (§7.12). **If concurrency is already 1.00 and
+per-stage CUDA streams are not part of the plan, there is no GPU win available from overlap — say
+so before the rewrite, not after.**
+
+### 7.12 Blocking lives in the tail, not the median — and call counts are your control
+
+A launch-duration *mean* or *median* can rise by a small, reassuring-looking factor while the
+thing that actually costs you time — queue-full blocking — is hiding in the tail. Comparing two
+configurations, we saw the median `cuLaunchKernel` duration rise 1.6× (consistent with ordinary
+GIL handoff cost) while the fraction of launches taking >50 us rose 27× (0.5% → 10.7% of calls),
+which accounted for nearly all of the measured regression. **Always report `fraction > 50us` and
+`time in calls > 50us` alongside the mean/median** — the mean alone will hide a change of this
+size:
+
+```python
+d = sorted((e-s)/1e3 for (e, s) in ...)          # microseconds
+frac_slow = sum(1 for x in d if x > 50) / len(d)
+time_slow = sum(x for x in d if x > 50) / 1e6      # seconds
+```
+
+Pair this with a control: **per-tick CUDA call *counts*, not just durations.** If a change makes a
+stage slower but the call count per tick is unchanged (we measured 923.6 vs 944.5
+`cudaLaunchKernel` calls/tick, effectively identical), the extra time is contention — something is
+making the same calls more expensive — not extra work. That distinction decides whether the fix is
+"do less work" or "stop fighting over a shared resource" (here: too many kernel launches from too
+many stages funnelling into one CUDA stream's pending queue).
+
+### 7.13 A wall-time gate that treats stage duration as fixed is wrong under contention
+
+A gate that measures each stage's wall time today and reasons "if I overlap these, the tick period
+drops to `max(stage)`" is implicitly assuming stage duration is a fixed property of the work, not a
+function of how many other things are competing for the same stream/queue/GIL at the same moment.
+That assumption breaks exactly when the rewrite you are gating is the thing that changes the
+contention. Here it predicted +55–72%; the measured result was −12%, because overlapping the
+stages inflated each one by ~2.5× (§7.12) — comparing `max(inflated stages)` to `sum(original
+stages)`, not to `max(original stages)` as the gate assumed. **A wall-time gate for a
+concurrency-adding change must itself measure or model contention (§7.11), not just today's stage
+durations.**
+
+### 7.14 An unverified finding worth checking before trusting bf16 autocast blindly (UNVERIFIED)
+
+In one trace, the top GPU kernels by total time were `sm86_xmma_gemm_f32f32_tf32f32` — an FP32
+kernel — at ~12.3 ms/tick across ~90 calls (~6% of the tick period), despite the surrounding decode
+path running under `bf16` autocast. This is flagged here **unverified**: either something on that
+path is escaping autocast, or the kernels originate somewhere else entirely. Do not assume autocast
+coverage from the `with torch.autocast(...):` block alone — check the actual kernel names in a
+trace for the precision you think you are getting.
 
 ## 8. Checklist for the next network
 

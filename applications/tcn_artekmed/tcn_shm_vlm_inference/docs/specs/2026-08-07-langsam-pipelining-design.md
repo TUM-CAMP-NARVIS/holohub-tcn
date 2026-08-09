@@ -144,3 +144,64 @@ edit, and instantly revertible if the measurement disappoints.
   urgent since GDINO measured 90% GPU-bound.
 - The panoptic CUDA kernel (step 2) and the SAM decode loop (step 4).
 - Passing class ids instead of label strings (§3).
+
+## Results
+
+Measured 2026-08-08/09, container, `nsys` traces of both configs (5 prompts, 85 s steady-state
+window; see `.superpowers/sdd/2026-08-07-langsam-pipelining/measured-results.md` for the full
+analysis). **The gate's prediction of +55% to +72% was wrong; the measured result is −12.2%.**
+
+| | monolithic | pipelined | delta |
+|---|---|---|---|
+| period | 195.0 ms | 221.9 ms | +13.8% |
+| fps | 5.13 | 4.51 | -12.2% |
+| GPU util dev0 / dev1 | 46.8 / 60.2% | 41.3 / 54.1% | down |
+
+Per-stage wall time (ms/tick), dev0 / dev1:
+
+| stage | mono | pipe |
+|---|---|---|
+| gdino | 74.81 / 70.10 | 125.58 / 102.65 |
+| sam | 63.89 / 89.87 | 205.93 / 220.75 |
+| panoptic | 9.23 / 14.65 | 95.72 / 124.16 |
+
+**The Motivation section's gate reasoned from a GIL floor and a GPU floor over stage wall times it
+treated as fixed, and named the GIL (Risks, above) as the thing to watch.** Both were incomplete:
+the wall times were not fixed, and the GIL was not the dominant cause.
+
+**The pipelining itself worked exactly as designed.** Within-worker gdino↔sam overlap was 100% of
+the smaller stage's busy time (total stage overlap 51.8% w0 / 50.7% w1 of the summed stages).
+Monolithic period (195.0 ms) tracked the *sum* of its stages (174.6 ms dev1); pipelined period
+(221.9 ms) tracked the *max* stage (sam, 220.75 ms). The sum→max conversion this design set out to
+produce happened. It lost anyway because each stage's own wall time inflated ~2.5×, so
+`max(inflated stages)` came out larger than `sum(original stages)`.
+
+**Why the inflation, and why it is not primarily the Risks section's GIL:** per-tick CUDA call
+counts are identical between the two runs (e.g. sam: 923.6 vs 944.5 `cudaLaunchKernel` calls/tick)
+— same work, more expensive per call. The median `cuLaunchKernel` duration only rose 1.6× (8.62 →
+13.88 us, consistent with GIL handoff cost), but the blocking *tail* rose 27×: calls over 50 us
+went from 0.5% to 10.7% of launches, accounting for ~25.8 s of the ~28.4 s total launch inflation
+across the trace. `concurrency = kernel_sum / kernel_union` was **1.00 on every device in both
+runs** — the GPU work was already fully serialized on the shared legacy default stream in the
+monolithic version too (the same assumption `SamOp`'s stream guard in `langsam_pipelined.py`
+enforces), so overlapping the *stages* bought zero GPU overlap. What pipelining did instead was
+route roughly three stages' worth of kernel launches — ~2400 kernels/frame — through that one
+shared stream's queue, and the queue backs up. The per-stage split of the inflation (dev1) shows
+this is not uniform: gdino's inflation is essentially all GIL (its own CUDA-API time *fell*, since
+the GPU had already finished by the time it synchronized); panoptic's is mostly stream-queue
+blocking; sam — the stage that sets the period — splits roughly 2:1 non-API-to-API, i.e. mostly GIL
+re-acquisition across its ~1000 Python-driven launches per tick, but with a real stream-queue
+component too. In short: the risk that materialized was real GIL cost *plus* a queue-serialization
+effect the Risks section did not name, and the second effect is comparable in size to the first.
+
+**Conclusion: pipelining is a prerequisite, not a win on its own.** It only pays once (a) each
+stage runs on its own CUDA stream with explicit event ordering across the operator edges instead
+of relying on the shared default stream, and (b) the per-stage Python work — sam's decode loop
+above all — is substantially reduced. Estimated effect of streams alone, from the same analysis:
+panoptic and part of sam recover, but sam still lands ~190 ms, putting the period at roughly
+break-even (~190 ms) against the monolithic 195 ms — not a win by itself, for substantial added
+complexity. **The default therefore stays `pipelined: false`.** The three-operator code is
+retained as the structural foundation for a future retry (see
+[`../dataflow-and-pipelining-roadmap.md`](../dataflow-and-pipelining-roadmap.md) step 3), which
+would need per-stage streams and explicit cross-edge event ordering, not another rearrangement of
+Python calls.
