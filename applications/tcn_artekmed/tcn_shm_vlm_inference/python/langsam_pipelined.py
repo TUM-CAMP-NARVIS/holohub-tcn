@@ -235,6 +235,7 @@ class SamOp(Operator):
                 compile_model=bool(langsam_cfg.get("sam_compile", False)),
                 sam_backend=langsam_cfg.get("sam_backend", "pytorch"),
                 sam_trt_engine=sam_engine,
+                batched_decode=bool(langsam_cfg.get("sam_batched_decode", False)),
             )
             self.sam.build_model()
             _assert_shared_default_stream_env()

@@ -39,6 +39,7 @@ from langsam_helpers import (  # noqa: F401
     build_class_token_masks,
     build_prompt_remap,
     plan_batch_padding,
+    plan_batched_decode,
 )
 
 
@@ -86,13 +87,18 @@ SAM_MODELS = {
 class SAM:
 
     def __init__(self, sam_type: str, ckpt_path: str | None = None, device: torch.device | None = None, compile_model: bool = False,
-                 sam_backend: str = "pytorch", sam_trt_engine: str | None = None):
+                 sam_backend: str = "pytorch", sam_trt_engine: str | None = None,
+                 batched_decode: bool = False):
         self.sam_type = sam_type
         self.ckpt_path = ckpt_path
         self.device = device
         self.compile_model = compile_model
         self.sam_backend = sam_backend
         self.sam_trt_engine = sam_trt_engine
+        # Opt-in batched decode across cameras (predict_batch_gpu); see
+        # docs/specs/2026-08-10-sam-batched-decode-design.md. Default false keeps the
+        # per-camera loop (the reference implementation) live.
+        self.batched_decode = batched_decode
         self.trt_encoder = None
         self.model = None
         self.mask_generator = None
@@ -102,6 +108,9 @@ class SAM:
         #   decode = predict_batch   (mask decoder + postprocess_masks upsampling)
         self.last_encode_ms = 0.0
         self.last_decode_ms = 0.0
+        # Guards the "falling back to the loop because resolutions differ" WARNING so it logs
+        # once per instance, not once per tick (see predict_batch_gpu).
+        self._warned_resolution_fallback = False
 
     def _sync(self):
         if self.device is not None and self.device.type == "cuda":
@@ -241,6 +250,77 @@ class SAM:
         p._is_image_set = True
         p._is_batch = True
 
+    def _predict_batch_gpu_batched(self, p, xyxy, num_images):
+        """The batched-decode path: all cameras' boxes decoded in ONE call.
+
+        Inlines the body of the vendored SAM 2's `SAM2ImagePredictor._predict`
+        (sam2_image_predictor.py, ~line 336) and `MaskDecoder.forward`/`predict_masks`
+        (modeling/sam/mask_decoder.py, ~line 110/168) at
+        /home/ecku/develop/vision/sam2/sam2/, with the per-image `image_embeddings`/
+        `high_res_features` broadcast (`repeat_image=True`) replaced by an explicit gather
+        (`repeat_image=False`) over `box_img` -- the image index each box came from -- so one
+        decoder call covers every camera's boxes instead of one call per camera. See
+        docs/specs/2026-08-10-sam-batched-decode-design.md §1-2.
+
+        `_predict` cannot be called directly here: its signature commits to a single
+        `img_idx`. This means a future SAM 2 upgrade that changes `_predict` or
+        `predict_masks` will NOT automatically change this method -- the loop path
+        (`predict_batch_gpu`'s else branch) stays the reference implementation and is not
+        deleted, precisely so drift between the two is A/B-detectable rather than silent.
+
+        `_predict` itself is `@torch.no_grad()`; since we bypass it and call
+        `sam_prompt_encoder`/`sam_mask_decoder` directly, we wrap the equivalent span in
+        `torch.no_grad()` explicitly below to match.
+
+        Returns (all_masks, all_scores) in the predict_batch_gpu contract: one cupy (K,H,W)
+        uint8 entry and one cupy (K,) float32 entry per input image, in input order.
+        """
+        counts = [int(b.shape[0]) for b in xyxy]        # cupy/torch .shape is host metadata; no sync
+        total, box_img_np = plan_batched_decode(counts)
+        orig_hw0 = p._orig_hw[0]
+        if total == 0:
+            # No boxes anywhere in this tick's batch -- skip the decoder entirely.
+            empty_masks = cp.empty((0, orig_hw0[0], orig_hw0[1]), dtype=cp.uint8)
+            empty_scores = cp.empty((0,), dtype=cp.float32)
+            return [empty_masks.copy() for _ in range(num_images)], \
+                   [empty_scores.copy() for _ in range(num_images)]
+
+        with torch.no_grad():
+            box_img = torch.as_tensor(box_img_np, device=self.device)
+            boxes = torch.cat(
+                [torch.as_tensor(b, dtype=torch.float, device=self.device) for b in xyxy], dim=0
+            )                                             # (M,4)
+            unnorm_box = p._transforms.transform_boxes(boxes, normalize=True, orig_hw=orig_hw0)
+            box_coords = unnorm_box.reshape(-1, 2, 2)
+            box_labels = torch.tensor([[2, 3]], dtype=torch.int, device=self.device)
+            box_labels = box_labels.repeat(box_coords.size(0), 1)
+            sparse, dense = p.model.sam_prompt_encoder(
+                points=(box_coords, box_labels), boxes=None, masks=None
+            )
+            low_res, iou, _, _ = p.model.sam_mask_decoder(
+                image_embeddings=p._features["image_embed"][box_img],
+                image_pe=p.model.sam_prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=sparse,
+                dense_prompt_embeddings=dense,
+                multimask_output=False,
+                repeat_image=False,
+                high_res_features=[f[box_img] for f in p._features["high_res_feats"]],
+            )
+            masks = p._transforms.postprocess_masks(low_res, orig_hw0) > p.mask_threshold
+
+        masks_per_image = torch.split(masks, counts)
+        scores_per_image = torch.split(iou.reshape(-1).float().contiguous(), counts)
+        all_masks, all_scores = [], []
+        for m, s in zip(masks_per_image, scores_per_image):
+            if m.ndim == 4:
+                m = m[:, 0]                                # (num_boxes, H, W), bool
+            m_u8 = m.to(torch.uint8).contiguous()
+            # torch -> cupy (zero-copy view) then .copy() so cupy owns the memory and it
+            # survives after the torch tensors are freed.
+            all_masks.append(cp.from_dlpack(m_u8).copy())
+            all_scores.append(cp.from_dlpack(s.contiguous()).copy())
+        return all_masks, all_scores
+
     def predict_batch_gpu(
         self,
         images,
@@ -250,8 +330,11 @@ class SAM:
         """Fully GPU-resident batched SAM: `images` is a list of (H,W,3) uint8 CUDA tensors.
 
         Encodes them via `_set_image_batch_gpu` (no host round-trip -- the old numpy
-        `set_image_batch` path uploaded each frame from host every tick), runs SAM2's
-        per-image decode (`_prep_prompts`/`_predict`), and returns cupy uint8 (N,H,W) masks +
+        `set_image_batch` path uploaded each frame from host every tick), then decodes boxes
+        into masks either per-camera (the reference loop, `_prep_prompts`/`_predict`) or, when
+        `self.batched_decode` is enabled and all cameras share a resolution, in a single
+        batched call (`_predict_batch_gpu_batched`); see
+        docs/specs/2026-08-10-sam-batched-decode-design.md. Returns cupy uint8 (N,H,W) masks +
         cupy scores so masks also never leave the device.
         """
         p = self.predictor
@@ -263,23 +346,41 @@ class SAM:
                 self._sync(); self.last_encode_ms = (time.perf_counter() - _t0) * 1000.0
                 _t1 = time.perf_counter()
             num_images = len(p._features["image_embed"])
-            all_masks, all_scores = [], []
-            for img_idx in range(num_images):
-                box = xyxy[img_idx] if xyxy is not None else None
-                mask_input, unnorm_coords, labels, unnorm_box = p._prep_prompts(
-                    None, None, box, None, True, img_idx=img_idx
-                )
-                masks, iou, _ = p._predict(
-                    unnorm_coords, labels, unnorm_box, mask_input,
-                    multimask_output=False, return_logits=False, img_idx=img_idx,
-                )
-                if masks.ndim == 4:
-                    masks = masks[:, 0]                      # (num_boxes, H, W), bool
-                masks_u8 = masks.to(torch.uint8).contiguous()
-                # torch -> cupy (zero-copy view) then .copy() so cupy owns the memory and
-                # it survives after the torch tensors are freed.
-                all_masks.append(cp.from_dlpack(masks_u8).copy())
-                all_scores.append(cp.from_dlpack(iou.reshape(-1).float().contiguous()).copy())
+
+            use_batched = self.batched_decode and xyxy is not None
+            if use_batched and len(set(p._orig_hw)) != 1:
+                if not self._warned_resolution_fallback:
+                    print(
+                        f"WARNING: SAM batched_decode is enabled but cameras in this batch have "
+                        f"different resolutions ({sorted(set(p._orig_hw))}); falling back to the "
+                        f"per-camera decode loop for this worker. postprocess_masks and "
+                        f"transform_boxes each take a single orig_hw, so batching requires a "
+                        f"uniform resolution (see design §5)."
+                    )
+                    self._warned_resolution_fallback = True
+                use_batched = False
+
+            if use_batched:
+                all_masks, all_scores = self._predict_batch_gpu_batched(p, xyxy, num_images)
+            else:
+                all_masks, all_scores = [], []
+                for img_idx in range(num_images):
+                    box = xyxy[img_idx] if xyxy is not None else None
+                    mask_input, unnorm_coords, labels, unnorm_box = p._prep_prompts(
+                        None, None, box, None, True, img_idx=img_idx
+                    )
+                    masks, iou, _ = p._predict(
+                        unnorm_coords, labels, unnorm_box, mask_input,
+                        multimask_output=False, return_logits=False, img_idx=img_idx,
+                    )
+                    if masks.ndim == 4:
+                        masks = masks[:, 0]                      # (num_boxes, H, W), bool
+                    masks_u8 = masks.to(torch.uint8).contiguous()
+                    # torch -> cupy (zero-copy view) then .copy() so cupy owns the memory and
+                    # it survives after the torch tensors are freed.
+                    all_masks.append(cp.from_dlpack(masks_u8).copy())
+                    all_scores.append(cp.from_dlpack(iou.reshape(-1).float().contiguous()).copy())
+
             if timing:
                 self._sync(); self.last_decode_ms = (time.perf_counter() - _t1) * 1000.0
         return all_masks, all_scores, None

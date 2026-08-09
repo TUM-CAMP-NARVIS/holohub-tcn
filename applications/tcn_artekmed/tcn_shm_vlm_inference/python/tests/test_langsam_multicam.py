@@ -22,6 +22,7 @@ from langsam_helpers import (
     panoptic_class,
     panoptic_instance,
     mask_name,
+    plan_batched_decode,
 )
 
 ALL = ["camera01_colorimage", "camera02_colorimage", "camera03_colorimage"]
@@ -119,6 +120,60 @@ def test_maskname_strips_colorimage_suffix():
 
 def test_maskname_without_colorimage_suffix_just_appends():
     assert mask_name("camera01") == "camera01_mask"
+
+
+def test_plan_batched_decode_typical():
+    total, box_img = plan_batched_decode([2, 3])
+    assert total == 5
+    assert box_img.tolist() == [0, 0, 1, 1, 1]
+
+
+def test_plan_batched_decode_single_image():
+    total, box_img = plan_batched_decode([4])
+    assert total == 4
+    assert box_img.tolist() == [0, 0, 0, 0]
+
+
+def test_plan_batched_decode_zero_in_middle():
+    total, box_img = plan_batched_decode([2, 0, 1])
+    assert total == 3
+    assert box_img.tolist() == [0, 0, 2]
+
+
+def test_plan_batched_decode_all_zeros():
+    total, box_img = plan_batched_decode([0, 0])
+    assert total == 0
+    assert box_img.tolist() == []
+
+
+def test_plan_batched_decode_empty():
+    total, box_img = plan_batched_decode([])
+    assert total == 0
+    assert box_img.tolist() == []
+
+
+def test_plan_batched_decode_negative_raises():
+    try:
+        plan_batched_decode([2, -1])
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+
+def test_plan_batched_decode_dtype_is_int64():
+    _, box_img = plan_batched_decode([2, 3])
+    assert box_img.dtype == np.int64
+
+
+def test_plan_batched_decode_matches_independent_oracle():
+    # Independent oracle: NOT a restatement of the implementation, just the definition of
+    # "which image did box j come from" spelled out the obvious (slow) way.
+    for counts in ([1], [3], [2, 3], [1, 1, 1], [5, 0, 2, 0, 1], [0], [7, 4, 9, 1]):
+        total, box_img = plan_batched_decode(counts)
+        oracle = np.concatenate([np.full(c, i) for i, c in enumerate(counts)]) \
+            if sum(counts) > 0 else np.empty(0, dtype=np.int64)
+        assert total == sum(counts)
+        assert box_img.tolist() == oracle.tolist(), (counts, box_img.tolist(), oracle.tolist())
 
 
 if __name__ == "__main__":

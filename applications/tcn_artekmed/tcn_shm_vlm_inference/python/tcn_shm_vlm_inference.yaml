@@ -110,6 +110,11 @@ langsam_inference:
   # trace time; N must be >= every worker's camera count and smaller workers pad up to it.
   sam_backend: "trt"
   sam_trt_engine: "/srv/models/active/sam2/sam2.1_hiera_tiny_encoder_b{batch}_fp16.engine"
+  # Decode all of a worker's cameras' boxes in ONE SAM mask-decoder call instead of looping
+  # per camera (see docs/specs/2026-08-10-sam-batched-decode-design.md). Output is
+  # near-identical to the loop, NOT bitwise-identical (batching reassociates floating-point
+  # reductions). Falls back to the loop if a worker's cameras do not all share one resolution.
+  sam_batched_decode: false
   # torch.compile the GDINO model / SAM2 image encoder (no quality loss). WARNING: first-
   # forward compilation is heavy on host RAM and can OOM (SIGKILL/-9), especially GDINO.
   # Enable ONE at a time and watch memory; sam_compile is the safer/cleaner target.

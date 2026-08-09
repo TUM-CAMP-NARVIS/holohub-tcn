@@ -246,6 +246,28 @@ def build_prompt_remap(baked_prompts, active_prompts):
     return remap
 
 
+def plan_batched_decode(counts):
+    """Per-camera box counts -> (total, box_img_idx) for a batched SAM decode.
+
+    `counts[i]` is the number of boxes on image i. Returns the total box count M and an int64
+    array of length M where entry j is the image index that box j came from, so
+    `image_embed[box_img_idx]` gathers each box's source-image embedding (see the batched path in
+    SAM.predict_batch_gpu). Cameras contributing zero boxes simply do not appear.
+
+    Returns `(0, empty int64 array)` for an all-zero or empty `counts`. Raises ValueError on a
+    negative count.
+    """
+    counts = [int(c) for c in counts]
+    for c in counts:
+        if c < 0:
+            raise ValueError(f"box count must be >= 0, got {c} in {counts}")
+    total = sum(counts)
+    if total == 0:
+        return 0, np.empty(0, dtype=np.int64)
+    box_img = np.repeat(np.arange(len(counts), dtype=np.int64), counts)
+    return total, box_img
+
+
 def plan_batch_padding(n_frames, engine_batch):
     """Dummy slices needed to fill a fixed-batch GDINO engine.
 
