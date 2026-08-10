@@ -21,6 +21,9 @@ from holohub.tcn_stream_splitter import TcnStreamSplitterOp as StreamSplitterOp
 from holohub.tcn_convert_bgra_to_rgba import TcnConvertBgraToRgbaOp as ConvertBgraToRgbaOp
 
 from operators.tcn_artekmed.tcn_util import RotateImage180Op
+from operators.tcn_artekmed.tcn_dataset_replayer import TcnDatasetReplayerOp
+
+from mask_dump import MaskDumpOp
 
 from holoscan.conditions import AsynchronousCondition, CountCondition
 from holoscan.core import Operator, OperatorSpec, Tracker
@@ -49,6 +52,50 @@ from langsam_multicam_fragment import LangSamMultiCamProcessingSubgraph
 
 
 log = logging.getLogger(__name__)
+
+
+# Conservative BlockMemoryPool sizing for `source: "dataset"` mode. There is no live shm
+# channel to query a real `frameSize` from (see the `channels_config` synthesis in `compose`),
+# so this is sized generously above the larger of the two known dataset resolutions (see
+# docs/specs/2026-08-10-replay-harness-design.md "Dataset facts": k4a_capture is
+# 2048x1536x3 uint8 = ~9.4 MiB). It only needs to be an upper bound, not exact -- it sizes a
+# scratch pool used by ops downstream of the replayer (stream_splitter/holoviz/etc.), not the
+# replayer's own device tensors, which it allocates itself via cupy.
+_DATASET_MAX_FRAME_BYTES = 16 * 1024 * 1024  # 16 MiB
+
+
+def _validate_source_cameras(source, provided_cameras, gpu_workers_cfg):
+    """`gpu_workers.workers` must name exactly the cameras the active source provides.
+
+    Both directions matter, on ANY source: a camera listed in `workers` that the source
+    doesn't emit gets silently-empty masks that look like a real regression (e.g. a 4-camera
+    dataset export replayed against a 5-camera worker config); the reverse -- a camera the
+    source emits that no worker claims -- gets silently dropped output (e.g. a 5-camera export
+    against a 4-camera worker config). 4-camera and 5-camera rigs are BOTH real, supported
+    deployment topologies, not "test" vs "production", so a mismatch here is always a
+    misconfiguration to fix, never an expected condition to silently work around.
+    """
+    provided = sorted(set(provided_cameras))
+    workers = (gpu_workers_cfg or {}).get("workers") or []
+    configured = sorted({cam for w in workers for cam in (w.get("cameras") or [])})
+    missing = sorted(set(configured) - set(provided))    # configured, source doesn't provide
+    extra = sorted(set(provided) - set(configured))       # provided, no worker claims it
+    if missing or extra:
+        detail = [
+            f"source {source!r} provides {len(provided)} camera(s): {provided}",
+            f"gpu_workers.workers is configured for {len(configured)} camera(s): {configured}",
+        ]
+        if missing:
+            detail.append(f"  missing (configured, but NOT provided by the source): {missing}")
+        if extra:
+            detail.append(f"  extra (provided by the source, but NO worker claims them): {extra}")
+        raise ValueError(
+            "gpu_workers.workers camera set does not match the cameras the active source "
+            "provides.\n  " + "\n  ".join(detail) +
+            "\nAdjust gpu_workers.workers to match this source's cameras -- see the "
+            "commented alternative camera-count profile next to gpu_workers/dataset_source "
+            "in the yaml."
+        )
 
 
 def create_tiled_input_specs(
@@ -150,11 +197,59 @@ class App(hs.core.Application):
         shm_stream_name = shm_config.get("stream_name")
         cycle_time_ms = shm_config.get("cycle_time_ms")
 
-        log.info("Discover contents in shared memory")
-        receiver_config = discover_shm(shm_stream_name)
-        shm_receiver = receiver_config["receiver"]
-        camera_names = receiver_config["camera_names"]
-        device_contexts = receiver_config["device_contexts"]
+        # --- frame source (design doc §2.1) --------------------------------------------
+        # "shm" (default) is the live pipeline -- this branch executes the exact same
+        # statements as before this toggle existed, so a live run is byte-for-byte unchanged.
+        # "dataset" replays a fixed on-disk export through TcnDatasetReplayerOp for
+        # deterministic correctness gating (compare two dumps with docs/compare_mask_dumps.py).
+        source = str(self.from_config("source")).strip().lower()
+        if source not in ("shm", "dataset"):
+            raise ValueError(f"Invalid 'source': {source!r}; must be 'shm' or 'dataset'")
+        log.info(f"Frame source: {source!r}")
+
+        mask_dump_dir = str(self.from_config("mask_dump_dir")).strip()
+        if mask_dump_dir and not camera_streams_config.get("enable_langsam_multicam", False):
+            raise ValueError(
+                "mask_dump_dir is set but camera_stream_processing.enable_langsam_multicam is "
+                "False -- there is no mask output to dump."
+            )
+
+        dataset_cfg = None
+        dataset_cameras = None
+        if source == "dataset":
+            dataset_cfg = self.kwargs("dataset_source")
+            dataset_cameras = list(dataset_cfg.get("cameras") or [])
+            if not dataset_cameras:
+                raise ValueError("dataset_source.cameras must list at least one camera id")
+
+        if source == "shm":
+            log.info("Discover contents in shared memory")
+            receiver_config = discover_shm(shm_stream_name)
+            shm_receiver = receiver_config["receiver"]
+            device_contexts = receiver_config["device_contexts"]
+            channels_config = receiver_config["channels_config"]
+        else:
+            shm_receiver = None
+            # No live shm channel to discover: no device calibration (DA3 handles a missing
+            # device_context by disabling metric scaling -- da3_fragment.py -- which is fine
+            # since DA2/DA3 are off by default and are not part of what this dataset path
+            # feeds), and a synthetic `channels_config` shaped just like discover_shm()'s
+            # return value, containing only the fields actually read below, so the rest of
+            # compose() (the color/depth stream split, pool sizing, ...) runs unchanged for
+            # both sources.
+            device_contexts = {}
+            channels_config = {
+                "ports": [
+                    {
+                        "name": f"{cam}_colorimage",
+                        "status": {
+                            "portType": "colorimage",
+                            "bufferInfo": {"frameSize": _DATASET_MAX_FRAME_BYTES},
+                        },
+                    }
+                    for cam in dataset_cameras
+                ]
+            }
 
         # Register the ctx_service with the fragment
         ctx_service = DeviceContextService.create(device_contexts)
@@ -182,10 +277,14 @@ class App(hs.core.Application):
         #     pose_tree_config["edges"].append(("world_origin", depth_channel_name, convert_rigid_transform_to_pose3(ctx_service.get_depth_extrinsics(name))))
         #     pose_tree_config["edges"].append((color_channel_name, depth_channel_name, convert_rigid_transform_to_pose3(ctx_service.get_color_to_depth(name))))
 
-        channels_config = receiver_config["channels_config"]
-        channel_semantic_types = {
-            v['name']: SemanticType(v['status']['bufferInfo']['semanticType']) for v in channels_config['ports']
-        }
+        # Semantic types are only reported by live shm channels; the synthetic dataset-mode
+        # `channels_config` above has no `semanticType` at all (its only consumer,
+        # need_convert_bgra below, is resolved without it in that mode).
+        channel_semantic_types = None
+        if source == "shm":
+            channel_semantic_types = {
+                v['name']: SemanticType(v['status']['bufferInfo']['semanticType']) for v in channels_config['ports']
+            }
 
         depth_streams_config = []
         color_streams_config = []
@@ -228,35 +327,69 @@ class App(hs.core.Application):
             dev_id=cuda_device_id
         )
 
-        log.info(f"create subscriber op {shm_stream_name}")
-        shm_async_condition = AsynchronousCondition(self, name="shm_async_condition")
-        subscriber_op = ShmSubscriberOp(self, cuda_stream_pool,
-                                        allocator=device_memory_pool,
-                                        async_condition=shm_async_condition,
-                                        receiver=shm_receiver,
-                                        stream_name=shm_stream_name,
-                                        cycle_time_ms=cycle_time_ms,
-                                        name="shm_subscriber")
+        # --- frame source op: ShmSubscriberOp (live) or TcnDatasetReplayerOp (deterministic
+        # replay) -- design doc §2.1. Built once, wired to the exact same two ports/edges
+        # (`color_outputs`, `depth_outputs`) either way, so every downstream operator is
+        # unaware of which one is feeding it.
+        if source == "shm":
+            log.info(f"create subscriber op {shm_stream_name}")
+            shm_async_condition = AsynchronousCondition(self, name="shm_async_condition")
+            frame_source_op = ShmSubscriberOp(self, cuda_stream_pool,
+                                            allocator=device_memory_pool,
+                                            async_condition=shm_async_condition,
+                                            receiver=shm_receiver,
+                                            stream_name=shm_stream_name,
+                                            cycle_time_ms=cycle_time_ms,
+                                            name="shm_subscriber")
+        else:
+            dataset_frame_count = dataset_cfg.get("frame_count")
+            if dataset_frame_count is None:
+                raise ValueError(
+                    "dataset_source.frame_count must be a positive integer in dataset mode -- "
+                    "the app bounds the run with CountCondition(count=frame_count) so it "
+                    "terminates on its own (design doc §2.1); it cannot discover the "
+                    "dataset's frame count before compose() without decoding it."
+                )
+            dataset_playback = dataset_cfg.get("playback", "auto")
+            log.info(
+                f"create dataset replayer op: path={dataset_cfg['path']!r} "
+                f"cameras={dataset_cameras} frame_count={dataset_frame_count} "
+                f"loop={dataset_cfg.get('loop', True)} playback={dataset_playback!r}"
+            )
+            source_args = ()
+            if dataset_playback == "auto":
+                # Bounds the run to exactly the requested frames so a harness run exits on its
+                # own instead of running forever (design doc §2.1).
+                source_args = (CountCondition(self, count=int(dataset_frame_count)),)
+            frame_source_op = TcnDatasetReplayerOp(
+                self, *source_args,
+                dataset_path=dataset_cfg["path"],
+                cameras=dataset_cameras,
+                frame_count=int(dataset_frame_count),
+                loop=bool(dataset_cfg.get("loop", True)),
+                emit_depth=False,
+                playback=dataset_playback,
+                allocator=device_memory_pool,
+                cuda_stream_pool=cuda_stream_pool,
+                name="dataset_replayer",
+            )
 
         log.info(f"create stream_splitter op: {color_streams_config[:1]}")
         # XXX only one for now
         split_op = StreamSplitterOp(self, cuda_stream_pool,
                                     channel_names=[v["name"] for v in color_streams_config[:1]],
                                     name="stream_splitter")
-        self.add_flow(subscriber_op, split_op, {("color_outputs", "receivers")})
-
-        current_config = color_streams_config[0]
-        channel_st = SemanticType(current_config['status']['bufferInfo']['semanticType'])
+        self.add_flow(frame_source_op, split_op, {("color_outputs", "receivers")})
 
         di_sink = DummySinkOp(self, name="depth_image_sink")
-        self.add_flow(subscriber_op, di_sink, {("depth_outputs", "input")})
+        self.add_flow(frame_source_op, di_sink, {("depth_outputs", "input")})
 
 
         config_rotate_image = False
         have_camera_consumer = False
 
         inference_input = (split_op, "camera01_colorimage")
-        camera_device_context = device_contexts["camera01"]
+        camera_device_context = device_contexts.get("camera01")
 
         if config_rotate_image:
             log.info("rotate image enabled")
@@ -264,13 +397,20 @@ class App(hs.core.Application):
             self.add_flow(inference_input[0], rotate_op, {(inference_input[1], "input")})
             inference_input = (rotate_op, "output")
 
+        # BGRA->RGBA detection needs a live channel's reported semantic type, which only
+        # exists when source == "shm" (channel_semantic_types above). TcnDatasetReplayerOp
+        # always emits plain BGR (channel_order="bgr", its default -- see its docstring), so
+        # there is no alpha channel to strip in dataset mode.
         need_convert_bgra = False
-        if channel_st.content_type.get_format_type() == ImageFormatTypes.Rgba:
-            need_convert_bgra = False
-        elif channel_st.content_type.get_format_type() == ImageFormatTypes.Bgra:
-            need_convert_bgra = True # camera_streams_config.get("enable_da3", False) or camera_streams_config.get("enable_langsam", False)
-        else:
-            log.warning(f"Unsupported format type: {channel_st.content_type.get_format_type()}")
+        if source == "shm":
+            current_config = color_streams_config[0]
+            channel_st = SemanticType(current_config['status']['bufferInfo']['semanticType'])
+            if channel_st.content_type.get_format_type() == ImageFormatTypes.Rgba:
+                need_convert_bgra = False
+            elif channel_st.content_type.get_format_type() == ImageFormatTypes.Bgra:
+                need_convert_bgra = True # camera_streams_config.get("enable_da3", False) or camera_streams_config.get("enable_langsam", False)
+            else:
+                log.warning(f"Unsupported format type: {channel_st.content_type.get_format_type()}")
 
         col_conv = None
         if need_convert_bgra:
@@ -347,6 +487,15 @@ class App(hs.core.Application):
 
         if camera_streams_config.get("enable_langsam_multicam", False):
             all_color_cams = [c["name"] for c in color_streams_config]
+
+            # gpu_workers.workers must name exactly the cameras this source provides -- on
+            # ANY source (design doc "Dataset facts" / see _validate_source_cameras
+            # docstring). Checked here, not earlier, because gpu_workers.workers is only
+            # actually consumed when this subgraph is built -- validating it unconditionally
+            # would newly break a live run that has enable_langsam_multicam off and a stale,
+            # otherwise-harmless gpu_workers block.
+            _validate_source_cameras(source, all_color_cams, self.kwargs("gpu_workers"))
+
             langsam_mc = LangSamMultiCamProcessingSubgraph(
                 self, "langsam_multicam", self.kwargs, all_color_cams)
 
@@ -359,10 +508,23 @@ class App(hs.core.Application):
             )
 
             # Feed the full color entity (all cameras) straight in; workers self-select.
-            self.add_flow(subscriber_op, langsam_mc, {("color_outputs", "input")})
+            self.add_flow(frame_source_op, langsam_mc, {("color_outputs", "input")})
             self.add_flow(langsam_mc, langsam_mc_holoviz, {("output_viz", "receivers")})
             self.add_flow(langsam_mc, langsam_mc_holoviz, {("output_specs", "input_specs")})
             have_camera_consumer = True
+
+            # --- mask dump (design doc §2.2) -- only built when mask_dump_dir is set, so a
+            # live run pays nothing. Uses the replayer's true source frame number in dataset
+            # mode; falls back to a tick counter in shm mode (correct there -- a live stream
+            # has no dataset frame number to report).
+            if mask_dump_dir:
+                mask_dump_op = MaskDumpOp(
+                    self, name="mask_dump",
+                    out_dir=mask_dump_dir,
+                    frame_source=frame_source_op if source == "dataset" else None,
+                )
+                self.add_flow(langsam_mc, mask_dump_op, {("output_masks", "masks")})
+                log.info(f"Mask dump enabled: writing to {mask_dump_dir!r}")
 
         if not have_camera_consumer:
             cs_sink = DummySinkOp(self, name="camera_stream_sink")
@@ -381,7 +543,7 @@ class App(hs.core.Application):
         )
 
         self.add_flow(inference_input[0], color_visualizer, {(inference_input[1], "receivers")})
-        #self.add_flow(subscriber_op, color_visualizer, {("color_output_specs", "input_specs")})
+        #self.add_flow(frame_source_op, color_visualizer, {("color_output_specs", "input_specs")})
 
 
 def main(config_file=None, scheduler_type="greedy", log_level="info", with_tracker=False):

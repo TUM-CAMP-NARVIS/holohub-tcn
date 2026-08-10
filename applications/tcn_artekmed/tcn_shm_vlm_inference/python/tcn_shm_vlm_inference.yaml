@@ -4,6 +4,35 @@ application:
   inputFormats: []
   outputFormats: ["screen"]
 
+# ---------------------------------------------------------------------------
+# Frame source -- "shm" (default) is the live pipeline, unchanged behaviour. "dataset" replays
+# a fixed on-disk export through TcnDatasetReplayerOp instead of TcnShmSubscriberOp, for
+# deterministic correctness gating: run twice with different settings, dump masks to two
+# directories (mask_dump_dir below), then compare with docs/compare_mask_dumps.py. See
+# docs/specs/2026-08-10-replay-harness-design.md §2.1/§2.2/§2.4.
+# ---------------------------------------------------------------------------
+source: "shm"
+
+# Only read when source: "dataset". `frame_count` is REQUIRED, not just a preload cap: the app
+# bounds the run with CountCondition(count=frame_count) so a harness run terminates on its own
+# instead of running forever, and passes the SAME value straight through as the replayer's own
+# `frame_count` -- so one run emits exactly this many frames, once, in "auto" playback.
+dataset_source:
+  # k4a_capture matches the live camera resolution (2048x1536); orbbec_capture (1920x1080)
+  # does not but is fine for correctness A/B. See design doc "Dataset facts".
+  path: "/workspace/volumes/artekmed_test_data/data/k4a_capture"
+  cameras: ["camera01", "camera02", "camera03", "camera04"]
+  frame_count: 6
+  loop: false
+  playback: "auto"
+
+# Only read when this is non-empty. Writes one <mask_dump_dir>/frame<NNNNNN>_<camera>.npy per
+# camera per tick from the langsam_multicam mask collector's output. Unset (default "") ->
+# MaskDumpOp is not built at all, so a live run pays nothing. Requires
+# camera_stream_processing.enable_langsam_multicam: true. See
+# docs/compare_mask_dumps.py and design doc §2.2.
+mask_dump_dir: ""
+
 shared_memory:
   stream_name: "camera_streams"
   parameter_rpc_name: "tcn_shm_receiver"
@@ -72,6 +101,16 @@ da3_inference:
 # A worker's ENGINE BATCH is its camera count -- derived, never configured. GPU 0 gets the
 # smaller share because it also drives Holoviz, the collector and colorize.
 # Changing a split means rebuilding that batch; the app fails fast at startup with the command.
+#
+# Both camera counts below are real, supported deployment topologies (4-camera and 5-camera
+# rigs both run in production) -- not "production" vs "test". Pick the `workers:` block
+# matching the rig actually connected (or, in source: "dataset" mode, the export being
+# replayed) and comment out the other. Each profile needs its OWN engines, built for its own
+# batch sizes:
+#   5-camera rig (2/3 split): batch-2 AND batch-3 engines
+#   4-camera rig (2/2 split): batch-2 engines only
+# The app validates gpu_workers.workers against the active source's cameras at startup and
+# fails fast, naming exactly which cameras are missing/extra, if they don't match.
 # ---------------------------------------------------------------------------
 gpu_workers:
   # Run each worker's gdino/sam/panoptic as three chained operators instead of one, so stages
@@ -79,11 +118,20 @@ gpu_workers:
   # of extra mask latency. false -> the original single LangSamBatchOp per worker.
   # See docs/specs/2026-08-07-langsam-pipelining-design.md.
   pipelined: false
+
+  # -- 5-camera profile (needs batch-2 + batch-3 engines) --
   workers:
     - device: 0
       cameras: ["camera01_colorimage", "camera02_colorimage"]
     - device: 1
       cameras: ["camera03_colorimage", "camera04_colorimage", "camera05_colorimage"]
+
+  # -- 4-camera profile (needs batch-2 engines only) --
+  # workers:
+  #   - device: 0
+  #     cameras: ["camera01_colorimage", "camera02_colorimage"]
+  #   - device: 1
+  #     cameras: ["camera03_colorimage", "camera04_colorimage"]
 
 # LangSAM (Grounding DINO + SAM2) Configuration
 langsam_inference:
