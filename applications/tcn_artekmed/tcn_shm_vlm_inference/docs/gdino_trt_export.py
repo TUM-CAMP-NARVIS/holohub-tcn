@@ -11,17 +11,29 @@ the TRT that built it, while the two halves of the toolchain live in different e
                    reference. Builds NO engine -- the host TRT is not the runtime TRT.
                      <out>/gdino_swint_prompts.npz          (input_ids, attention_mask,
                          position_ids, token_type_ids, text_token_mask, token_class_ids, prompts)
-                     <out>/gdino_swint_<H>x<W>_b<N>_tf32.onnx
+                     <out>/gdino_swint_<H>x<W>_b<N>.onnx     (precision-neutral FP32 graph --
+                         see NOTE below, this ONNX is shared by every engine precision)
                      <out>/gdino_swint_<H>x<W>_parity_ref.npz  (preprocessed image, top score,
                          top box) -- lets the build stage run the same faithfulness gate without
                          torch weights or the GroundingDINO checkout.
                    Requires: --prompts.
 
   --stage build    INSIDE the holohub runtime container (tensorrt + torch), so the engine
-                   matches the TRT that will deserialize it at run time. Reads the three
-                   artifacts above, writes the engine, and re-runs the fidelity report against
-                   the saved reference.
-                     <out>/gdino_swint_<H>x<W>_b<N>_tf32.engine
+                   matches the TRT that will deserialize it at run time. Reads the ONNX + the
+                   two batch-independent artifacts above, writes the engine, and re-runs the
+                   fidelity report against the saved reference.
+                     <out>/gdino_swint_<H>x<W>_b<N>_tf32.engine   (default)
+                     <out>/gdino_swint_<H>x<W>_b<N>_fp16.engine   (--fp16)
+
+NOTE on ONNX vs engine precision: an exported ONNX graph is FP32 and precision-neutral --
+engine precision (TF32 vs FP16) is purely a TensorRT builder flag applied at --stage build
+(see build_engine). So ONE ONNX legitimately serves both a TF32 and an FP16 engine, and this
+tool resolves it by name independently of --fp16 (see resolve_onnx): the precision-free
+`_b<N>.onnx` name is canonical and is what --stage export now writes, but the older
+`_b<N>_tf32.onnx` / `_b<N>_fp16.onnx` names are still tried as fallbacks so ONNX exported
+before this change keeps working without a redundant host re-export. The two ENGINE files
+DO keep separate precision-tagged names, deliberately -- both must be able to coexist on disk
+so they can be A/B compared (see --fp16's help text).
 
 Both stages compare against the SAME PyTorch reference, so the full model -> ONNX -> engine
 chain stays gated even though no single environment can run all of it.
@@ -401,6 +413,34 @@ def load_text_npz(path):
     return text, int(text["input_ids"].shape[1])
 
 
+def onnx_candidates(out_dir, H, W, batch):
+    """ONNX paths for one batch, in resolution order (first existing file wins).
+
+    The ONNX graph is FP32 and precision-neutral -- engine precision is purely a TRT builder
+    flag applied later in build_engine -- so a single ONNX legitimately serves both a TF32 and
+    an FP16 engine. `_b<N>.onnx` (no precision tag) is the canonical name and what --stage
+    export writes going forward; `_b<N>_tf32.onnx` / `_b<N>_fp16.onnx` are kept as fallbacks so
+    ONNX exported before this naming change keeps working without a redundant host re-export.
+    """
+    base = f"gdino_swint_{H}x{W}_b{int(batch)}"
+    return [os.path.join(out_dir, base + suffix) for suffix in (".onnx", "_tf32.onnx", "_fp16.onnx")]
+
+
+def resolve_onnx(out_dir, H, W, batch):
+    """Return the first existing ONNX candidate for `batch` (see onnx_candidates), logging
+    which one was picked -- a silent pick would make it impossible to tell later which graph
+    an engine came from. Raises SystemExit listing every path tried if none exist."""
+    candidates = onnx_candidates(out_dir, H, W, batch)
+    for p in candidates:
+        if os.path.exists(p):
+            print(f"ONNX resolved for batch {batch}: {p}")
+            return p
+    tried = "\n  ".join(candidates)
+    raise SystemExit(
+        f"ONNX not found for batch {batch}. Tried, in order:\n  {tried}\n"
+        f"Run the export stage on the host first.")
+
+
 def stage_export_setup(args, H, W, npz_path, ref_path):
     """Load the model, build the fixed text tensors, capture the PyTorch parity reference, and
     write the two batch-INDEPENDENT artifacts (prompts npz, parity ref) once.
@@ -454,10 +494,8 @@ def stage_export_batch(model, text, H, W, onnx_path, batch, print_hint=True):
 def stage_build(args, H, W, onnx_path, engine_path, npz_path, ref_path, batch):
     """Build and gate the engine for one batch. `npz_path`/`ref_path` are the batch-independent
     artifacts the export stage wrote once; they are only READ here, so re-reading them per
-    batch (the caller loops this function once per distinct batch) is harmless."""
-    if not os.path.exists(onnx_path):
-        raise SystemExit(
-            f"ONNX not found: {onnx_path}\nRun the export stage on the host first.")
+    batch (the caller loops this function once per distinct batch) is harmless. `onnx_path` is
+    already resolved (see resolve_onnx) by the caller."""
     text, L = load_text_npz(npz_path)
     ref_img, s_pt, b_pt, ref_image_path = load_parity_ref(ref_path, H, W)
     print(f"TensorRT {trt.__version__}  |  L={L}  |  pytorch reference: top score={s_pt:.3f} "
@@ -516,7 +554,13 @@ def main():
     ap.add_argument("--min-detect", type=float, default=0.30,
                     help="PyTorch top score the parity image must reach for the IoU check to be "
                          "valid (i.e. the image must actually contain a prompted class)")
-    ap.add_argument("--fp16", action="store_true", help="experimental; TF32 is the validated default")
+    ap.add_argument("--fp16", action="store_true",
+                    help="build an FP16 engine instead of TF32 (default). Same ONNX either way -- "
+                         "engine precision is purely a TRT builder flag, not a property of the "
+                         "graph (see NOTE in the module docstring). FP16 is experimental: validate "
+                         "it by A/B'ing against a TF32 engine through the replay harness "
+                         "(docs/compare_mask_dumps.py --iou-gate), not by this tool's build-time "
+                         "fidelity_report, which is deliberately non-blocking (see fidelity_report).")
     ap.add_argument("--batch", type=int, default=None,
                     help="the engine's batch = the largest LangSAM worker's camera count. Both "
                          "stages need the SAME value: export traces at it (the traced batch is "
@@ -550,9 +594,16 @@ def main():
     npz_path = os.path.join(args.out, "gdino_swint_prompts.npz")
     ref_path = os.path.join(args.out, f"gdino_swint_{H}x{W}_parity_ref.npz")
 
-    def paths_for(batch):
+    def onnx_path_for(batch):
+        """The (precision-free, canonical) ONNX path --stage export writes for `batch`."""
+        return os.path.join(args.out, f"gdino_swint_{H}x{W}_b{int(batch)}.onnx")
+
+    def engine_path_for(batch):
+        # Unlike the ONNX, the engine's name DOES carry the precision tag: TF32 and FP16
+        # engines must coexist on disk (built from the SAME onnx_path_for/resolve_onnx ONNX)
+        # so they can be A/B compared -- see --fp16's help text.
         tag = f"gdino_swint_{H}x{W}_b{int(batch)}_{'fp16' if args.fp16 else 'tf32'}"
-        return (os.path.join(args.out, tag + ".onnx"), os.path.join(args.out, tag + ".engine"))
+        return os.path.join(args.out, tag + ".engine")
 
     if args.stage == "export":
         if not args.prompts:
@@ -561,7 +612,7 @@ def main():
         # which bakes the traced batch -- repeats per batch.
         model, text = stage_export_setup(args, H, W, npz_path, ref_path)
         for batch in batches:
-            onnx_path, _ = paths_for(batch)
+            onnx_path = onnx_path_for(batch)
             stage_export_batch(model, text, H, W, onnx_path, batch, print_hint=not args.from_config)
         if args.from_config:
             print(f"\nDONE (export, batches {batches}). Now build the engines INSIDE the "
@@ -570,7 +621,8 @@ def main():
                   f"--from-config {args.from_config} --out <container path>")
     else:
         for batch in batches:
-            onnx_path, engine_path = paths_for(batch)
+            onnx_path = resolve_onnx(args.out, H, W, batch)
+            engine_path = engine_path_for(batch)
             stage_build(args, H, W, onnx_path, engine_path, npz_path, ref_path, batch)
 
 
