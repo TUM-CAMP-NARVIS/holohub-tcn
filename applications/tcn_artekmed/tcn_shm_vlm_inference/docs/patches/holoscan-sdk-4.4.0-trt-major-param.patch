@@ -1,0 +1,30 @@
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -381,20 +381,23 @@
+     --mount=type=cache,target=/var/lib/apt,sharing=locked,id=holoscan-sdk-apt-lib-$TARGETARCH-$GPU_TYPE \
+     apt-get update \
+     && TRT_VERSION_VAR_NAME="TENSORRT_CU${CUDA_MAJOR}_VERSION" \
+-    && TRT_VERSION=$(apt-cache madison libnvinfer10 | grep "${!TRT_VERSION_VAR_NAME}" | grep "+cuda${CUDA_MAJOR}" | head -n 1 | awk '{print $3}') \
++    && TRT_REQ="${!TRT_VERSION_VAR_NAME}" \
++    && TRT_MAJOR="${TRT_REQ%%.*}" \
++    && TRT_VERSION=$(apt-cache madison libnvinfer${TRT_MAJOR} | grep "${TRT_REQ}" | grep "+cuda${CUDA_MAJOR}" | head -n 1 | awk '{print $3}') \
++    && if [ -z "${TRT_VERSION}" ]; then echo "ERROR: no libnvinfer${TRT_MAJOR} matching ${TRT_REQ} for +cuda${CUDA_MAJOR}" >&2; exit 1; fi \
+     && EXTRA_TRT_PKGS="" \
+     && if apt-cache madison libnvinfer-safe-headers-dev 2>/dev/null | grep -Fq "| ${TRT_VERSION} |"; then \
+            EXTRA_TRT_PKGS="libnvinfer-safe-headers-dev=${TRT_VERSION}"; \
+        fi \
+     && apt-get install -y --no-install-recommends \
+         libnvonnxparsers-dev="${TRT_VERSION}" \
+-        libnvonnxparsers10="${TRT_VERSION}" \
++        libnvonnxparsers${TRT_MAJOR}="${TRT_VERSION}" \
+         libnvinfer-plugin-dev="${TRT_VERSION}" \
+         libnvinfer-headers-plugin-dev="${TRT_VERSION}" \
+-        libnvinfer-plugin10="${TRT_VERSION}" \
++        libnvinfer-plugin${TRT_MAJOR}="${TRT_VERSION}" \
+         libnvinfer-dev="${TRT_VERSION}" \
+         libnvinfer-headers-dev="${TRT_VERSION}" \
+-        libnvinfer10="${TRT_VERSION}" \
++        libnvinfer${TRT_MAJOR}="${TRT_VERSION}" \
+         ${EXTRA_TRT_PKGS} \
+     && echo "-- Deleting unused static libs:" \
+     && packages=$(dpkg -l | grep -e nvinfer -e nvonnxparsers | awk '{print $2}') \
