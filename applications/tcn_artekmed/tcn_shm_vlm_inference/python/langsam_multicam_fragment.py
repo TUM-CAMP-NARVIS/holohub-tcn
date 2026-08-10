@@ -20,7 +20,7 @@ from holoscan.operators import HolovizOp
 
 from langsam_common import (
     SAM, GDINO, GDinoTrtDetector, resolve_workers, worker_batch, worker_engine_path,
-    class_id_map, build_panoptic_map, build_panoptic_lut,
+    class_id_map, build_panoptic_map, build_panoptic_map_auto, build_panoptic_lut,
 )
 # Shared with langsam_pipelined.py so the output-key convention can't drift between the
 # monolithic and split ops; imported directly (not via langsam_common's re-export list).
@@ -62,6 +62,7 @@ class LangSamBatchOp(Operator):
         self.box_threshold = float(langsam_cfg.get("box_threshold", 0.3))
         self.text_threshold = float(langsam_cfg.get("text_threshold", 0.25))
         self.gdino_backend = langsam_cfg.get("gdino_backend", "pytorch")
+        self.panoptic_backend = langsam_cfg.get("panoptic_backend", "cupy")
         super().__init__(fragment, *args, **kwargs)
         with torch.cuda.device(self.device):
             self.sam = SAM(
@@ -188,8 +189,9 @@ class LangSamBatchOp(Operator):
                 torch.cuda.nvtx.range_pop()
                 torch.cuda.nvtx.range_push("panoptic")
                 for k, i in enumerate(sam_idx):
-                    pmaps[i] = build_panoptic_map(
-                        masks[k], sam_labels[k], mscores[k], self._cmap, hw[0], hw[1], xp=cp)
+                    pmaps[i] = build_panoptic_map_auto(
+                        masks[k], sam_labels[k], mscores[k], self._cmap, hw[0], hw[1],
+                        backend=self.panoptic_backend)
                 torch.cuda.nvtx.range_pop()
 
             for i, cam in enumerate(names):

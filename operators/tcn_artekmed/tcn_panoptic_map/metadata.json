@@ -1,0 +1,6 @@
+{
+    "operator": {
+        "name": "TCN Panoptic Map",
+        "description": "Fused CUDA kernel: per-pixel highest-priority-wins panoptic paint from (M,H,W) masks + packed class/instance values, exposed as a free pybind function (build_panoptic_map_cuda), not an Operator."
+    }
+}

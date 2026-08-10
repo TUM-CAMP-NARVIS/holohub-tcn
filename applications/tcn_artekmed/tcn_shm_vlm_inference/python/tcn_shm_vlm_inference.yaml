@@ -158,6 +158,13 @@ langsam_inference:
   # trace time; N must be >= every worker's camera count and smaller workers pad up to it.
   sam_backend: "trt"
   sam_trt_engine: "/srv/models/active/sam2/sam2.1_hiera_tiny_encoder_b{batch}_fp16.engine"
+  # Panoptic-map paint backend: "cupy" (existing per-detection boolean-mask assignment) |
+  # "cuda" (fused kernel, one launch per camera -- see
+  # docs/specs/2026-08-10-panoptic-cuda-design.md). cupy's nonzero()-based scatter forces a
+  # device sync PER DETECTION (~45 syncs/tick measured, 28.5 ms wall for ~3 ms of real GPU
+  # work); "cuda" removes that. Falls back to "cupy" with a loud WARNING if the compiled
+  # extension (operators/tcn_artekmed/tcn_panoptic_map) is missing.
+  panoptic_backend: "cupy"
   # Decode all of a worker's cameras' boxes in ONE SAM mask-decoder call instead of looping
   # per camera (see docs/specs/2026-08-10-sam-batched-decode-design.md). Output is
   # near-identical to the loop, NOT bitwise-identical (batching reassociates floating-point

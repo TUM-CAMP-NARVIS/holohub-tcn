@@ -32,6 +32,7 @@ from langsam_helpers import (  # noqa: F401
     class_id_for_label,
     build_label_map,
     build_panoptic_map,
+    plan_panoptic_paint,
     panoptic_class,
     panoptic_instance,
     gdino_postprocess,
@@ -41,6 +42,97 @@ from langsam_helpers import (  # noqa: F401
     plan_batch_padding,
     plan_batched_decode,
 )
+
+
+# --- CUDA-kernel-backed panoptic map (docs/specs/2026-08-10-panoptic-cuda-design.md) -----------
+#
+# `build_panoptic_map`'s cupy path paints one detection at a time (`pmap[masks[j] > 0] = v`),
+# and cupy's boolean-mask assignment forces a `nonzero()`-driven device sync PER DETECTION.
+# `tcn_panoptic_map` (operators/tcn_artekmed/tcn_panoptic_map) does the whole per-camera paint
+# in one fused kernel launch instead. Opt-in via `langsam_inference.panoptic_backend: "cuda"`
+# (default stays "cupy" -- see `build_panoptic_map_auto`).
+
+_panoptic_cuda_ext = None       # None = not yet attempted; False = attempted and failed
+_panoptic_cuda_warned = False
+
+
+def _load_panoptic_cuda_ext():
+    """Lazy-import the compiled `tcn_panoptic_map` extension; caches success AND failure so the
+    import (and, on failure, the warning) happens at most once per process, not once per tick.
+    """
+    global _panoptic_cuda_ext, _panoptic_cuda_warned
+    if _panoptic_cuda_ext is not None:
+        return _panoptic_cuda_ext
+    try:
+        from holohub.tcn_panoptic_map._tcn_panoptic_map import (
+            build_panoptic_map_cuda as _ext_build_panoptic_map_cuda,
+        )
+        _panoptic_cuda_ext = _ext_build_panoptic_map_cuda
+    except ImportError as e:
+        _panoptic_cuda_ext = False
+        if not _panoptic_cuda_warned:
+            _panoptic_cuda_warned = True
+            print(
+                "WARNING: langsam_inference.panoptic_backend is \"cuda\" but the compiled "
+                f"tcn_panoptic_map extension is not importable ({e!r}). Falling back to the "
+                "cupy panoptic-map backend for the rest of this run. This almost always means "
+                "the extension was never built: check that "
+                "add_holohub_operator(tcn_panoptic_map) is present in "
+                "operators/tcn_artekmed/CMakeLists.txt and rebuild HoloHub."
+            )
+    return _panoptic_cuda_ext
+
+
+def build_panoptic_map_cuda_backed(masks, labels, scores, cmap, height, width):
+    """CUDA-kernel-backed panoptic map: same inputs/output contract as `build_panoptic_map`,
+    but the per-pixel paint is one fused kernel launch (see `tcn_panoptic_map`'s design doc)
+    instead of one cupy boolean-mask assignment per detection.
+
+    `masks` must be a C-contiguous cupy uint8 array -- this does NOT silently accept a strided
+    view (e.g. a slice of a larger buffer); it raises instead, because passing a strided view's
+    raw pointer to the kernel would silently read the wrong bytes. Falls back to
+    `build_panoptic_map` (never raises for this reason) if `masks` is empty/None, since that
+    case is already a cheap no-sync zero-fill with nothing for the kernel to do, or if the
+    compiled extension is not importable (see `_load_panoptic_cuda_ext`).
+    """
+    if masks is None or len(masks) == 0:
+        return build_panoptic_map(None, [], None, cmap, height, width, xp=cp)
+
+    ext_fn = _load_panoptic_cuda_ext()
+    if ext_fn is False:
+        return build_panoptic_map(masks, labels, scores, cmap, height, width, xp=cp)
+
+    if not masks.flags.c_contiguous:
+        raise ValueError(
+            "build_panoptic_map_cuda_backed: masks must be C-contiguous, got a strided view "
+            f"(shape={masks.shape}, strides={masks.strides}). The caller must "
+            "cp.ascontiguousarray() the mask stack before calling this -- silently accepting a "
+            "strided view would have the kernel read the wrong bytes.")
+    if masks.dtype != cp.uint8:
+        raise ValueError(
+            f"build_panoptic_map_cuda_backed: masks must be uint8, got {masks.dtype}.")
+
+    M = len(masks)
+    values, priorities = plan_panoptic_paint(labels, scores, cmap, xp=cp)
+    values_gpu = cp.asarray(values, dtype=cp.uint16)
+    priorities_gpu = cp.asarray(priorities, dtype=cp.int32)
+    out = cp.empty((height, width), dtype=cp.uint16)   # kernel writes every pixel; no zero-fill
+
+    ext_fn(
+        int(masks.data.ptr), int(values_gpu.data.ptr), int(priorities_gpu.data.ptr),
+        int(M), int(height), int(width),
+        int(out.data.ptr), int(cp.cuda.get_current_stream().ptr),
+    )
+    return out
+
+
+def build_panoptic_map_auto(masks, labels, scores, cmap, height, width, backend="cupy"):
+    """Dispatch to the cupy (default, existing/oracle) or CUDA-kernel panoptic-map
+    implementation by `backend` -- the `langsam_inference.panoptic_backend` config toggle.
+    """
+    if backend == "cuda":
+        return build_panoptic_map_cuda_backed(masks, labels, scores, cmap, height, width)
+    return build_panoptic_map(masks, labels, scores, cmap, height, width, xp=cp)
 
 
 def build_panoptic_lut(num_classes, max_instances=64, alpha=180):

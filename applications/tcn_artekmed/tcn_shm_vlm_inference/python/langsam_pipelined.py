@@ -22,7 +22,8 @@ import holoscan as hs
 from holoscan.core import Operator, OperatorSpec
 
 from langsam_common import (
-    SAM, GDINO, GDinoTrtDetector, class_id_map, build_panoptic_map, worker_engine_path,
+    SAM, GDINO, GDinoTrtDetector, class_id_map, build_panoptic_map, build_panoptic_map_auto,
+    worker_engine_path,
 )
 # Shared with langsam_multicam_fragment.py so the output-key convention can't drift between the
 # monolithic and split ops; imported directly (not via langsam_common's re-export list).
@@ -289,6 +290,7 @@ class PanopticOp(Operator):
         self.device = device if isinstance(device, torch.device) else torch.device(f"cuda:{int(device)}")
         self.prompts = list(prompts)
         self._cmap = class_id_map(self.prompts)
+        self.panoptic_backend = langsam_cfg.get("panoptic_backend", "cupy")
         self._stream_checked = False
         super().__init__(fragment, *args, **kwargs)
 
@@ -320,9 +322,9 @@ class PanopticOp(Operator):
             if p["sam_idx"]:
                 torch.cuda.nvtx.range_push("panoptic")
                 for k, i in enumerate(p["sam_idx"]):
-                    pmaps[i] = build_panoptic_map(
+                    pmaps[i] = build_panoptic_map_auto(
                         p["masks"][k], p["sam_labels"][k], p["scores"][k],
-                        self._cmap, hw[0], hw[1], xp=cp)
+                        self._cmap, hw[0], hw[1], backend=self.panoptic_backend)
                 torch.cuda.nvtx.range_pop()
             for i, cam in enumerate(names):
                 out[mask_name(cam)] = hs.as_tensor(cp.ascontiguousarray(pmaps[i]))

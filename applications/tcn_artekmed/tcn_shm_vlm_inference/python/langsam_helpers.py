@@ -139,6 +139,61 @@ def build_panoptic_map(masks, labels, scores, cmap, height, width, xp=np):
     return pmap
 
 
+def plan_panoptic_paint(labels, scores, cmap, xp=np):
+    """(values, priorities) for a fused panoptic paint.
+
+    `values[j]` is the packed `(class_id << 8) | instance_id` for detection j, or 0 when the
+    label is unknown (the paint skips those). `priorities[j]` is j's index in the ascending-score
+    `argsort` order, so LARGER priority wins an overlap -- exactly equivalent to the existing
+    "paint in ascending score order, last write wins", including for tied scores, because argsort
+    indices are unique.
+
+    Host-side bookkeeping only (identical to `build_panoptic_map`'s instance-numbering logic);
+    the actual per-pixel paint is done by `paint_panoptic_np` (numpy model) / the CUDA kernel.
+    Reproduces the existing instance numbering: per class, descending score, instance 1 = most
+    confident, clamped by `PANOPTIC_INSTANCE_MASK`, unknown labels (class id 0) skipped (value 0).
+    """
+    M = len(labels)
+    values = np.zeros(M, dtype=np.uint16)
+    priorities = np.zeros(M, dtype=np.int32)
+    if M == 0:
+        return values, priorities
+    order = xp.argsort(scores)
+    order = [int(i) for i in (order.tolist() if hasattr(order, "tolist") else order)]
+    for priority, j in enumerate(order):            # ascending score -> ascending priority
+        priorities[j] = priority
+    inst_count = {}
+    for j in reversed(order):                        # descending score: number instances
+        cid = class_id_for_label(labels[j], cmap)
+        if cid == 0:
+            values[j] = 0
+            continue
+        inst_count[cid] = inst_count.get(cid, 0) + 1
+        values[j] = (cid << PANOPTIC_CLASS_SHIFT) | min(inst_count[cid], PANOPTIC_INSTANCE_MASK)
+    return values, priorities
+
+
+def paint_panoptic_np(masks, values, priorities, height, width):
+    """Reference for the CUDA kernel: per pixel, the covering detection with the LARGEST priority
+    wins; detections with value 0 never paint. Pure numpy, no cupy.
+    """
+    pmap = np.zeros((height, width), dtype=np.uint16)
+    if masks is None or len(masks) == 0:
+        return pmap
+    best_priority = np.full((height, width), -1, dtype=np.int64)
+    for j in range(len(masks)):
+        v = int(values[j])
+        if v == 0:
+            continue
+        p = int(priorities[j])
+        covered = masks[j] > 0
+        take = covered & (p > best_priority)
+        if np.any(take):
+            pmap[take] = v
+            best_priority[take] = p
+    return pmap
+
+
 def gdino_postprocess(logits, boxes, token_class_ids, num_classes,
                       box_threshold, img_h, img_w, xp=np):
     """Grounding DINO raw outputs -> detections, using a fixed token->class map.
