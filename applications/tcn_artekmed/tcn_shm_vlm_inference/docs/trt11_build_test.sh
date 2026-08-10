@@ -47,6 +47,11 @@ TMP_HOST="${TMP_HOST:-/tmp/tcn}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCH="${SCRIPT_DIR}/patches/holoscan-sdk-4.4.0-trt-major-param.patch"
+# holoinfer does not compile against TRT 11 unmodified: BuilderFlag::kFP16 and
+# kPREFER_PRECISION_CONSTRAINTS were REMOVED (they were deprecated in 10.12). Found by the
+# 2026-08-10 build; two enum constants in one file, guarded the same way the file already guards
+# another TRT deprecation. This is the "does holoinfer survive TRT 11" answer.
+PATCH_HOLOINFER="${SCRIPT_DIR}/patches/holoscan-sdk-4.4.0-holoinfer-trt11.patch"
 LOG_DIR="${LOG_DIR:-${TMP_HOST}/trt11}"
 LOG="${LOG_DIR}/build-$(date +%Y%m%d-%H%M%S).log"
 
@@ -79,23 +84,26 @@ revert_patch() {
   say "Reverting SDK patch (checkout must be left pristine)"
   # `git checkout` rather than `git apply -R`: the sdk stage makes TWO edits (the patch and the
   # ARG-default injection below), and preflight has already asserted Dockerfile was pristine.
-  ( cd "$SDK_DIR" && git checkout -- Dockerfile ) \
+  ( cd "$SDK_DIR" && git checkout -- Dockerfile modules/holoinfer ) \
     && { PATCH_APPLIED=0; info "reverted (git checkout -- Dockerfile)"; } \
-    || printf '\033[1;31mWARNING: could not revert -- run: cd %s && git checkout -- Dockerfile\033[0m\n' "$SDK_DIR"
+    || printf '\033[1;31mWARNING: could not revert -- run: cd %s && git checkout -- Dockerfile modules/holoinfer\033[0m\n' "$SDK_DIR"
 }
 trap revert_patch EXIT INT TERM
 
 stage_preflight() {
   say "Preflight"
   [[ -f "$PATCH" ]] || fail "patch not found: $PATCH"
+  [[ -f "$PATCH_HOLOINFER" ]] || fail "patch not found: $PATCH_HOLOINFER"
   [[ -d "$SDK_DIR/.git" ]] || fail "not a git checkout: $SDK_DIR"
   local sha; sha="$(cd "$SDK_DIR" && git rev-parse HEAD)"
   info "SDK at $sha"
   [[ "$sha" == "$SDK_EXPECTED_SHA" ]] || \
     info "WARNING: SDK is not the commit this patch was generated against ($SDK_EXPECTED_SHA). The patch may not apply."
-  ( cd "$SDK_DIR" && git diff --quiet -- Dockerfile ) || fail "$SDK_DIR/Dockerfile already modified -- refusing to patch on top"
-  ( cd "$SDK_DIR" && git apply --check "$PATCH" ) || fail "patch does not apply cleanly to this SDK checkout"
-  info "patch applies cleanly (checked, not applied)"
+  ( cd "$SDK_DIR" && git diff --quiet -- Dockerfile modules/holoinfer ) \
+    || fail "$SDK_DIR has local modifications to Dockerfile or modules/holoinfer -- refusing to patch on top"
+  ( cd "$SDK_DIR" && git apply --check "$PATCH" "$PATCH_HOLOINFER" ) \
+    || fail "patches do not apply cleanly to this SDK checkout"
+  info "both patches apply cleanly (checked, not applied)"
   command -v docker >/dev/null || fail "docker not found"
   local free; free=$(df -BG --output=avail /var/lib/docker 2>/dev/null | tail -1 | tr -dc '0-9')
   info "free space on /var/lib/docker: ${free:-?} GiB (an SDK + holohub image build wants >100)"
@@ -109,9 +117,9 @@ stage_preflight() {
 
 stage_sdk() {
   say "Building the Holoscan SDK image against TensorRT ${TRT_VERSION}"
-  ( cd "$SDK_DIR" && git apply "$PATCH" ) || fail "git apply failed"
+  ( cd "$SDK_DIR" && git apply "$PATCH" "$PATCH_HOLOINFER" ) || fail "git apply failed"
   PATCH_APPLIED=1
-  info "patch applied to $SDK_DIR/Dockerfile"
+  info "applied: TRT-major parameterisation + holoinfer TRT-11 guards"
 
   # Set the ARG DEFAULT rather than passing --build-arg. `run build_run_image` forwards its
   # arguments to an internal `build`, which hands them to `docker run` -- so --build-arg dies with

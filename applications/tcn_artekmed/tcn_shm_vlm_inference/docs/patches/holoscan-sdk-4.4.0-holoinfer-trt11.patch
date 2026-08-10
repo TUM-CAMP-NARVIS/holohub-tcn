@@ -1,0 +1,44 @@
+--- a/modules/holoinfer/src/infer/trt/utils.cpp
++++ b/modules/holoinfer/src/infer/trt/utils.cpp
+@@ -193,12 +193,22 @@
+   config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, network_options.max_memory);
+ 
+   if (network_options.use_fp16) {
+-    // TensorRT 10.12 deprecated the BuilderFlag::kFP16 flag, but we want to keep the feature
+-    // until it is removed from the API. Therefore disabled the warning.
++    // TensorRT 10.12 deprecated BuilderFlag::kFP16; TensorRT 11 REMOVED it. TRT 11 networks are
++    // strongly typed, so precision is carried by the model rather than set on the builder.
++    // Guarded rather than deleted so TRT 10 keeps the feature, matching the existing
++    // NV_TENSORRT_MAJOR guard further down this function.
++#if NV_TENSORRT_MAJOR < 11
+ #pragma GCC diagnostic push
+ #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+     config->setFlag(nvinfer1::BuilderFlag::kFP16);
+ #pragma GCC diagnostic pop
++#else
++    HOLOSCAN_LOG_WARN(
++        "use_fp16 was requested, but BuilderFlag::kFP16 was removed in TensorRT {}. Networks are "
++        "strongly typed from TensorRT 11 onwards: export the ONNX with FP16 types instead. This "
++        "setting has no effect on the built engine.",
++        NV_TENSORRT_MAJOR);
++#endif
+   }
+   if (network_options.dla_core > -1) {
+     const int32_t available_dla_cores = builder->getNbDLACores();
+@@ -209,12 +219,14 @@
+       return false;
+     }
+     config->setDefaultDeviceType(nvinfer1::DeviceType::kDLA);
+-    // TensorRT 10.12 deprecated the BuilderFlag::kPREFER_PRECISION_CONSTRAINTS flag, but we want
+-    // to keep the feature until it is removed from the API. Therefore disabled the warning.
++    // TensorRT 10.12 deprecated BuilderFlag::kPREFER_PRECISION_CONSTRAINTS; TensorRT 11 REMOVED
++    // it, for the same strongly-typed-network reason as kFP16 above.
++#if NV_TENSORRT_MAJOR < 11
+ #pragma GCC diagnostic push
+ #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+     config->setFlag(nvinfer1::BuilderFlag::kPREFER_PRECISION_CONSTRAINTS);
+ #pragma GCC diagnostic pop
++#endif
+     config->setDLACore(network_options.dla_core);
+     // if requested, enable GPU fallback. If this is not set and a layer is not supported by DLA,
+     // building the engine will fail with an error.
