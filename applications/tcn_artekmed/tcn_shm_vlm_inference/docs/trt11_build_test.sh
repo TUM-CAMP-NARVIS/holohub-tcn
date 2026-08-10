@@ -34,6 +34,9 @@ SDK_EXPECTED_SHA="${SDK_EXPECTED_SHA:-e64af8f270896599ec4c7e53a25acef12dbb3934}"
 HOLOHUB_DIR="${HOLOHUB_DIR:-/home/ecku/develop/holoscan/holohub-tcn}"
 TRT_VERSION="${TRT_VERSION:-11.2}"      # apt-cache madison is grepped for this prefix
 CUDA_MAJOR="${CUDA_MAJOR:-12}"          # 11.2.1.2 ships +cuda12.9 AND +cuda13.3; 12 is the smaller delta
+TRT_FULL="${TRT_FULL:-11.2.1.2}"        # exact apt/pip version for the packaging overlay
+TRT_CUDA_MINOR="${TRT_CUDA_MINOR:-12.9}"  # the +cudaX.Y suffix the TRT packages carry
+TRT11_BASE_IMG="${TRT11_BASE_IMG:-holoscan-trt11:4.4.0-cu${CUDA_MAJOR}}"
 APP_REL="applications/tcn_artekmed/tcn_shm_vlm_inference"
 
 # Engines built here go to a SEPARATE tree. The live TRT 10.9 engines must stay loadable by the
@@ -142,10 +145,36 @@ stage_sdk() {
   ( cd "$SDK_DIR" && HOLOSCAN_CUDA_MAJOR_VERSION="$CUDA_MAJOR" ./run build_image ) 2>&1 | tee -a "$LOG"
   [[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "SDK builder image failed -- check the tensorrt-dev stage output above"
 
-  say "Compiling the SDK + runtime image (this is holoinfer's real TRT-${TRT_VERSION} test)"
-  ( cd "$SDK_DIR" && HOLOSCAN_CUDA_MAJOR_VERSION="$CUDA_MAJOR" ./run build_run_image ) 2>&1 | tee -a "$LOG"
-  [[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "SDK runtime image failed -- if the error is in modules/holoinfer,
-   that is the compatibility answer we came for. Capture it; it is a genuine result, not a script bug."
+  # `./run build` compiles AND installs into install-cu12-x86_64/. This is holoinfer's real
+  # TRT test: at 2026-08-10 it failed here on BuilderFlag::kFP16 / kPREFER_PRECISION_CONSTRAINTS,
+  # which PATCH_HOLOINFER now guards; with that patch all 1080 targets build.
+  say "Compiling + installing the SDK (holoinfer's real TRT-${TRT_VERSION} test)"
+  ( cd "$SDK_DIR" && HOLOSCAN_CUDA_MAJOR_VERSION="$CUDA_MAJOR" ./run build ) 2>&1 | tee -a "$LOG"
+  [[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "SDK compile failed -- if the error is in modules/holoinfer,
+   that is a NEW TRT-${TRT_VERSION} incompatibility beyond the two BuilderFlag enums already patched.
+   Capture it; it is a genuine result, not a script bug."
+
+  # Deliberately NOT `./run build_run_image`: it is broken upstream at v4.4.0 -- it passes
+  # -f ${TOP}/runtime_docker/Dockerfile, but runtime_docker/ was deleted in the v4.0.0 release
+  # commit and is absent from the repo. The compile+install above is unaffected, so we package
+  # the resulting tree ourselves.
+  say "Packaging the rebuilt SDK into a base image (upstream build_run_image is broken at v4.4.0)"
+  local instdir="install-cu${CUDA_MAJOR}-x86_64"
+  [[ -d "$SDK_DIR/$instdir" ]] || fail "$SDK_DIR/$instdir not found -- the compile stage did not install"
+  local hi="$SDK_DIR/$instdir/lib/libholoscan_infer.so.4.4.0"
+  if [[ -f "$hi" ]]; then
+    info "holoinfer links: $(objdump -p "$hi" | grep -oE 'libnvinfer[a-z_]*\.so\.[0-9]+' | sort -u | tr '\n' ' ')"
+  fi
+  run docker build \
+      -f "${SCRIPT_DIR}/patches/Dockerfile.holoscan-trt11" \
+      --build-arg "TRT_VERSION=${TRT_FULL}" \
+      --build-arg "TRT_CUDA_TAG=cuda${TRT_CUDA_MINOR}" \
+      --build-arg "HOST_INSTALL_DIR=${instdir}" \
+      -t "${TRT11_BASE_IMG}" \
+      "$SDK_DIR" \
+    || fail "packaging the TRT ${TRT_VERSION} base image failed"
+  info "built base image: ${TRT11_BASE_IMG}"
+  info "Next: ./trt11_build_test.sh --stage holohub   (BASE_IMG defaults to this image)"
 
   say "Confirming the builder image really has TRT ${TRT_VERSION} (a cached layer would hide it)"
   local bimg; bimg="holoscan-sdk-build-cu${CUDA_MAJOR}-x86_64:latest"
@@ -163,7 +192,8 @@ stage_sdk() {
 
 stage_holohub() {
   say "Building the holohub image on the new base"
-  [[ -n "${BASE_IMG:-}" ]] || fail "set BASE_IMG=<holoscan runtime image:tag> (see the 'sdk' stage output)"
+  BASE_IMG="${BASE_IMG:-$TRT11_BASE_IMG}"
+  info "base image: $BASE_IMG"
   run "$HOLOHUB_DIR/holohub" build --base-img "$BASE_IMG" --cuda "$CUDA_MAJOR" tcn_shm_vlm_inference \
     || fail "holohub image build failed against base $BASE_IMG"
 }
