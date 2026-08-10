@@ -77,9 +77,11 @@ PATCH_APPLIED=0
 revert_patch() {
   [[ $PATCH_APPLIED -eq 1 ]] || return 0
   say "Reverting SDK patch (checkout must be left pristine)"
-  ( cd "$SDK_DIR" && git apply -R "$PATCH" ) \
-    && { PATCH_APPLIED=0; info "reverted"; } \
-    || printf '\033[1;31mWARNING: could not revert %s -- check %s manually\033[0m\n' "$PATCH" "$SDK_DIR"
+  # `git checkout` rather than `git apply -R`: the sdk stage makes TWO edits (the patch and the
+  # ARG-default injection below), and preflight has already asserted Dockerfile was pristine.
+  ( cd "$SDK_DIR" && git checkout -- Dockerfile ) \
+    && { PATCH_APPLIED=0; info "reverted (git checkout -- Dockerfile)"; } \
+    || printf '\033[1;31mWARNING: could not revert -- run: cd %s && git checkout -- Dockerfile\033[0m\n' "$SDK_DIR"
 }
 trap revert_patch EXIT INT TERM
 
@@ -111,21 +113,38 @@ stage_sdk() {
   PATCH_APPLIED=1
   info "patch applied to $SDK_DIR/Dockerfile"
 
-  local ARG="TENSORRT_CU${CUDA_MAJOR}_VERSION=${TRT_VERSION}"
-  # build_image passes trailing args through to `docker build`, so --build-arg reaches the
-  # tensorrt-dev stage. This stage is where a TRT-11 apt resolution failure would surface.
-  run "$SDK_DIR/run" build_image --cuda "$CUDA_MAJOR" --build-arg "$ARG" \
-    || fail "SDK builder image failed. If apt could not resolve TRT ${TRT_VERSION}, check the
-   tensorrt-dev stage output above; if the ARG was rejected, the patch may need to also change
-   the ARG default rather than relying on --build-arg."
+  # Set the ARG DEFAULT rather than passing --build-arg. `run build_run_image` forwards its
+  # arguments to an internal `build`, which hands them to `docker run` -- so --build-arg dies with
+  # "unknown flag" there, and on `build_image` it silently failed to override (the first attempt
+  # produced a TRT 10.3 image, the default). Editing the default sidesteps the CLI entirely.
+  local ARGLINE="TENSORRT_CU${CUDA_MAJOR}_VERSION"
+  # Replace the WHOLE line: the original carries a trailing comment ("TRT 10.3 is the last
+  # version that supports CUDA 12 on sbsa 22.04") that would be stale and misleading against a
+  # bumped value, and anyone inspecting the checkout mid-build should see this is temporary.
+  run sed -i -E "s|^ARG ${ARGLINE}=.*|ARG ${ARGLINE}=${TRT_VERSION}  # TEMPORARY (trt11_build_test.sh) -- reverted on exit|" \
+      "$SDK_DIR/Dockerfile" || fail "could not set ${ARGLINE} default"
+  local got; got=$(grep -E "^ARG ${ARGLINE}=" "$SDK_DIR/Dockerfile")
+  info "Dockerfile now has: ${got}"
+  [[ "$got" == *"=${TRT_VERSION}"* ]] || fail "ARG default not applied: ${got}"
 
-  # This compiles the SDK -- including holoinfer -- against TRT 11. It is THE compatibility test:
-  # holoinfer uses only enqueueV3/setTensorAddress, none of the binding API removed in TRT 11,
-  # so it is expected to compile, but that is an inspection, not a proof.
-  say "Compiling the SDK + building the runtime image (this is holoinfer's real TRT-11 test)"
-  run "$SDK_DIR/run" build_run_image --cuda "$CUDA_MAJOR" --build-arg "$ARG" \
-    || fail "SDK runtime image failed -- if the error is in modules/holoinfer, that is the
-   compatibility answer we came for. Capture it; it is a genuine result, not a script bug."
+  # ./run must execute with CWD inside the SDK checkout: it derives image tags from `git rev-parse`
+  # in the CURRENT directory, so running it from elsewhere tagged the image with holohub's sha.
+  # CUDA major goes through the documented env var, avoiding option-ordering ambiguity.
+  say "Building the SDK builder image (this is where TRT ${TRT_VERSION} apt resolution is proven)"
+  ( cd "$SDK_DIR" && HOLOSCAN_CUDA_MAJOR_VERSION="$CUDA_MAJOR" ./run build_image ) 2>&1 | tee -a "$LOG"
+  [[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "SDK builder image failed -- check the tensorrt-dev stage output above"
+
+  say "Compiling the SDK + runtime image (this is holoinfer's real TRT-${TRT_VERSION} test)"
+  ( cd "$SDK_DIR" && HOLOSCAN_CUDA_MAJOR_VERSION="$CUDA_MAJOR" ./run build_run_image ) 2>&1 | tee -a "$LOG"
+  [[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "SDK runtime image failed -- if the error is in modules/holoinfer,
+   that is the compatibility answer we came for. Capture it; it is a genuine result, not a script bug."
+
+  say "Confirming the builder image really has TRT ${TRT_VERSION} (a cached layer would hide it)"
+  local bimg; bimg="holoscan-sdk-build-cu${CUDA_MAJOR}-x86_64:latest"
+  run docker run --rm --entrypoint bash "$bimg" -lc \
+    'dpkg -l | grep -E "^ii  libnvinfer[0-9]" | awk "{print \$2, \$3}"' \
+    || info "WARNING: could not inspect $bimg"
+  info "EXPECT libnvinfer${TRT_VERSION%%.*} at ${TRT_VERSION}.x. If it says 10.3, the ARG default did not take."
 
   say "Runtime image tags"
   run docker images --format '{{.Repository}}:{{.Tag}}  {{.CreatedSince}}' \
