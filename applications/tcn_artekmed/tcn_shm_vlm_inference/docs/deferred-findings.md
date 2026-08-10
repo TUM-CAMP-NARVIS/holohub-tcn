@@ -10,8 +10,12 @@ fixed were dropped rather than carried forward. If you fix one, delete its entry
 Not repeated here (they have their own homes):
 
 - The **TRT 10.9 confidence-score depression** — boxes right (IoU ~0.964), scores 0.52 vs
-  PyTorch's 0.889. The likeliest cause of corner-case detection misses. See
-  [`specs/2026-08-04-gdino-batched-inference-design.md`](./specs/2026-08-04-gdino-batched-inference-design.md).
+  PyTorch's 0.889. **DIAGNOSED, not yet fixed (2026-08-10):** it is a TensorRT 10.9 defect that
+  TensorRT 11.2 fixes exactly — same ONNX, same TF32 settings, TRT 11.2 matches PyTorch exactly
+  (top score |d| = 0.000, top-box IoU 1.0000) where TRT 10.9 depresses the score by |d| = 0.384.
+  Still present in the shipped image; the fix is a TRT-major-version upgrade to the SDK image, not
+  yet done. See
+  [`specs/2026-08-10-tensorrt-upgrade-assessment.md`](./specs/2026-08-10-tensorrt-upgrade-assessment.md).
 - The remaining **performance levers** (stage pipelining, the SAM decode loop) — see
   [`optimization-playbook.md`](./optimization-playbook.md) §4 and
   [`specs/2026-08-05-per-worker-engines-design.md`](./specs/2026-08-05-per-worker-engines-design.md).

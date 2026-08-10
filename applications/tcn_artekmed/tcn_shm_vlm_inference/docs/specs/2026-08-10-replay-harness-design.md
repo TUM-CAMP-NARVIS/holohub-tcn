@@ -146,8 +146,10 @@ toggle precedent: opt-in, one config line, instantly revertible.
 ### 2.2 Mask dump
 
 A small `MaskDumpOp` in the app (not in `operators/` — it is harness-specific) that takes the
-collector's mask map and writes `<out_dir>/frame<NNNNNN>_<camera>.npy` per camera per tick, using
-the replayer's true source frame number.
+collector's mask map and writes `<out_dir>/frame<NNNNNN>_<camera>.npy` per camera per tick, labelled
+by **arrival index** — the order in which mask maps actually reach `MaskDumpOp`, not the replayer's
+live `frame_index`. See §Results for what this corrected and why it mattered;
+`index_manifest.tsv` in `<out_dir>` records the arrival-index -> source-frame mapping.
 
 Panoptic maps are packed integers (`class << 8 | instance`), so `.npy` round-trips them exactly and
 comparison needs no tolerance on the container side.
@@ -188,6 +190,35 @@ Deterministic on both sides, so a difference means the change did it.
 | `source: "shm"` unchanged | container | live path untouched |
 | replayer emits BGR | container | dump one frame, compare against the reader's array reversed on axis −1 |
 | replay is deterministic | container | two identical runs → `compare_mask_dumps` exact-equal. **This is the harness's own gate: if it cannot reproduce itself, it cannot gate anything.** |
+
+## Results
+
+**Self-consistency (2026-08-10).** Two identical dataset runs, 16 dumps each, compared with
+`compare_mask_dumps.py` in exact mode: **0 of 50,331,648 pixels differing, instance counts
+identical.** This is the check §Testing calls "the harness's own gate: if it cannot reproduce
+itself, it cannot gate anything" — it passed. The harness can be used to gate other changes.
+
+Determinism held under looping too: with `loop: true`, the same source frame on its second pass
+through produced bit-identical output — `frame000000` and `frame000006` showed identical diff
+counts throughout the comparison.
+
+**MaskDumpOp arrival-index correction.** §2.2's dumps were originally labelled with the replayer's
+live `frame_index` attribute. That is wrong: `frame_index` advances as the replayer *emits* frames,
+but a mask map reaches `MaskDumpOp` several ticks later, after gdino/sam/panoptic have processed
+it — the replayer's live counter runs roughly 2 frames ahead of the mask that is actually arriving.
+So a file named `frame000006_camera01.npy` was not frame 6's mask; it was an earlier frame's mask
+carrying the replayer's *current* position as its label.
+
+This is dangerous rather than cosmetic: the offset **equals pipeline latency**, and pipeline latency
+is not a constant — it varies with configuration (monolithic vs pipelined, batch size, stage count).
+Two runs of the *same* configuration can get the same offset by construction and appear to agree,
+hiding the bug; two runs of *different* configurations would silently compare mismatched frames
+while the matching filenames imply alignment.
+
+The fix: dumps are now labelled by **arrival index** — the order in which mask maps actually reach
+`MaskDumpOp` — and `index_manifest.tsv` is written alongside them recording the arrival-index ->
+source-frame mapping, so the true frame number stays recoverable without the comparison depending
+on it.
 
 ## Risks
 

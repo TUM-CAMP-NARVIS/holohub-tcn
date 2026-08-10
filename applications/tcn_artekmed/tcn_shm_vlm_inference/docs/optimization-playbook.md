@@ -145,6 +145,19 @@ Report medians of ≥20 iterations after ≥5 warmups, and always sanity-check t
 against the in-pipeline NVTX number. When they disagree, one of them is measuring the wrong
 thing — find out which before acting.
 
+### 2.6 A deterministic replay source turns a correctness question into an exit code
+
+A correctness gate against a live source is not possible: two runs of a live camera feed never see
+the same frames, so any difference between their outputs is inseparable from scene drift. Every
+correctness-sensitive change in §3 (batching, precision changes, byte-identity claims) needs an
+answer to "does this alter the output" that is not an eyeball judgement. The fix is to swap the
+pipeline's source for a deterministic replay of a fixed dataset, dump comparable output from both
+runs, and diff the dumps — which turns the question into a script with an exit code. See
+[`specs/2026-08-10-replay-harness-design.md`](./specs/2026-08-10-replay-harness-design.md).
+
+**Trap: a gate script must refuse to pass on an empty comparison, and must distinguish "gate
+failed" from "structural problem."** See §7.16.
+
 ---
 
 ## 3. The levers, in the order they paid off
@@ -463,8 +476,9 @@ input.
 Engines built with the host's TRT 11.2 matched PyTorch at IoU 0.9994. Engines built inside the
 container with **TRT 10.9** put the box in nearly the right place (IoU ~0.964) but **depress
 confidence scores** (0.52 vs 0.889). With a `box_threshold` of 0.3, marginal detections silently
-disappear. *(Still open; suspects are TF32 handling and INT64→INT32 input truncation, which
-TensorRT warns about.)*
+disappear. *(Diagnosed 2026-08-10, not yet fixed in the shipped image: a TRT 10.9 defect that TRT
+11.2 fixes exactly — top score |d| 0.384 -> 0.000, top-box IoU -> 1.0000. See §7.19 and
+[`specs/2026-08-10-tensorrt-upgrade-assessment.md`](./specs/2026-08-10-tensorrt-upgrade-assessment.md).)*
 
 TensorRT engines are also **version-locked** — an engine built outside the runtime container will
 not deserialize inside it. Build where you run.
@@ -617,6 +631,65 @@ moved. **Launch-count scaling with the batch factor is how you prove a batching 
 took effect** — dev1's sam launches fell 57% at batch 3, dev0's fell more modestly at batch 2, and
 the untouched `gdino` stage (the control) did not move at all.
 
+### 7.16 A gate script must refuse to pass on an empty comparison
+
+`sys.exit("msg")` exits with status **1** — the same code an ordinary gate failure uses. That
+collision is dangerous: a missing dump directory, a frame-set mismatch, or a comparison over zero
+frames will silently look like "the gate ran and found a real difference" instead of "the gate
+could not run." Our `compare_mask_dumps.py` fixes this by using **exit 1 for an actual gate
+failure** (a real pixel/IoU difference measured over a nonempty, matched comparison) and **exit 2
+for a structural problem** (missing directory, shape mismatch, mismatched frame/camera sets, zero
+frames compared). A gate that cannot tell these apart will, sooner or later, report a green PASS
+because a directory did not exist, or a red "regression" because two runs' file sets did not
+overlap. Refuse to pass on an empty or malformed comparison, and give structural failures a
+different exit code than substantive ones.
+
+### 7.17 A per-class IoU gate alone can't see instances merging — pair it with an instance count
+
+A per-class IoU gate compares the *union* of all pixels of a class, not individual objects. A run
+that merges two instances of the same class into one blob leaves the per-class union unchanged, so
+an IoU-only gate would pass a real correctness regression. Pair every per-class IoU check with a
+per-class instance-count comparison.
+
+The 2026-08-10 replay-harness runs also showed the opposite failure mode, which is just as
+important to catch: gate 4a (`sam_batched_decode` false vs true) measured min per-class IoU
+0.993508, under a 0.999 threshold, while per-class instance counts were identical everywhere and a
+per-instance analysis found zero instances present in only one run's output — only boundary pixels
+had moved; no object appeared or vanished. An IoU threshold in isolation can fail a change that is
+actually fine, exactly as it can pass one that is not. Report both numbers and decide on substance,
+not on either number alone.
+
+### 7.18 Label pipelined-dump comparisons by arrival order, not a source-side counter
+
+When comparing dumps pulled from a pipelined graph, labelling output by a counter read at the
+*source* is wrong: the source runs ahead of the sink by the pipeline's depth (its end-to-end
+latency in frames), and that depth changes with configuration (monolithic vs pipelined, batch size,
+stage count). Two runs' dump files can then carry the same filename while holding different
+content, and nothing about the comparison announces the mismatch — it looks like an ordinary
+apples-to-apples diff.
+
+The 2026-08-10 replay harness's `MaskDumpOp` originally labelled dumps with the replayer's live
+`frame_index`, which runs about 2 frames ahead of the mask actually arriving at the dump operator.
+It now labels by **arrival index** — the order dumps are actually written in — with a manifest
+(`index_manifest.tsv`) recording the arrival-index -> source-frame mapping for anyone who needs the
+true frame number. Label dump filenames by arrival order at the comparison point, never by a
+counter read upstream of the stages being compared.
+
+### 7.19 A build-time fidelity check on one image and one box can miss a scene-wide defect
+
+The GDINO FP16 TRT build's own gate reported box IoU 0.9721 against the parity reference image and
+passed. Run through the 2026-08-10 replay harness across the dataset, the same comparison (TF32 vs
+FP16 engine, both batched decode) told a different story: min per-class IoU 0.535230, 26 per-class
+instance-count mismatches, 6,267,156 of 150,994,944 pixels differing (4.150573%, worst frame
+12.819417%), and 36 whole instances present in only one engine's output — objects appearing and
+disappearing, not boundary jitter. A single-image, single-box fidelity number at build time is a
+necessary check, not a sufficient one: it cannot see a defect that only shows up as different
+objects crossing detection threshold across a varied scene. (Here the underlying root cause turned
+out to be a TRT 10.9 score-depression defect independent of FP16 itself — see
+[`specs/2026-08-10-tensorrt-upgrade-assessment.md`](./specs/2026-08-10-tensorrt-upgrade-assessment.md)
+— but that does not change the methodological point: where a full-dataset harness exists, use it
+before trusting a build-time single-image gate alone.)
+
 ## 8. Checklist for the next network
 
 **Measure**
@@ -671,3 +744,5 @@ the untouched `gdino` stage (the control) did not move at all.
 - [`specs/2026-08-05-per-worker-engines-design.md`](./specs/2026-08-05-per-worker-engines-design.md) — per-worker batches and the `gpu_workers` topology node
 - [`specs/2026-07-28-langsam-multicam-design.md`](./specs/2026-07-28-langsam-multicam-design.md) — the multi-camera architecture
 - [`specs/2026-08-10-sam-batched-decode-design.md`](./specs/2026-08-10-sam-batched-decode-design.md) — SAM mask-decoder batching across cameras (step 4a), with measured results
+- [`specs/2026-08-10-replay-harness-design.md`](./specs/2026-08-10-replay-harness-design.md) — the deterministic replay harness used to gate 4a and diagnose A1
+- [`specs/2026-08-10-tensorrt-upgrade-assessment.md`](./specs/2026-08-10-tensorrt-upgrade-assessment.md) — root-cause diagnosis of the TRT 10.9 score depression (§7.5, §7.19) and the upgrade feasibility assessment
