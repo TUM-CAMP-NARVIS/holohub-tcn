@@ -61,8 +61,16 @@ RUN apt-get update \
 # rather than going through holoinfer), so they must move in lockstep with the C++ libraries --
 # otherwise engines would be built by one major and loaded by another, which fails with
 # "Serialization assertion stdVersionRead == kSERIALIZATION_VERSION".
-RUN python3 -m pip install --no-cache-dir --break-system-packages "tensorrt==${TRT_VERSION}" \
-    || python3 -m pip install --no-cache-dir "tensorrt==${TRT_VERSION}"
+#
+# Install tensorrt-cu12, NOT the bare `tensorrt` meta-package. `pip install tensorrt==11.2.1.2`
+# resolves to tensorrt_cu13 -- the CUDA 13 variant -- inside this CUDA 12 image. Observed
+# 2026-08-10: it uninstalled tensorrt 10.9, spent minutes building a 3.8 GB tensorrt_cu13_libs
+# wheel, and left NO importable `tensorrt` module at all (only dist-info), so the image was
+# broken in a way that a laxer verification step would have shipped.
+ARG TRT_PIP_PKG=tensorrt-cu12
+RUN python3 -m pip install --no-cache-dir --break-system-packages \
+        "${TRT_PIP_PKG}==${TRT_VERSION}" \
+    || python3 -m pip install --no-cache-dir "${TRT_PIP_PKG}==${TRT_VERSION}"
 
 # Holoscan itself, rebuilt against TRT 11 (this is what makes libholoscan_infer need .so.11).
 COPY ${HOST_INSTALL_DIR}/ /opt/nvidia/holoscan/
@@ -79,7 +87,14 @@ RUN set -e; \
       *".so.11"*) echo "OK: holoinfer links TensorRT 11" ;; \
       *) echo "ERROR: holoinfer does not link TensorRT 11 (${need}) -- the install tree was not rebuilt" >&2; exit 1 ;; \
     esac; \
-    python3 -c "import tensorrt as t; assert t.__version__.startswith('11.'), t.__version__"
+    python3 -c "import tensorrt as t; assert t.__version__.startswith('11.'), t.__version__"; \
+    python3 -c "import tensorrt_libs, os; p=os.path.dirname(tensorrt_libs.__file__); \
+      libs=sorted(os.listdir(p)); print('tensorrt_libs:', [l for l in libs if 'nvinfer.so' in l]); \
+      assert any('libnvinfer.so.11' in l for l in libs), libs"; \
+    python3 -c "import importlib.metadata as m; \
+      d=[x for x in m.distributions() if (x.metadata['Name'] or '').startswith('tensorrt')]; \
+      names=sorted((x.metadata['Name'] or '') for x in d); print('tensorrt dists:', names); \
+      assert not any('cu13' in n for n in names), f'CUDA 13 TensorRT in a CUDA 12 image: {names}'"
 
 ARG FINAL_USER=holoscan
 USER ${FINAL_USER}
