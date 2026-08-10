@@ -326,13 +326,25 @@ def image_independence_gate(ser, text, img, batch, min_rel_diff=1e-3):
     print(f"image-independence gate OK (mirrored input changed logits by {rel:.3e})")
 
 
-def slice_consistency_gate(slices, min_iou=0.999, max_score_delta=0.01):
+def slice_consistency_gate(slices, min_iou=0.999, max_score_delta=0.01,
+                           onnx_path=None, fp16=False):
     """BLOCKING. Every slice of a batched run must agree with slice 0.
 
     This is the check that proves batching is correct. The engine's batch is baked at trace
     time, and the failure mode of getting that wrong is silently wrong output on slices
     1..N-1 -- which looks like random per-camera detection dropouts, not like a crash.
     Identical inputs, so the bar is tight (measured 0.999611 on a good engine).
+
+    There are TWO distinct causes of failure and they need different remedies, so
+    `onnx_path`/`fp16` are used to tailor the message:
+
+    * A traced-batch mismatch (the ONNX was traced at a different batch than requested).
+      Re-exporting at the right batch fixes it. This is the only cause possible at TF32.
+    * Precision-induced slice variance. At reduced precision TRT may pick a tactic whose
+      tiling spans slices, so a slice's result depends on its batch position. Re-exporting
+      CANNOT fix this -- the graph is already correct -- and telling the user to re-export
+      wastes a long host-side export that fails identically. Observed 2026-08-10: batch 2
+      FP16 was slice-exact (IoU 1.000000) while batch 3 FP16 gave IoU 0.998016.
     """
     if len(slices) < 2:
         print("slice-consistency gate: batch 1, nothing to compare")
@@ -344,11 +356,46 @@ def slice_consistency_gate(slices, min_iou=0.999, max_score_delta=0.01):
         ds = abs(float(s) - float(s0))
         worst_iou, worst_ds = min(worst_iou, iou), max(worst_ds, ds)
         if iou < min_iou or ds > max_score_delta:
+            # Name only the arm(s) that actually failed; reporting both reads as if both did.
+            failed = []
+            if iou < min_iou:
+                failed.append(f"IoU {iou:.6f} < {min_iou}")
+            if ds > max_score_delta:
+                failed.append(f"|score delta| {ds:.6f} > {max_score_delta}")
+            if fp16:
+                remedy = (
+                    f"CAUSE: this is an FP16 build, so the likely cause is precision-induced\n"
+                    f"slice variance -- at reduced precision TRT can pick a tactic whose tiling\n"
+                    f"spans batch slices, making a slice's result depend on its position.\n"
+                    f"Re-exporting will NOT help: the ONNX\n"
+                    f"  {onnx_path or '<unknown>'}\n"
+                    f"is already traced at batch {len(slices)}, so a re-export reproduces an\n"
+                    f"identical graph and fails identically. Options, in order:\n"
+                    f"  1. Build this batch at TF32 (drop --fp16); TF32 has been slice-exact here.\n"
+                    f"     Engines of both precisions coexist, so per-batch precision is a\n"
+                    f"     config choice, not an all-or-nothing one.\n"
+                    f"  2. Decide whether this deviation matters END TO END rather than at the\n"
+                    f"     tensor level: build it, then A/B the masks with the replay harness\n"
+                    f"     (docs/compare_mask_dumps.py --iou-gate). For scale, the TRT-vs-PyTorch\n"
+                    f"     deviation already shipping is ~100x larger than a 0.998 slice IoU.\n"
+                    f"     If you take this route, record the harness result -- do NOT just widen\n"
+                    f"     min_iou, which would disable the gate for the traced-batch bug too.\n"
+                    f"  3. Try a different batch size (an even batch may tile slice-independently)."
+                )
+            else:
+                remedy = (
+                    f"CAUSE: most likely a traced-batch mismatch -- the ONNX\n"
+                    f"  {onnx_path or '<unknown>'}\n"
+                    f"must be traced at batch {len(slices)}, and the traced batch IS the engine's\n"
+                    f"batch. Re-export with --batch {len(slices)} and rebuild."
+                )
             raise SystemExit(
-                f"SLICE CONSISTENCY GATE FAILED at slice {i}/{len(slices)}: IoU {iou:.6f} "
-                f"(need >= {min_iou}), |score delta| {ds:.6f} (need <= {max_score_delta}).\n"
+                f"SLICE CONSISTENCY GATE FAILED at slice {i}/{len(slices)}: "
+                f"{', '.join(failed)}.\n"
+                f"measured both arms: IoU {iou:.6f} (need >= {min_iou}), "
+                f"|score delta| {ds:.6f} (need <= {max_score_delta})\n"
                 f"The engine gives different answers for identical inputs across the batch, so "
-                f"batching is NOT safe with it. Re-export with --batch {len(slices)} and rebuild.")
+                f"batching is NOT safe with it.\n\n{remedy}")
     print(f"slice-consistency gate OK (batch {len(slices)}: worst IoU {worst_iou:.6f}, "
           f"worst |score delta| {worst_ds:.6f})")
 
@@ -518,7 +565,7 @@ def stage_build(args, H, W, onnx_path, engine_path, npz_path, ref_path, batch):
         # Order matters: image-independence first. It is the one gate immune to the container's
         # TRT-vs-PyTorch score deviation, so a stale-cache trace cannot hide behind it.
         image_independence_gate(ser, text, ref_img, int(batch))
-        slice_consistency_gate(slices)
+        slice_consistency_gate(slices, onnx_path=onnx_path, fp16=bool(args.fp16))
         fidelity_report(slices[0], s_pt, b_pt, ref_image_path, min_iou=args.min_iou,
                         min_detect=args.min_detect, strict=args.strict_parity)
         os.replace(tmp_engine, engine_path)
