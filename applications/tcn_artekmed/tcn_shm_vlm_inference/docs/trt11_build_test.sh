@@ -23,6 +23,9 @@
 # Usage:
 #   ./trt11_build_test.sh                 # full sequence
 #   ./trt11_build_test.sh --stage verify  # just one stage
+#
+# Stage order: preflight -> sdk -> verify -> engines -> gate. The `holohub` stage is OPTIONAL --
+# the sdk stage's overlay is built on the existing HoloHub image, so it is already runnable.
 #   ./trt11_build_test.sh --dry-run       # print the commands, run nothing
 #   TRT_VERSION=11.1 ./trt11_build_test.sh
 #
@@ -200,7 +203,11 @@ stage_holohub() {
 
 stage_verify() {
   say "Verifying the new image: TRT version, holoinfer soname, InferenceOp"
-  [[ -n "${TEST_IMG:-}" ]] || fail "set TEST_IMG=<holohub image:tag> built by the 'holohub' stage"
+  # The sdk stage's overlay is built ON the HoloHub image, so it is directly runnable and is the
+  # default test image; the separate `holohub` stage is only needed if you want a clean rebuild
+  # of HoloHub on a bare Holoscan base.
+  TEST_IMG="${TEST_IMG:-$TRT11_BASE_IMG}"
+  info "test image: $TEST_IMG"
   run docker run --rm --gpus all "$TEST_IMG" bash -lc '
     set -e
     echo "python tensorrt : $(python3 -c "import tensorrt as t;print(t.__version__)")"
@@ -215,7 +222,8 @@ stage_verify() {
 
 stage_engines() {
   say "Rebuilding GDINO + SAM engines against TensorRT ${TRT_VERSION}"
-  [[ -n "${TEST_IMG:-}" ]] || fail "set TEST_IMG=<holohub image:tag>"
+  TEST_IMG="${TEST_IMG:-$TRT11_BASE_IMG}"
+  info "test image: $TEST_IMG"
   mkdir -p "$ENGINE_OUT_HOST/active/groundingdino" "$ENGINE_OUT_HOST/active/sam2"
   # Seed the precision-neutral inputs the build stage reads (ONNX + prompts + parity ref).
   for f in gdino_swint_512x672_b2_tf32.onnx gdino_swint_512x672_b3_tf32.onnx \
@@ -243,7 +251,8 @@ stage_engines() {
 
 stage_gate() {
   say "Harness run against the TRT ${TRT_VERSION} engines"
-  [[ -n "${TEST_IMG:-}" ]] || fail "set TEST_IMG=<holohub image:tag>"
+  TEST_IMG="${TEST_IMG:-$TRT11_BASE_IMG}"
+  info "test image: $TEST_IMG"
   local cfg="${TMP_HOST}/gates/trt11.yaml"
   mkdir -p "${TMP_HOST}/gates" "${TMP_HOST}/harness"
   python3 - "$HOLOHUB_DIR/${APP_REL}/python/tcn_shm_vlm_inference.yaml" "$cfg" <<'PY'
