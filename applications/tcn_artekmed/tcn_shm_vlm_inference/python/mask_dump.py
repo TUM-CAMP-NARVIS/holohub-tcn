@@ -60,11 +60,9 @@ class MaskDumpOp(Operator):
             os.makedirs(self.out_dir, exist_ok=False)
 
         if self.frame_source is None:
-            log.warning(
-                'MaskDumpOp: no frame_source given -- dumping with an internal tick counter. '
-                'This is correct for source: "shm" (no dataset frame number exists there). If '
-                'this is source: "dataset", dump filenames will be WRONG whenever the '
-                'replayer loops -- pass frame_source=<the replayer op> instead.'
+            log.info(
+                "MaskDumpOp: no frame_source given -- index_manifest.tsv will not be written. "
+                "Dump filenames are unaffected: they are always the arrival index (see compute)."
             )
 
         super().__init__(fragment, *args, **kwargs)
@@ -75,16 +73,33 @@ class MaskDumpOp(Operator):
     def compute(self, op_input, op_output, context):
         msg = op_input.receive("masks")
 
-        if self.frame_source is not None:
-            frame_number = self.frame_source.frame_index
-            if frame_number is None:
-                # Should not happen once the replayer has emitted at least once, but skip
-                # rather than mislabel a dump with a bogus frame number.
-                log.warning("MaskDumpOp: frame_source.frame_index is None; skipping this tick")
-                return
-        else:
-            frame_number = self._tick
+        # Label by ARRIVAL INDEX, not by the replayer's current frame_index.
+        #
+        # The replayer is several frames ahead of the masks arriving here: the pipeline holds
+        # ~2 frames in flight, so reading `frame_source.frame_index` at this moment labels
+        # frame 0's masks as "frame 2". Measured 2026-08-10: a 6-frame run produced dumps
+        # named frame000002..frame000005 -- an offset, not a lost tail.
+        #
+        # That is not merely cosmetic. The offset equals the pipeline latency, which CHANGES
+        # with configuration (sam_batched_decode and FP16 engines both alter timing). Two runs
+        # could each emit four files named 2..5 holding DIFFERENT source frames, and
+        # compare_mask_dumps.py would then compare mismatched content and report a confident
+        # pass or fail. Labelling by arrival index is safe instead: the collector emits one
+        # message per tick in source order, so index i is the i-th completed frame in BOTH
+        # runs, and if the two runs complete different numbers of frames the compare script's
+        # structural check fails loudly (exit 2) instead of comparing the wrong pairs.
+        #
+        # `frame_source.frame_index` is still recorded, in index_manifest.tsv, so a dump can be
+        # traced back to its source frame for diagnosis without being load-bearing for the gate.
+        frame_number = self._tick
         self._tick += 1
+        if self.frame_source is not None:
+            src = self.frame_source.frame_index
+            with open(os.path.join(self.out_dir, "index_manifest.tsv"), "a") as mf:
+                if frame_number == 0:
+                    mf.write("arrival_index\treplayer_frame_index\tloop_count\n")
+                mf.write(f"{frame_number}\t{src}\t"
+                         f"{getattr(self.frame_source, 'loop_count', '')}\n")
 
         for name in sorted(msg.keys()):
             camera_id = name[: -len(_MASK_SUFFIX)] if name.endswith(_MASK_SUFFIX) else name
