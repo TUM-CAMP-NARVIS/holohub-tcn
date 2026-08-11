@@ -114,29 +114,45 @@ That `[OK]` with `|d|` near zero is the whole point of the upgrade. Under TRT 10
 
 ## Step 4 — point the model mount at the new tree
 
-**This is the step whose omission produces the 243-vs-239 error.** In your `run_*.sh`:
+**This is the step whose omission produces the 243-vs-239 error.** In your `run_*.sh`, one line:
 
 ```diff
 - --mount type=bind,src=/data/models,dst=/srv/models
 + --mount type=bind,src=/data/models_trt11,dst=/srv/models
-+ --mount type=bind,src=/data/models,dst=/data/models,readonly
 ```
 
-The second mount is required, not optional: `/data/models_trt11` holds the rebuilt engines plus
-**absolute symlinks** back into `/data/models` for the large read-only inputs (SAM configs and 1.6 GB
-of checkpoints, the DA ONNX files, dinov3). Without it those symlinks dangle and startup fails on a
-missing `sam2.1_hiera_t.yaml`.
+That is the *only* mount change needed. `/data/models_trt11` is **self-contained**: the rebuilt
+engines are real files, and everything else (SAM configs, the `.pt` checkpoints, the DA and dinov3
+trees) is **hardlinked** from `/data/models`. Both live on the same filesystem, so the hardlinks cost
+no additional disk — `du` reports ~13 GB for the tree but the blocks are shared, and `stat` shows
+`links=2`.
+
+Hardlinks rather than symlinks on purpose: absolute symlinks pointing into `/data/models` dangle
+inside the container unless that path is *also* mounted, which cost two failed startups
+(`No such file or directory: .../sam2.1_hiera_t.yaml`) before being made self-contained. If you
+rebuild this tree from scratch, use `cp -al` for the shared trees, not `ln -s`.
 
 Tree layout:
 
 ```
 /data/models_trt11/active/
-├── groundingdino/   real: TRT 11 engines + reused ONNX/npz
-├── sam2/            real: TRT 11 engine; symlinks: configs/, *.pt
-├── depth_anything_v2 -> /data/models/active/depth_anything_v2
-├── depth_anything_v3 -> /data/models/active/depth_anything_v3
-├── dinov3            -> ...
-└── sam2_trt_inference-> ...
+├── groundingdino/         TRT 11 engines (real) + reused ONNX/npz
+├── sam2/                  TRT 11 engine (real), configs/ copied, *.pt hardlinked
+├── depth_anything_v2/     hardlinked from /data/models
+├── depth_anything_v3/     hardlinked
+├── dinov3/                hardlinked
+└── sam2_trt_inference/    hardlinked
+```
+
+Verify before running the app — this catches the whole class of problem in one command:
+
+```bash
+docker run --rm -v /data/models_trt11:/srv/models --entrypoint bash holoscan-trt11:4.4.0-cu12 -c '
+for p in active/groundingdino/gdino_swint_512x672_b2_tf32.engine \
+         active/sam2/sam2.1_hiera_tiny_encoder_b2_fp16.engine \
+         active/sam2/configs/sam2.1/sam2.1_hiera_t.yaml \
+         active/sam2/sam2.1_hiera_tiny.pt ; do
+  [ -e "/srv/models/$p" ] && echo "OK   $p" || echo "MISS $p"; done'
 ```
 
 ## Step 5 — verify
@@ -198,3 +214,4 @@ Recorded so they are not rediscovered:
 | `fatal: destination path 'pybind11' already exists` | non-idempotent step in HoloHub's Dockerfile (fixed) |
 | slang `unzip` prompting, then `ln -s` failing | same class (fixed) |
 | 243-vs-239 serialization error | step 4 — the model mount still points at `/data/models` |
+| `No such file: .../sam2.1_hiera_t.yaml` under the new tree | absolute symlinks into `/data/models` dangling in the container; the tree is now hardlinked and self-contained (step 4) |
