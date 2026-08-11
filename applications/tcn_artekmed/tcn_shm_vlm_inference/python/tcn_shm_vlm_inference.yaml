@@ -32,6 +32,7 @@ dataset_source:
 # camera_stream_processing.enable_langsam_multicam: true. See
 # docs/compare_mask_dumps.py and design doc §2.2.
 mask_dump_dir: ""
+#mask_dump_dir: "/srv/tmp/harness/bd_on"
 
 shared_memory:
   stream_name: "camera_streams"
@@ -125,6 +126,7 @@ gpu_workers:
       cameras: ["camera01_colorimage", "camera02_colorimage"]
     - device: 1
       cameras: ["camera03_colorimage", "camera04_colorimage", "camera05_colorimage"]
+#      cameras: ["camera03_colorimage", "camera04_colorimage"]
 
   # -- 4-camera profile (needs batch-2 engines only) --
   # workers:
@@ -164,12 +166,12 @@ langsam_inference:
   # device sync PER DETECTION (~45 syncs/tick measured, 28.5 ms wall for ~3 ms of real GPU
   # work); "cuda" removes that. Falls back to "cupy" with a loud WARNING if the compiled
   # extension (operators/tcn_artekmed/tcn_panoptic_map) is missing.
-  panoptic_backend: "cupy"
+  panoptic_backend: "cuda"
   # Decode all of a worker's cameras' boxes in ONE SAM mask-decoder call instead of looping
   # per camera (see docs/specs/2026-08-10-sam-batched-decode-design.md). Output is
   # near-identical to the loop, NOT bitwise-identical (batching reassociates floating-point
   # reductions). Falls back to the loop if a worker's cameras do not all share one resolution.
-  sam_batched_decode: false
+  sam_batched_decode: true
   # torch.compile the GDINO model / SAM2 image encoder (no quality loss). WARNING: first-
   # forward compilation is heavy on host RAM and can OOM (SIGKILL/-9), especially GDINO.
   # Enable ONE at a time and watch memory; sam_compile is the safer/cleaner target.
@@ -215,7 +217,8 @@ langsam_inference:
 
 text_prompts:
 #  prompts: ["floor", "person", "robot", "furniture", "lamp"]
-  prompts: ["floor", "person"]
+#  prompts: ["floor", "person"]
+  prompts: ["person", "bed", "device", "hololens", "pipes"]
 
 langsam_postprocessor:
   save_intermediate: false

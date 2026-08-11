@@ -133,3 +133,56 @@ plugin registry, `libnvinfer_plugin` initialisation and ONNX-parser behaviour ar
 - The B2 panoptic CUDA kernel, which is independent of TRT and already verified byte-identical.
 - CUDA graph capture (roadmap step 5), also TRT-version-independent in principle but worth
   re-checking after an upgrade, since capture support is a TRT behaviour.
+
+---
+
+## Addendum 2026-08-11: results, and why GDINO stayed TF32
+
+### Measured outcome of the upgrade
+
+| | period | fps | dev1 gdino GPU | dev1 sam GPU |
+|---|---|---|---|---|
+| TRT 10.9 | 171.0 ms | 5.85 | 62.00 ms | 52.02 ms |
+| TRT 11, first run | 253.0 ms | 3.95 | 92.13 | 97.91 |
+| TRT 11 + FP16 SAM + CUDA panoptic | **199.5 ms** | **5.01** | 93.84 | 67.09 |
+
+Quality improved as intended — the score depression is gone (|d| 0.384 → 0.001) and masks are
+visibly more stable. The residual ~17% throughput gap versus TRT 10.9 is **entirely GDINO**, whose
+GPU time rose 62 → 94 ms/tick. It was TF32 before and after, so this is TensorRT 11 kernel
+selection, with one fused node (`__myl_DivMulReshTranReshConcReshMoveMulSum`) at 30.94 ms/tick.
+
+Two recoveries along the way, both committed:
+- **SAM strongly-typed FP16** — 2.18× on the encoder (75.41 → 34.63 ms at batch 3). TRT 11 removed
+  `BuilderFlag.FP16`, and the export tool's `hasattr` guard had been silently skipping it and
+  building TF32 while still naming the file `_fp16`.
+- **panoptic CUDA kernel** — −19 ms, 240 kernels → 3.
+
+### GDINO FP16: four approaches, all blocked
+
+Attempted 2026-08-11 and **reverted**. Recorded so it is not retried blindly. The obstacle is
+structural: GDINO is **cross-modal**, so text and image tensors meet inside the fusion encoder.
+There is no clean seam to cut along, and a strongly-typed TensorRT network refuses to auto-promote,
+so every mixed edge is a hard parse error.
+
+| approach | failure |
+|---|---|
+| `model.half()`, traced on CUDA | the vendored Swin builds its shift mask inline with `torch.zeros(...)` at fp32; adding it promotes `attn` while `v` stays half → `swin_transformer.py:171 ... expected scalar type Float but found Half`. Needs patching the fork |
+| `torch.autocast(cuda, float16)` | `NameError: name '_C' is not defined` — GroundingDINO's deformable-attention CUDA extension is not built, and the traceable pure-PyTorch fallback is CPU-only. This is precisely why `--stage export` traces on CPU |
+| graph FP16 (`onnxconverter-common`), `op_block_list` widened | `/bert/encoder/layer.0/attention/self/Div` — types Half and Float |
+| graph FP16, whole BERT subgraph block-listed by node name (1122 nodes) | boundary moves into the fusion: `/transformer/encoder/Mul_9` — types Float and Half |
+| graph FP16, whole graph, shape inference enabled | back to `/bert/Sub` — types Half and Float |
+
+`onnxconverter-common` does not place casts correctly for this graph in any configuration tried.
+Routes worth considering if it is revisited, cheapest first:
+
+1. patch the vendored Swin to build its mask in the activation dtype, making `.half()` viable —
+   but the CUDA-op problem still blocks tracing on GPU;
+2. build GroundingDINO's `_C` extension so `autocast` on CUDA becomes tractable;
+3. insert the casts by hand rather than relying on the converter.
+
+### Better next lever
+
+**CUDA graphs** (see [`2026-08-10-trt-cuda-graphs-design.md`](./2026-08-10-trt-cuda-graphs-design.md))
+is precision-independent and targets a measured cost: GDINO issues ~1843 TensorRT kernel launches
+per tick, ~94% of that stage's launches. Nothing about the TRT 11 move invalidates that design.
+

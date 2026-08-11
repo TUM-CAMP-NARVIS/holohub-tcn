@@ -53,7 +53,7 @@
         "description": "Profile mode for tcn_artekmed - development, testing, and basic usage",
         "requirements": [],
         "run": {
-          "command": "nsys profile -t cuda,nvtx,osrt -o /srv/tmp/vlm_inference_profile -f true -d 600 python3 <holohub_app_source>/tcn_shm_vlm_inference.py",
+          "command": "nsys profile -t cuda,nvtx,osrt -o /srv/tmp/vlm_inference_profile -f true -d 120 python3 <holohub_app_source>/tcn_shm_vlm_inference.py",
           "workdir": "holohub_bin"
         }
       },
