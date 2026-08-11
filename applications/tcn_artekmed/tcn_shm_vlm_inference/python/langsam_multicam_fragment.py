@@ -21,6 +21,7 @@ from holoscan.operators import HolovizOp
 from langsam_common import (
     SAM, GDINO, GDinoTrtDetector, resolve_workers, worker_batch, worker_engine_path,
     class_id_map, build_panoptic_map, build_panoptic_map_auto, build_panoptic_lut,
+    acq_timestamp, acq_timestamp_consensus,
 )
 # Shared with langsam_pipelined.py so the output-key convention can't drift between the
 # monolithic and split ops; imported directly (not via langsam_common's re-export list).
@@ -137,6 +138,8 @@ class LangSamBatchOp(Operator):
 
     def compute(self, op_input, op_output, context):
         msg = op_input.receive("color_input")
+        # Frame identity must be forwarded explicitly -- see acq_timestamp's docstring.
+        acq = acq_timestamp(op_input, "color_input")
         out = {}
         with torch.cuda.device(self.device), cp.cuda.Device(self.device.index):
             rgb_gpu, names, hw = [], [], None
@@ -152,7 +155,7 @@ class LangSamBatchOp(Operator):
                 hw = (int(img.shape[0]), int(img.shape[1]))
 
             if not rgb_gpu:
-                op_output.emit(out, "masks")
+                op_output.emit(out, "masks", acq_timestamp=acq)
                 return
 
             # --- Grounding DINO over this worker's cameras (TRT engine or PyTorch) ---
@@ -196,7 +199,7 @@ class LangSamBatchOp(Operator):
 
             for i, cam in enumerate(names):
                 out[mask_name(cam)] = hs.as_tensor(cp.ascontiguousarray(pmaps[i]))
-        op_output.emit(out, "masks")
+        op_output.emit(out, "masks", acq_timestamp=acq)
 
 
 class MaskCollectorOp(Operator):
@@ -208,6 +211,9 @@ class MaskCollectorOp(Operator):
 
     def compute(self, op_input, op_output, context):
         messages = op_input.receive("receivers")     # tuple of per-worker dicts
+        # All workers process the SAME source frame, so they should agree; disagreement is warned
+        # about rather than hidden, because it would make downstream grouping quietly wrong.
+        acq = acq_timestamp_consensus(op_input, "receivers", log)
         out = {}
         with cp.cuda.Device(0):
             for msg in messages:
@@ -219,7 +225,7 @@ class MaskCollectorOp(Operator):
                         t = torch.from_dlpack(arr).to("cuda:0")
                         arr = cp.ascontiguousarray(cp.from_dlpack(t))
                     out[name] = hs.as_tensor(arr)
-        op_output.emit(out, "masks")
+        op_output.emit(out, "masks", acq_timestamp=acq)
 
 
 class LabelMapColorizeOp(Operator):
@@ -238,6 +244,7 @@ class LabelMapColorizeOp(Operator):
 
     def compute(self, op_input, op_output, context):
         msg = op_input.receive("masks")
+        acq = acq_timestamp(op_input, "masks")
         names = sorted(msg.keys())
         out = {}
         with cp.cuda.Device(0):
@@ -245,8 +252,8 @@ class LabelMapColorizeOp(Operator):
                 pmap = cp.asarray(msg.get(name))        # (H,W) uint16 panoptic (class<<8|inst)
                 rgba = self._lut[pmap]                   # (H,W,4) uint8
                 out[name] = hs.as_tensor(cp.ascontiguousarray(rgba))
-        op_output.emit(out, "viz")
-        op_output.emit(self._tiled_specs(names), "specs")
+        op_output.emit(out, "viz", acq_timestamp=acq)
+        op_output.emit(self._tiled_specs(names), "specs", acq_timestamp=acq)
 
     def _tiled_specs(self, names):
         grid = int(math.ceil(math.sqrt(len(names)))) if names else 1

@@ -111,6 +111,8 @@ class GdinoOp(Operator):
 
     def compute(self, op_input, op_output, context):
         msg = op_input.receive("color_input")
+        # Frame identity must be forwarded explicitly -- see acq_timestamp's docstring.
+        acq = acq_timestamp(op_input, "color_input")
         with torch.cuda.device(self.device), cp.cuda.Device(self.device.index):
             rgb_gpu, names, hw = [], [], None
             for cam in self.cameras:
@@ -126,7 +128,7 @@ class GdinoOp(Operator):
 
             if not rgb_gpu:
                 op_output.emit({"names": [], "hw": None, "sam_idx": [], "sam_imgs": [],
-                                "sam_boxes": [], "sam_labels": []}, "det")
+                                "sam_boxes": [], "sam_labels": []}, "det", acq_timestamp=acq)
                 return
 
             sam_imgs, sam_boxes, sam_labels, sam_idx = [], [], [], []
@@ -151,7 +153,7 @@ class GdinoOp(Operator):
             torch.cuda.nvtx.range_pop()
 
         op_output.emit({"names": names, "hw": hw, "sam_idx": sam_idx, "sam_imgs": sam_imgs,
-                        "sam_boxes": sam_boxes, "sam_labels": sam_labels}, "det")
+                        "sam_boxes": sam_boxes, "sam_labels": sam_labels}, "det", acq_timestamp=acq)
 
 
 def _assert_shared_default_stream_env():
@@ -263,10 +265,11 @@ class SamOp(Operator):
                     f"emits.")
             self._stream_checked = True
         p = op_input.receive("det")
+        acq = acq_timestamp(op_input, "det")
         out = {"names": p["names"], "hw": p["hw"], "sam_idx": p["sam_idx"],
                "sam_labels": p["sam_labels"], "masks": [], "scores": []}
         if not p["sam_idx"]:
-            op_output.emit(out, "seg")
+            op_output.emit(out, "seg", acq_timestamp=acq)
             return
         with torch.cuda.device(self.device), cp.cuda.Device(self.device.index):
             torch.cuda.nvtx.range_push("sam")
@@ -274,7 +277,7 @@ class SamOp(Operator):
                 p["sam_imgs"], xyxy=p["sam_boxes"], timing=False)
             torch.cuda.nvtx.range_pop()
         out["masks"], out["scores"] = masks, mscores
-        op_output.emit(out, "seg")
+        op_output.emit(out, "seg", acq_timestamp=acq)
 
 
 class PanopticOp(Operator):
@@ -311,10 +314,11 @@ class PanopticOp(Operator):
                     f"or make SamOp synchronise explicitly before it emits.")
             self._stream_checked = True
         p = op_input.receive("seg")
+        acq = acq_timestamp(op_input, "seg")
         names, hw = p["names"], p["hw"]
         out = {}
         if not names:
-            op_output.emit(out, "masks")
+            op_output.emit(out, "masks", acq_timestamp=acq)
             return
         with cp.cuda.Device(self.device.index):
             pmaps = {i: build_panoptic_map(None, [], None, self._cmap, hw[0], hw[1], xp=cp)
@@ -328,4 +332,4 @@ class PanopticOp(Operator):
                 torch.cuda.nvtx.range_pop()
             for i, cam in enumerate(names):
                 out[mask_name(cam)] = hs.as_tensor(cp.ascontiguousarray(pmaps[i]))
-        op_output.emit(out, "masks")
+        op_output.emit(out, "masks", acq_timestamp=acq)

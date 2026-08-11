@@ -160,6 +160,38 @@ class TcnDatasetReplayerOp(Operator):
         spec.output("color_outputs")
         spec.output("depth_outputs")
 
+    def _frame_acq_ns(self, frame_group, frame_number):
+        """One acquisition timestamp for the whole frame group, in nanoseconds.
+
+        Mirrors the live path: `tcn_shm_subscriber` stamps one time per SHM composite buffer,
+        shared by every camera in it, because the cameras in a segment are synchronised at capture.
+        The reader exposes per-camera stamps (`FrameGroup.timestamps`, keyed `<camera>_colorimage`),
+        so the MINIMUM across the selected cameras is used -- consistent with the synchroniser's
+        "oldest wins" rule, and stable regardless of camera ordering.
+
+        Falls back to a synthetic monotonic value if the export carries no timestamps, so replay
+        still exercises grouping rather than silently emitting -1.
+        """
+        stamps = []
+        try:
+            ts = frame_group.timestamps or {}
+            for camera_id in self._camera_ids:
+                v = ts.get(f"{camera_id}_colorimage")
+                if v is not None:
+                    stamps.append(int(v))
+        except Exception as e:                       # noqa: BLE001 - reader shape is not ours
+            log.debug(f"TcnDatasetReplayerOp: no usable timestamps ({e!r}); synthesising")
+        if stamps:
+            return min(stamps)
+        # 30 fps synthetic spacing, keyed on the source frame number so it is deterministic and
+        # monotonic across a loop. Flagged once so a timestamp-less export is not mistaken for
+        # real capture times.
+        if not getattr(self, "_warned_synthetic_acq", False):
+            self._warned_synthetic_acq = True
+            log.warning("TcnDatasetReplayerOp: dataset has no colorimage timestamps; synthesising "
+                        "monotonic acquisition times at 30 fps for frame grouping")
+        return int(frame_number) * 33_333_333
+
     def start(self):
         # Imported lazily: pyarrow/tifffile/PIL are not available on a plain host, only inside
         # the container. Importing at module scope would make this whole module (and therefore
@@ -203,8 +235,14 @@ class TcnDatasetReplayerOp(Operator):
         total_bytes = 0
         self._color_pinned = {}
         self._depth_pinned = {}
+        # Real dataset acquisition times, so the harness can exercise frame grouping
+        # (docs/specs/2026-08-11-temporal-sync-design.md §0.2). Without these,
+        # get_acquisition_timestamp() returns None for replayed frames and tcn_temporal_sync cannot
+        # be tested on the one source that is deterministic.
+        self._acq_ns = {}
         for frame_number in self._plan:
             frame_group = dataset.frame(frame_number)
+            self._acq_ns[frame_number] = self._frame_acq_ns(frame_group, frame_number)
 
             color_per_camera: Dict[str, np.ndarray] = {}
             for camera_id in self._camera_ids:
@@ -321,8 +359,10 @@ class TcnDatasetReplayerOp(Operator):
                 device_array.set(host_array)
                 depth_message[f"{camera_id}_depthimage"] = hs.as_tensor(device_array)
 
-        op_output.emit(color_message, "color_outputs")
-        op_output.emit(depth_message, "depth_outputs")
+        # Both ports carry the SAME group timestamp, as the live subscriber does.
+        acq = int(self._acq_ns.get(frame_number, -1))
+        op_output.emit(color_message, "color_outputs", acq_timestamp=acq)
+        op_output.emit(depth_message, "depth_outputs", acq_timestamp=acq)
 
         if self.playback == "manual" and self._async_condition is not None:
             self._async_condition.event_state = AsynchronousEventState.EVENT_WAITING
