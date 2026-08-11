@@ -23,9 +23,8 @@
 ARG BASE_IMAGE=holohub-tcn_shm_vlm_inference:feature-tcn-artekmed-initial
 FROM ${BASE_IMAGE}
 
-# The HoloHub image runs as a non-root user, so apt and the /opt overlay both need root.
-# The original user is restored at the end -- leaving the image as root would change how it
-# runs and could mask permission problems that would appear in the real container.
+# apt and the /opt overlay both need root, and this image STAYS root -- see FINAL_USER at the
+# bottom for why.
 USER root
 
 ARG TRT_VERSION=11.2.1.2
@@ -96,5 +95,10 @@ RUN set -e; \
       names=sorted((x.metadata['Name'] or '') for x in d); print('tensorrt dists:', names); \
       assert not any('cu13' in n for n in names), f'CUDA 13 TensorRT in a CUDA 12 image: {names}'"
 
-ARG FINAL_USER=holoscan
+# Stay root. This image is consumed as BASE_IMAGE by HoloHub's own Dockerfile, which runs
+# `chmod +x`, apt and its setup script during build and only drops to a non-root user at the very
+# end. Ending as holoscan here makes that build fail immediately with
+#   chmod: changing permissions of '/tmp/scripts/holohub': Operation not permitted
+# Set FINAL_USER=holoscan if you instead want to RUN this image directly rather than build on it.
+ARG FINAL_USER=root
 USER ${FINAL_USER}

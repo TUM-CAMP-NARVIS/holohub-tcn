@@ -51,6 +51,12 @@ ENGINE_OUT_HOST="${ENGINE_OUT_HOST:-/data/models_trt11}"
 DATASET_HOST="${DATASET_HOST:-/home/ecku/develop/artekmed/artekmed_test_data}"
 TMP_HOST="${TMP_HOST:-/tmp/tcn}"
 
+# HolovizOp needs a real display -- the app dies with "Failed to initialize glfw" otherwise, and
+# the harness app builds Holoviz operators even in dataset mode. These mirror what `./holohub run`
+# passes (read off the working container): DISPLAY, the X socket, and an xauth file.
+DISPLAY_VAL="${DISPLAY:-:1}"
+XAUTH_FILE="${XAUTH_FILE:-$(ls -t /tmp/.docker.xauth-* 2>/dev/null | head -1)}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCH="${SCRIPT_DIR}/patches/holoscan-sdk-4.4.0-trt-major-param.patch"
 # holoinfer does not compile against TRT 11 unmodified: BuilderFlag::kFP16 and
@@ -283,8 +289,28 @@ pathlib.Path(sys.argv[2]).write_text(s)
 print("wrote", sys.argv[2])
 PY
   rm -rf "${TMP_HOST}/harness/trt11"
-  run docker run --rm --gpus all --ipc=host --shm-size=16gb \
-      -v "$ENGINE_OUT_HOST:/srv/models" -v "$TMP_HOST:/srv/tmp" \
+  # ENGINE_SRC_HOST again mounted read-only at its own path: the sam2 configs/checkpoints in the
+  # output tree are absolute symlinks into it, and the APP loads that yaml at startup too -- not
+  # just the export tool. Missing it fails in LangSamBatchOp's SAM.build_model().
+  local x11=()
+  if [[ -n "$XAUTH_FILE" && -e "$XAUTH_FILE" ]]; then
+    x11+=(-e "XAUTHORITY=$XAUTH_FILE" -v "$XAUTH_FILE:$XAUTH_FILE")
+  else
+    info "WARNING: no /tmp/.docker.xauth-* found; Holoviz may fail to open a window."
+  fi
+  [[ -d /tmp/.X11-unix ]] && x11+=(-v /tmp/.X11-unix:/tmp/.X11-unix)
+  # --runtime=nvidia, NOT --gpus all: Holoviz needs Vulkan, and only the nvidia runtime injects
+  # /etc/vulkan/icd.d/nvidia_icd.json plus the graphics libraries. With --gpus all the ICD is
+  # absent and the app dies with "Failed to create the Vulkan instance" AFTER glfw succeeds.
+  # /dev/nvidia-modeset mirrors what the working container gets.
+  run docker run --rm --runtime=nvidia --ipc=host --shm-size=16gb \
+      -e NVIDIA_VISIBLE_DEVICES=all \
+      --device /dev/nvidia-modeset \
+      -e "DISPLAY=$DISPLAY_VAL" -e NVIDIA_DRIVER_CAPABILITIES=graphics,video,compute,utility,display \
+      "${x11[@]}" \
+      -v "$ENGINE_OUT_HOST:/srv/models" \
+      -v "$ENGINE_SRC_HOST:$ENGINE_SRC_HOST:ro" \
+      -v "$TMP_HOST:/srv/tmp" \
       -v "$HOLOHUB_DIR:/workspace/holohub" \
       -v "$DATASET_HOST:/workspace/volumes/artekmed_test_data" \
       "$TEST_IMG" bash -lc "
