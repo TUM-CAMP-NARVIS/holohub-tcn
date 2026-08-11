@@ -192,10 +192,16 @@ stage_sdk() {
     || info "WARNING: could not inspect $bimg"
   info "EXPECT libnvinfer${TRT_VERSION%%.*} at ${TRT_VERSION}.x. If it says 10.3, the ARG default did not take."
 
-  say "Runtime image tags"
-  run docker images --format '{{.Repository}}:{{.Tag}}  {{.CreatedSince}}' \
-    | grep -i holoscan | head -10
-  info "Note the runtime image name above; pass it to the next stage as BASE_IMG=<name:tag>."
+  # Filtered listing: an unfiltered `docker images` walks every image and dies on a corrupt
+  # content blob in this host's local store ("blob not found"), which looks alarming and is
+  # unrelated to this build.
+  say "Image built"
+  run docker images --filter "reference=${TRT11_BASE_IMG%%:*}" \
+      --format '  {{.Repository}}:{{.Tag}}  {{.Size}}  {{.CreatedSince}}'
+  info "Use it as the HoloHub base image, e.g.:"
+  info "  ./holohub run --base-img ${TRT11_BASE_IMG} ... tcn_shm_receiver"
+  info "or continue here: ./trt11_build_test.sh --stage verify   (TEST_IMG defaults to it)"
+
   revert_patch
 }
 
@@ -328,7 +334,10 @@ PY
 }
 
 case "$STAGE" in
-  all)       stage_preflight && stage_sdk && info "Now re-run with --stage holohub after setting BASE_IMG" ;;
+  all)       stage_preflight && stage_sdk \
+               && info "Next: --stage verify, then --stage engines, then --stage gate." \
+               && info "The holohub stage is optional; building via your own run script with" \
+               && info "--base-img ${TRT11_BASE_IMG} is equivalent and inherits X11/Vulkan/env." ;;
   preflight) stage_preflight ;;
   sdk)       stage_preflight && stage_sdk ;;
   holohub)   stage_holohub ;;
