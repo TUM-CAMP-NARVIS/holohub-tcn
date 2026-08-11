@@ -126,7 +126,7 @@ RUN wget https://developer.nvidia.com/downloads/assets/tools/secure/nsight-graph
     rm NVIDIA_Nsight_Graphics_2025.5.0.25335.run
 
 WORKDIR /tmp/dependencies
-RUN rm -Rf /tmp/depencencies/pybind11 && \
+RUN rm -Rf /tmp/dependencies/pybind11 && \
     git clone https://github.com/pybind/pybind11 && \
     cd pybind11 && \
     git checkout v2.13.6 && \
