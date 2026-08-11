@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 TUM CAMP / NARVIS. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,74 +13,76 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Rewritten alongside the operator. The previous version did not compile at all -- it used
+ * unqualified `Operator`/`Fragment` inside `namespace tcn::ops` while closing with
+ * `// namespace holoscan::ops`, and bound the old `num_streams`/`cuda_device_ordinal` parameters.
+ * That is consistent with the operator's registration having been commented out.
  */
 
-#include <pybind11/complex.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <variant>
+#include <vector>
 
 #include "holoscan/core/fragment.hpp"
 #include "holoscan/core/operator.hpp"
 #include "holoscan/core/operator_spec.hpp"
+#include "holoscan/core/subgraph.hpp"
+#include "holoscan/python/core/component_util.hpp"
+#include <holoscan/python/core/emitter_receiver_registry.hpp>
 
 #include "../tcn_stream_synchronizer.hpp"
 #include "./tcn_stream_synchronizer_pydoc.hpp"
 
 #include "../../../operator_util.hpp"
+
 using std::string_literals::operator""s;
 using pybind11::literals::operator""_a;
-
-#define STRINGIFY(x) #x
-#define MACRO_STRINGIFY(x) STRINGIFY(x)
 
 namespace py = pybind11;
 
 namespace tcn::ops {
 
-/* Trampoline class for handling Python kwargs
- *
- * These add a constructor that takes a Fragment for which to initialize the operator.
- * The explicit parameter list and default arguments take care of providing a Pythonic
- * kwarg-based interface with appropriate default values matching the operator's
- * default parameters in the C++ API `setup` method.
- *
- * The sequence of events in this constructor is based on Fragment::make_operator<OperatorT>
- */
-
 class PyTcnStreamSynchronizerOp : public TcnStreamSynchronizerOp {
  public:
-  /* Inherit the constructors */
   using TcnStreamSynchronizerOp::TcnStreamSynchronizerOp;
 
-  // Define a constructor that fully initializes the object.
-  PyTcnStreamSynchronizerOp(holoscan::Fragment* fragment, const py::args& args, int cuda_device_ordinal,
-                     std::shared_ptr<::holoscan::Allocator> allocator, int num_streams, bool verbose,
-                     const std::string& name = "nv_video_decoder")
-      : TcnStreamSynchronizerOp(holoscan::ArgList{holoscan::Arg{"cuda_device_ordinal", cuda_device_ordinal},
-                                 holoscan::Arg{"allocator", allocator},
-                                 holoscan::Arg{"num_streams", num_streams},
-                                 holoscan::Arg{"verbose", verbose}}) {
+  PyTcnStreamSynchronizerOp(
+      const std::variant<holoscan::Fragment*, holoscan::Subgraph*>& fragment_or_subgraph,
+      const py::args& args,
+      const std::vector<std::string>& streams,
+      const std::vector<std::string>& optional_streams = {},
+      const std::vector<int64_t>& capacities = {},
+      const std::string& reference_stream = "",
+      const std::string& match_policy = "exact",
+      int64_t window_ns = 0,
+      int64_t default_capacity = 8,
+      bool verbose = false,
+      const std::string& name = "tcn_stream_synchronizer")
+      : TcnStreamSynchronizerOp(
+            holoscan::ArgList{holoscan::Arg{"streams", streams},
+                              holoscan::Arg{"optional_streams", optional_streams},
+                              holoscan::Arg{"capacities", capacities},
+                              holoscan::Arg{"reference_stream", reference_stream},
+                              holoscan::Arg{"match_policy", match_policy},
+                              holoscan::Arg{"window_ns", window_ns},
+                              holoscan::Arg{"default_capacity", default_capacity},
+                              holoscan::Arg{"verbose", verbose}}) {
     add_positional_condition_and_resource_args(this, args);
-    name_ = name;
-    fragment_ = fragment;
-    spec_ = std::make_shared<holoscan::OperatorSpec>(fragment);
-    setup(*spec_.get());
+    init_operator_base(this, fragment_or_subgraph, name);
   }
 };
 
-/* The python module */
-
 PYBIND11_MODULE(_tcn_stream_synchronizer, m) {
   m.doc() = R"pbdoc(
-        Holoscan SDK Python Bindings
+        TCN temporal stream synchronizer
         ---------------------------------------
         .. currentmodule:: _tcn_stream_synchronizer
-        .. autosummary::
-           :toctree: _generate
     )pbdoc";
 
 #ifdef VERSION_INFO
@@ -89,23 +91,43 @@ PYBIND11_MODULE(_tcn_stream_synchronizer, m) {
   m.attr("__version__") = "dev";
 #endif
 
-  py::class_<TcnStreamSynchronizerOp, PyTcnStreamSynchronizerOp, Operator, std::shared_ptr<TcnStreamSynchronizerOp>>(
-      m, "TcnStreamSynchronizerOp", doc::TcnStreamSynchronizerOp::doc_TcnStreamSynchronizerOp)
-      .def(py::init<Fragment*,
+  py::class_<TcnStreamSynchronizerOp,
+             PyTcnStreamSynchronizerOp,
+             holoscan::Operator,
+             std::shared_ptr<TcnStreamSynchronizerOp>>(
+      m,
+      "TcnStreamSynchronizerOp",
+      doc::TcnStreamSynchronizerOp::doc_TcnStreamSynchronizerOp)
+      .def(py::init<std::variant<holoscan::Fragment*, holoscan::Subgraph*>,
                     const py::args&,
-                    int,
-                    std::shared_ptr<::holoscan::Allocator>,
-                    int,
+                    const std::vector<std::string>&,
+                    const std::vector<std::string>&,
+                    const std::vector<int64_t>&,
+                    const std::string&,
+                    const std::string&,
+                    int64_t,
+                    int64_t,
                     bool,
                     const std::string&>(),
            "fragment"_a,
-           "cuda_device_ordinal"_a,
-           "allocator"_a,
-           "num_streams"_a = 1,
+           "streams"_a,
+           "optional_streams"_a = std::vector<std::string>{},
+           "capacities"_a = std::vector<int64_t>{},
+           "reference_stream"_a = ""s,
+           "match_policy"_a = "exact"s,
+           "window_ns"_a = static_cast<int64_t>(0),
+           "default_capacity"_a = static_cast<int64_t>(8),
            "verbose"_a = false,
            "name"_a = "tcn_stream_synchronizer"s,
            doc::TcnStreamSynchronizerOp::doc_TcnStreamSynchronizerOp)
-      .def("initialize", &TcnStreamSynchronizerOp::initialize, doc::TcnStreamSynchronizerOp::doc_initialize)
-      .def("setup", &TcnStreamSynchronizerOp::setup, "spec"_a, doc::TcnStreamSynchronizerOp::doc_setup);
-}  // PYBIND11_MODULE NOLINT
-}  // namespace holoscan::ops
+      .def("setup",
+           &TcnStreamSynchronizerOp::setup,
+           "spec"_a,
+           doc::TcnStreamSynchronizerOp::doc_setup);
+
+  m.def("register_types", [](holoscan::EmitterReceiverRegistry& registry) {
+    (void)registry;
+    HOLOSCAN_LOG_DEBUG("TCN Stream Synchronizer - register types");
+  });
+}  // PYBIND11_MODULE
+}  // namespace tcn::ops
