@@ -186,3 +186,57 @@ Routes worth considering if it is revisited, cheapest first:
 is precision-independent and targets a measured cost: GDINO issues ~1843 TensorRT kernel launches
 per tick, ~94% of that stage's launches. Nothing about the TRT 11 move invalidates that design.
 
+---
+
+## Checkpoint 2026-08-11 19:41 — live 5-camera, everything landed
+
+Config: TRT 11.2.1.2, GDINO b2/b3 TF32, SAM b2/b3 strongly-typed FP16, `panoptic_backend: cuda`,
+`sam_batched_decode: true`, 5 prompts, 2/3 worker split, `pipelined: false`.
+
+| | value |
+|---|---|
+| period | **197.2 ms** |
+| fps (per worker) | **5.071** |
+| GPU util dev0 / dev1 | 62.6% / **80.3%** |
+| kernel concurrency | 1.00 on both (single default stream, as designed) |
+
+Per-tick, dev1 (the busier worker):
+
+| stage | wall | GPU | of which sync (GPU wait) | launch API | non-API (Python/GIL) |
+|---|---|---|---|---|---|
+| gdino | 100.70 ms | 92.19 | **80.55** (2 calls) | 8.14 | 11.79 |
+| sam | 58.91 | 65.47 | — | — | — |
+| panoptic | 17.48 | 0.54 | 6.13 | 0.03 | 1.17 |
+| **total** | 177.1 | **158.2** | | | |
+
+### The important shift: the pipeline is now GPU-bound
+
+dev1 runs at **80.3% GPU utilisation** (was 62.5% under TRT 10.9) and its GPU work is 158.2 ms
+against a 197.2 ms period. So only ~39 ms/frame of non-GPU critical path remains, and `gdino` — the
+largest stage — spends **80.55 of its 100.70 ms waiting for the GPU**, in just two
+`cudaStreamSynchronize` calls.
+
+This changes the ranking. Overhead-removal levers are now bounded by ~39 ms total, while further
+gains mostly require removing GPU *work*. Panoptic is essentially free already (0.54 ms GPU,
+1.17 ms Python) after the fused kernel.
+
+### Consequence for CUDA graphs (roadmap step 5)
+
+The spec was written when `gdino` was 69.45 ms wall with 49.29 ms of sync, i.e. ~20 ms of
+addressable overhead against a 47.8/56.5% utilised GPU. Re-measured now:
+
+- GDINO still issues ~**1831 TensorRT launches/tick** (1030 myelin + 799 cublas), so the launch
+  *count* premise holds;
+- but the launch *time* is only **8.14 ms/tick**, and it is issued while the GPU is already
+  saturated — the stage ends in an 80 ms wait regardless.
+
+So the realistic ceiling is roughly 8 ms of launch API plus part of gdino's 11.79 ms non-API —
+call it 10-12 ms, about **6% of the period**, against a design that requires persistent IO buffers
+and carries a real capture-mode hazard in a 24-thread scheduler
+(see [`2026-08-10-trt-cuda-graphs-design.md`](./2026-08-10-trt-cuda-graphs-design.md) §"Holoscan").
+
+That is a materially weaker case than when it was specced, and it is weaker precisely because the
+earlier work succeeded: SAM's FP16 and the panoptic kernel removed the overhead that made the GPU
+look under-used. Recording it here rather than discovering it after implementing — the playbook's
+own §L7 lesson is that a gate written against stale measurements is worse than no gate.
+
