@@ -48,31 +48,42 @@ through one shared-memory segment are synchronised at capture, and `ShmPortView`
 timestamp field — the timestamp is per frame-group by construction. So the matching key is the
 **capture group**, which is exactly the right granularity here.
 
-### 0.2 Carrying identity through the Python LangSAM path — verify, do not assume
+### 0.2 Carrying identity through the Python LangSAM path — RESOLVED 2026-08-11
 
-GXF `Timestamp` does **not** survive that path: Python operators emit fresh dicts, producing a new
-entity with no `Timestamp` component. Some explicit carrier is required.
+GXF `Timestamp` does not survive that path on its own: Python operators emit fresh dicts, producing
+a new entity with no `Timestamp` component. **Metadata is not needed either** — Holoscan's Python
+`emit` takes the acquisition time directly:
 
-`MetadataDictionary` propagates automatically with a merge policy and is the obvious candidate, but
-it is **reported unreliable with multiple input ports** — and `MaskCollectorOp` is exactly that
-(`IOSpec.ANY_SIZE` receivers). So metadata must not be load-bearing until proven.
+```python
+emit(self, data, name, emitter_name='', acq_timestamp: int = -1)
+```
 
-**Step 0.2 is therefore an experiment, not an implementation**, and it gates the rest:
+Verified by round-trip through **two** Python hops (`Src -> Mid -> Sink`), each stage reading with
+`op_input.get_acquisition_timestamp(port)` and forwarding via `emit(..., acq_timestamp=t)`:
 
-1. enable metadata, set `acq_timestamp` in `GdinoOp`, and check it arrives intact at the far side of
-   `MaskCollectorOp` (the multi-input hop) and at `LabelMapColorizeOp`;
-2. if it survives — use it, with the policy stated explicitly rather than defaulted;
-3. if it does not — fall back to threading the value through the existing payload dicts
-   (`GdinoOp` → `SamOp` → `PanopticOp` already pass plain dicts internally) and have the final
-   emitted TensorMap carry it under a reserved key.
+```
+sent    : [1111111111, 2222222222, 3333333333]
+received: [1111111111, 2222222222, 3333333333]
+```
 
-The fallback has a known consequence to handle rather than discover: consumers that iterate the mask
-map — `MaskCollectorOp`, `LabelMapColorizeOp`, `MaskDumpOp` — would otherwise treat the extra key as
-a camera and, in `MaskDumpOp`'s case, write a bogus `.npy`. Any reserved key must be filtered at
-those three sites.
+So the carrier is the **same GXF `Timestamp` mechanism end to end**, in both C++ and Python. This
+sidesteps `MetadataDictionary` entirely, and with it the reported unreliability across multiple input
+ports (`MaskCollectorOp` uses `IOSpec.ANY_SIZE` receivers and would have been the risky hop). No
+reserved payload key is needed either, so the three mask-map consumers
+(`MaskCollectorOp`, `LabelMapColorizeOp`, `MaskDumpOp`) need no filtering.
 
-Whichever wins, the synchroniser reads the timestamp through **one** accessor so the choice stays
-isolated.
+Also confirmed: `get_acquisition_timestamp` returns `None` — not 0 — when no `Timestamp` is present,
+so "absent" is distinguishable from "zero".
+
+Each Python stage on the mask path must therefore forward the timestamp explicitly:
+`GdinoOp` -> `SamOp` -> `PanopticOp` -> `MaskCollectorOp`. A stage that forgets silently drops
+identity, so this belongs in the operator tests rather than in review.
+
+**`TcnDatasetReplayerOp` must do the same.** It currently attaches nothing, so
+`get_acquisition_timestamp` returns `None` for replayed frames — which would make `tcn_temporal_sync`
+untestable on the deterministic harness, the one place it can be tested properly. The dataset carries
+real timestamps (`FrameGroup.timestamps`, keyed `<camera>_colorimage`; `Stamped.timestamp_ns`), so
+the replayer should emit them as `acq_timestamp`. Prerequisite for the Part 2 harness test.
 
 ---
 

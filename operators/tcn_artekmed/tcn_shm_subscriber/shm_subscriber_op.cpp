@@ -19,6 +19,8 @@
 
 #include <holoscan/utils/cuda_macros.hpp>
 
+#include "gxf/std/timestamp.hpp"  // nvidia::gxf::Timestamp -- acquisition time for frame grouping
+
 #include "../common/utils.h"
 
 namespace tcn::ops {
@@ -191,6 +193,20 @@ void TcnShmSubscriberOp::compute(
     HOLOSCAN_LOG_DEBUG("Processing frame ts={} (zero-copy, {} ports)",
                        frame.timestamp, frame.ports.size());
 
+    // Capture the acquisition timestamp BEFORE `frame` is cleared further down (`frame = {}` runs
+    // before the emits, to release the SHM segment as early as possible), otherwise this reads 0.
+    //
+    // Units are nanoseconds, but the EPOCH is the publisher's std::chrono::steady_clock
+    // (tcn_shm_zenoh_sender: user_header.timestamp = now_ns), NOT the GXF global clock and not wall
+    // time. So these values are only meaningful RELATIVE TO EACH OTHER: they are safe to compare
+    // and match across streams from the same publisher, and must never be compared against a
+    // locally computed "now" or against a second publisher's timestamps.
+    //
+    // One timestamp per composite buffer, shared by every camera port in it -- the cameras in a
+    // segment are synchronised at capture and ShmPortView carries no per-port time. So this is a
+    // capture-GROUP identity, which is the granularity tcn_temporal_sync matches on.
+    const int64_t acq_timestamp_ns = static_cast<int64_t>(frame.timestamp);
+
     // Get allocator handle for tensor allocation
     auto allocator_handle = nvidia::gxf::Handle<nvidia::gxf::Allocator>::Create(
         context.context(), allocator_->gxf_cid());
@@ -261,6 +277,29 @@ void TcnShmSubscriberOp::compute(
     // we explicitly clear it here to make the release point obvious and to
     // ensure it happens before the emit (defense in depth).
     frame = {};
+
+    // Stamp both entities with the acquisition time so downstream operators can group frames that
+    // belong together (tcn_temporal_sync). Holoscan already reads this back on the receive side --
+    // InputContext::get_acquisition_timestamp() searches a received entity for ANY component of
+    // type nvidia::gxf::Timestamp, so the component NAME is not significant; only the type is.
+    // Nothing in Holoscan CREATES one, which is why this has to be done here: without it the
+    // frame's identity is lost at the source and there is nothing downstream to match on.
+    const int64_t pub_timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto stamp = [&](nvidia::gxf::Entity& e, const char* what) {
+        auto ts = e.add<nvidia::gxf::Timestamp>("timestamp");
+        if (!ts) {
+            // Non-fatal: the frame is still valid data, but anything downstream that groups by
+            // acquisition time will not see this one. Warn rather than drop the frame.
+            HOLOSCAN_LOG_WARN("Failed to add Timestamp to {} entity (acq={})", what,
+                              acq_timestamp_ns);
+            return;
+        }
+        ts.value()->acqtime = acq_timestamp_ns;
+        ts.value()->pubtime = pub_timestamp_ns;
+    };
+    stamp(color_entity.value(), "color");
+    stamp(depth_entity.value(), "depth");
 
     // Emit outputs
     op_output.emit(color_entity.value(), "color_outputs");
