@@ -117,7 +117,22 @@ def build_engine(onnx_path, engine_path, batch, fp16=True):
             raise SystemExit("ONNX parse failed")
     cfg = b.create_builder_config()
     cfg.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 8 << 30)
-    if fp16 and hasattr(trt.BuilderFlag, "FP16"):
+    if fp16:
+        # TensorRT 11 REMOVED BuilderFlag.FP16 (along with BF16/INT8): networks became strongly
+        # typed, so precision is carried by the ONNX rather than set on the builder. The previous
+        # `hasattr` guard silently SKIPPED the flag on TRT 11 and produced an FP32/TF32 engine that
+        # was still NAMED _fp16 -- measured 2026-08-11: the SAM encoder fell from FP16 tensor-core
+        # GEMMs (trt_ampere_h16816gemm, 3.02 ms) to TF32 (~17 ms), a silent ~46 ms/tick regression.
+        # Refuse rather than mislabel.
+        if not hasattr(trt.BuilderFlag, "FP16"):
+            raise SystemExit(
+                f"--fp16 requested but BuilderFlag.FP16 does not exist in TensorRT "
+                f"{trt.__version__} (removed in TRT 11: networks are strongly typed).\n"
+                f"Building anyway would produce an FP32/TF32 engine NAMED fp16 -- silently slower "
+                f"and mislabelled.\n"
+                f"To get FP16 on TRT 11 the ONNX must carry FP16 types and the network must be "
+                f"created with NetworkDefinitionCreationFlag.STRONGLY_TYPED.\n"
+                f"Until that is implemented, drop --fp16 and build TF32.")
         cfg.set_flag(trt.BuilderFlag.FP16)
     elif hasattr(trt.BuilderFlag, "TF32"):
         cfg.set_flag(trt.BuilderFlag.TF32)
