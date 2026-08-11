@@ -243,10 +243,10 @@ RUN rm -Rf /tmp/dependencies/xylt && \
 WORKDIR /tmp/dependencies/slang
 ARG SLANG_VERSION=2025.24.2  # Check https://github.com/shader-slang/slang/releases
 RUN wget https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/slang-${SLANG_VERSION}-linux-x86_64.zip \
-    && unzip slang-${SLANG_VERSION}-linux-x86_64.zip -d /tmp/dependencies/slang \
+    && unzip -o slang-${SLANG_VERSION}-linux-x86_64.zip -d /tmp/dependencies/slang \
     && rm slang-${SLANG_VERSION}-linux-x86_64.zip \
-    && ln -s /tmp/dependencies/slang/bin/slangc /usr/local/bin/slangc \
-    && ln -s /tmp/dependencies/slang/bin/slangd /usr/local/bin/slangd
+    && ln -sf /tmp/dependencies/slang/bin/slangc /usr/local/bin/slangc \
+    && ln -sf /tmp/dependencies/slang/bin/slangd /usr/local/bin/slangd
 
 # Set PATH and verify
 ENV PATH="/usr/local/bin:${PATH}"
