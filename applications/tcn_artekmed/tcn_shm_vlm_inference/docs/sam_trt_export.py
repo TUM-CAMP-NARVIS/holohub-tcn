@@ -52,7 +52,16 @@ class SAM2EncoderWrapper(nn.Module):
     otherwise would make the engine silently wrong.
     """
 
-    def __init__(self, sam_model):
+    def __init__(self, sam_model, half_internal=False):
+        """`half_internal` casts the encoder's weights and activations to FP16 while keeping the
+        wrapper's INPUT AND OUTPUT in FP32.
+
+        That combination is deliberate. TensorRT 11 removed BuilderFlag.FP16 -- networks are
+        strongly typed, so precision must come from the ONNX. Casting the whole graph to FP16
+        would also change the engine's I/O dtypes, and both consumers (`run_engine` here and
+        `SamTrtEncoder.encode` in langsam_common.py) allocate FP32 buffers. Keeping the boundary
+        FP32 and the interior FP16 gets the tensor-core kernels back with NO runtime change.
+        """
         super().__init__()
         if not getattr(sam_model, "use_high_res_features_in_sam", False):
             raise SystemExit("model has use_high_res_features_in_sam=False; this wrapper "
@@ -60,11 +69,25 @@ class SAM2EncoderWrapper(nn.Module):
         if not getattr(sam_model, "directly_add_no_mem_embed", False):
             raise SystemExit("model has directly_add_no_mem_embed=False; this wrapper adds "
                              "no_mem_embed unconditionally and would be wrong")
+        self.half_internal = bool(half_internal)
+        if self.half_internal:
+            # DEEP COPY before halving. `self.half()` walks every registered submodule, and
+            # `self.model` IS the caller's `sam.model` -- halving in place silently converted the
+            # shared model, so the gates' own FP32/bf16 reference passes then failed with
+            # "expected mat1 and mat2 to have the same dtype, but got: float != c10::Half".
+            # The engine is judged against those references, so corrupting them would have
+            # invalidated the comparison rather than merely erroring.
+            import copy
+            sam_model = copy.deepcopy(sam_model)
         self.model = sam_model
         self.image_encoder = sam_model.image_encoder
         self.no_mem_embed = sam_model.no_mem_embed
+        if self.half_internal:
+            self.half()          # weights -> FP16; forward() re-establishes the FP32 boundary
 
     def forward(self, input_image):
+        if self.half_internal:
+            input_image = input_image.half()
         backbone_out = self.image_encoder(input_image)
         backbone_out["backbone_fpn"][0] = self.model.sam_mask_decoder.conv_s0(
             backbone_out["backbone_fpn"][0])
@@ -78,6 +101,8 @@ class SAM2EncoderWrapper(nn.Module):
         feats[-1] = feats[-1] + self.no_mem_embed
         out = [f.permute(1, 2, 0).reshape(input_image.shape[0], -1, *s)
                for f, s in zip(feats[::-1], sizes[::-1])][::-1]
+        if self.half_internal:
+            out = [o.float() for o in out]     # restore the FP32 output boundary
         return out[0], out[1], out[2]
 
 
@@ -105,10 +130,28 @@ def export_onnx(wrapper, onnx_path, batch, device):
 
 def build_engine(onnx_path, engine_path, batch, fp16=True):
     """min = opt = max = batch. GDINO taught us the traced batch is the engine's batch for
-    that model; SAM 2's Hiera may be genuinely dynamic, but the design does not rely on it."""
+    that model; SAM 2's Hiera may be genuinely dynamic, but the design does not rely on it.
+
+    Two precision routes, chosen by what the installed TensorRT actually offers:
+
+    * TRT < 11 -- weakly typed. The ONNX is FP32 and `BuilderFlag.FP16` lets the builder pick
+      FP16 kernels where it judges them safe.
+    * TRT >= 11 -- strongly typed. `BuilderFlag.FP16` no longer exists; the graph's own types
+      decide. The ONNX is therefore exported with FP16 interior (see SAM2EncoderWrapper's
+      `half_internal`) and the network is created with STRONGLY_TYPED so TensorRT honours it.
+
+    Getting this wrong is silent: before this split, the FP16 flag was skipped on TRT 11 and the
+    engine built at TF32 while still being named _fp16 -- the SAM encoder lost its tensor-core
+    GEMMs and 46 ms/tick with nothing in the log.
+    """
     lg = trt.Logger(trt.Logger.WARNING)
     b = trt.Builder(lg)
-    net = b.create_network(0)
+    strongly_typed = fp16 and not hasattr(trt.BuilderFlag, "FP16")
+    if strongly_typed:
+        net = b.create_network(1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED))
+        print(f"TensorRT {trt.__version__}: strongly-typed network; precision comes from the ONNX")
+    else:
+        net = b.create_network(0)
     p = trt.OnnxParser(net, lg)
     with open(onnx_path, "rb") as f:
         if not p.parse(f.read()):
@@ -117,22 +160,9 @@ def build_engine(onnx_path, engine_path, batch, fp16=True):
             raise SystemExit("ONNX parse failed")
     cfg = b.create_builder_config()
     cfg.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 8 << 30)
-    if fp16:
-        # TensorRT 11 REMOVED BuilderFlag.FP16 (along with BF16/INT8): networks became strongly
-        # typed, so precision is carried by the ONNX rather than set on the builder. The previous
-        # `hasattr` guard silently SKIPPED the flag on TRT 11 and produced an FP32/TF32 engine that
-        # was still NAMED _fp16 -- measured 2026-08-11: the SAM encoder fell from FP16 tensor-core
-        # GEMMs (trt_ampere_h16816gemm, 3.02 ms) to TF32 (~17 ms), a silent ~46 ms/tick regression.
-        # Refuse rather than mislabel.
-        if not hasattr(trt.BuilderFlag, "FP16"):
-            raise SystemExit(
-                f"--fp16 requested but BuilderFlag.FP16 does not exist in TensorRT "
-                f"{trt.__version__} (removed in TRT 11: networks are strongly typed).\n"
-                f"Building anyway would produce an FP32/TF32 engine NAMED fp16 -- silently slower "
-                f"and mislabelled.\n"
-                f"To get FP16 on TRT 11 the ONNX must carry FP16 types and the network must be "
-                f"created with NetworkDefinitionCreationFlag.STRONGLY_TYPED.\n"
-                f"Until that is implemented, drop --fp16 and build TF32.")
+    if strongly_typed:
+        pass          # setting precision flags on a strongly-typed network is rejected
+    elif fp16:
         cfg.set_flag(trt.BuilderFlag.FP16)
     elif hasattr(trt.BuilderFlag, "TF32"):
         cfg.set_flag(trt.BuilderFlag.TF32)
@@ -314,7 +344,15 @@ def main():
 
     print(f"TensorRT {trt.__version__} | sam-type {args.sam_type}")
     sam = build_sam(args.sam_type, dev)
-    wrapper = SAM2EncoderWrapper(sam.model).eval().to(dev)
+    # On TensorRT 11 the ONNX must carry the FP16 types itself (strongly-typed networks; the
+    # FP16 builder flag was removed). Only the encoder INTERIOR goes half -- the wrapper keeps an
+    # FP32 boundary so the engine's I/O dtypes, and therefore both consumers' FP32 buffers, are
+    # unchanged. On TRT < 11 the builder flag still does the work and the graph stays FP32.
+    _needs_half_onnx = (not args.tf32) and not hasattr(trt.BuilderFlag, "FP16")
+    if _needs_half_onnx:
+        print(f"TensorRT {trt.__version__}: exporting ONNX with FP16 interior "
+              f"(FP32 in/out preserved) for a strongly-typed engine")
+    wrapper = SAM2EncoderWrapper(sam.model, half_internal=_needs_half_onnx).eval().to(dev)
 
     for batch in batches:
         tag = f"{args.sam_type}_encoder_b{int(batch)}_{'tf32' if args.tf32 else 'fp16'}"
