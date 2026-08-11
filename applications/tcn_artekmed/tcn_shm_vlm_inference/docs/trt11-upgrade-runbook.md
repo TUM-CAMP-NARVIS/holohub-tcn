@@ -186,6 +186,26 @@ for p in active/groundingdino/gdino_swint_512x672_b2_tf32.engine \
   [ -e "/srv/models/$p" ] && echo "OK   $p" || echo "MISS $p"; done'
 ```
 
+## Step 4b — config hygiene before a live run
+
+Harness settings left in the yaml will stop a live run, or worse, fill a disk. Check all four:
+
+| key | live value | why |
+|---|---|---|
+| `source` | `"shm"` | `"dataset"` replays the export instead of the cameras |
+| `mask_dump_dir` | `""` | dumping a live stream is unbounded: ~6 MiB per panoptic map, ~9 GiB/minute for 5 cameras at 2048x1536. The app now refuses this combination outright |
+| `gpu_workers.workers` | the 5-camera 2/3 profile | a 4-camera profile silently drops camera05 |
+| `gpu_workers.pipelined` | `false` | the 3-operator path measured **-12%**; see the pipelining spec |
+
+```bash
+python3 -c "
+import yaml; c=yaml.safe_load(open('python/tcn_shm_vlm_inference.yaml'))
+print('source          :', c.get('source'))
+print('mask_dump_dir   :', repr(c.get('mask_dump_dir')))
+print('pipelined       :', c['gpu_workers'].get('pipelined'))
+print('workers         :', [(w['device'], len(w['cameras'])) for w in c['gpu_workers']['workers']])"
+```
+
 ## Step 5 — verify
 
 ```bash
@@ -246,4 +266,5 @@ Recorded so they are not rediscovered:
 | slang `unzip` prompting, then `ln -s` failing | same class (fixed) |
 | 243-vs-239 serialization error | step 4 — the model mount still points at `/data/models` |
 | `GDINO engine for batch 3 not found` after switching to live | step 3 built only the active profile's batches; rebuild with `ENGINE_BATCHES="2 3"` |
+| `mask_dump_dir ... already exists and is non-empty` | a harness `mask_dump_dir` left set; clear it for live runs (step 4b) |
 | `No such file: .../sam2.1_hiera_t.yaml` under the new tree | absolute symlinks into `/data/models` dangling in the container; the tree is now hardlinked and self-contained (step 4) |

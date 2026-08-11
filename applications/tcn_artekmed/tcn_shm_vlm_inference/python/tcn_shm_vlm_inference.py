@@ -213,6 +213,19 @@ class App(hs.core.Application):
                 "mask_dump_dir is set but camera_stream_processing.enable_langsam_multicam is "
                 "False -- there is no mask output to dump."
             )
+        if mask_dump_dir and source == "shm":
+            # Dumping is a HARNESS facility: it exists to compare two deterministic replays. On a
+            # live stream there is nothing to compare against and the output is unbounded -- one
+            # panoptic map is 2048*1536*2 = 6 MiB, so 5 cameras at ~5 fps writes ~9 GiB/minute
+            # until the disk fills. A mask_dump_dir left over from a harness run is therefore
+            # always a mistake, and one that costs a disk rather than a run.
+            raise ValueError(
+                f"mask_dump_dir is set ({mask_dump_dir!r}) but source is 'shm' (live).\n"
+                f"Mask dumping is for deterministic dataset replays only: on a live stream there "
+                f"is no second run to compare against, and the output is unbounded -- roughly "
+                f"9 GiB per minute for 5 cameras at 2048x1536.\n"
+                f"Set mask_dump_dir: \"\" for live runs, or source: \"dataset\" to dump."
+            )
 
         dataset_cfg = None
         dataset_cameras = None
