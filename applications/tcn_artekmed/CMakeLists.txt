@@ -72,6 +72,12 @@ add_holohub_application(tcn_shm_vlm_inference DEPENDS OPERATORS
         tcn_shm_subscriber
         tcn_device_context
         tcn_convert_bgra_to_rgba
+        # Fused panoptic-map paint. This DEPENDS entry is what actually enables the build:
+        # add_holohub_operator() gates each operator behind an OP_<NAME> cache option that only
+        # a DEPENDS OPERATORS listing turns ON. Adding it to the app's target_link_libraries is
+        # NOT sufficient -- that is a link-time relationship resolved after configure, so the
+        # subdirectory is never added and the module silently is not built.
+        tcn_panoptic_map
 )
 
 add_holohub_application(tcn_operator_tests DEPENDS OPERATORS
