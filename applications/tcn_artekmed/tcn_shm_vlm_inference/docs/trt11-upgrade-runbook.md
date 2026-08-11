@@ -94,23 +94,54 @@ hand-rolling `docker run`: the launcher already supplies X11 (`DISPLAY`, the X s
 ## Step 3 — rebuild the GDINO and SAM engines
 
 ```bash
-./trt11_build_test.sh --stage engines
+ENGINE_BATCHES="2 3" ./trt11_build_test.sh --stage engines
 ```
 
+**Always name the batches explicitly.** Without `ENGINE_BATCHES`, the stage uses `--from-config` and
+builds only what the *currently active* `gpu_workers` profile needs. That is a trap whenever more
+than one camera topology is in use: building with the 4-camera profile active yields batch 2 only,
+and switching to live then fails at startup with
+
+```
+FileNotFoundError: GDINO engine for batch 3 not found: .../gdino_swint_512x672_b3_tf32.engine
+This worker owns 3 cameras, so it needs a batch-3 engine.
+```
+
+Engine batch **is** the per-worker camera count, because the batch is baked at ONNX trace time:
+
+| topology | worker split | batches needed |
+|---|---|---|
+| 4-camera | 2 + 2 | 2 |
+| 5-camera | 2 + 3 | 2 **and** 3 |
+
+`ENGINE_BATCHES="2 3"` covers both, so either topology runs without a rebuild. Both rigs are
+supported deployments, not test-vs-production.
+
 Builds into `/data/models_trt11` (host) — **never over `/data/models`**, so the TRT 10.9 setup stays
-loadable while the new one is unproven. Batches come from `gpu_workers` in the app yaml, so the
-engines cannot drift from the split that runs (4-camera 2+2 → batch 2 only; 5-camera 2/3 → 2 and 3).
+loadable while the new one is unproven.
 
 Expect, per engine:
 
 ```
 image-independence gate OK
-slice-consistency gate OK (worst IoU 1.000000, worst |score delta| 0.000000)
+slice-consistency gate OK (batch 3: worst IoU 1.000000, worst |score delta| 0.000000)
 pytorch fidelity [OK]: pytorch score=0.871 vs trt 0.872 (|d|=0.001) | top-box IoU=0.9999
 ```
 
 That `[OK]` with `|d|` near zero is the whole point of the upgrade. Under TRT 10.9 the same line read
 `[DEVIATION] ... trt 0.487 (|d|=0.384) | top-box IoU=0.9721`.
+
+Worth noting: batch 3 is slice-exact under TRT 11 (`worst IoU 1.000000`). Under TRT 10.9 an FP16
+batch-3 build **failed** that gate at 0.998016, which was the reason b3 stayed TF32 then.
+
+The GDINO ONNX is precision- and version-neutral and is reused, so no host-side re-export is needed
+for either batch. Confirm the inventory before switching topology:
+
+```bash
+ls /data/models_trt11/active/groundingdino/*.engine /data/models_trt11/active/sam2/*.engine
+```
+
+Expect four files: GDINO `b2` + `b3`, SAM encoder `b2` + `b3`.
 
 ## Step 4 — point the model mount at the new tree
 
@@ -214,4 +245,5 @@ Recorded so they are not rediscovered:
 | `fatal: destination path 'pybind11' already exists` | non-idempotent step in HoloHub's Dockerfile (fixed) |
 | slang `unzip` prompting, then `ln -s` failing | same class (fixed) |
 | 243-vs-239 serialization error | step 4 — the model mount still points at `/data/models` |
+| `GDINO engine for batch 3 not found` after switching to live | step 3 built only the active profile's batches; rebuild with `ENGINE_BATCHES="2 3"` |
 | `No such file: .../sam2.1_hiera_t.yaml` under the new tree | absolute symlinks into `/data/models` dangling in the container; the tree is now hardlinked and self-contained (step 4) |

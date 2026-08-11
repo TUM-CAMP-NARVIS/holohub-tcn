@@ -40,6 +40,14 @@ CUDA_MAJOR="${CUDA_MAJOR:-12}"          # 11.2.1.2 ships +cuda12.9 AND +cuda13.3
 TRT_FULL="${TRT_FULL:-11.2.1.2}"        # exact apt/pip version for the packaging overlay
 TRT_CUDA_MINOR="${TRT_CUDA_MINOR:-12.9}"  # the +cudaX.Y suffix the TRT packages carry
 TRT11_BASE_IMG="${TRT11_BASE_IMG:-holoscan-trt11:4.4.0-cu${CUDA_MAJOR}}"
+
+# Which engine batches to build. Empty = derive from the ACTIVE gpu_workers profile via
+# --from-config. That is a trap when you run more than one camera topology: building with the
+# 4-camera (2+2) profile active yields batch 2 ONLY, and switching to the live 5-camera (2/3)
+# split then fails at startup with "GDINO engine for batch 3 not found". Set ENGINE_BATCHES to
+# build every batch any topology needs, regardless of which profile happens to be active:
+#   ENGINE_BATCHES="2 3" ./trt11_build_test.sh --stage engines
+ENGINE_BATCHES="${ENGINE_BATCHES:-}"
 APP_REL="applications/tcn_artekmed/tcn_shm_vlm_inference"
 
 # Engines built here go to a SEPARATE tree. The live TRT 10.9 engines must stay loadable by the
@@ -256,14 +264,25 @@ stage_engines() {
       ln -sfn "$f" "$ENGINE_OUT_HOST/active/sam2/$(basename "$f")"
   done
   info "sam2 inputs: $(ls "$ENGINE_OUT_HOST/active/sam2" | tr '\n' ' ')"
+  # One --batch N per requested batch, or a single --from-config when none were named.
+  local _batch_args=""
+  if [[ -n "$ENGINE_BATCHES" ]]; then
+    for b in $ENGINE_BATCHES; do _batch_args+="--batch=$b "; done
+    info "building explicit batches: $ENGINE_BATCHES"
+  else
+    _batch_args="--from-config=../python/tcn_shm_vlm_inference.yaml"
+    info "building batches from the ACTIVE gpu_workers profile (set ENGINE_BATCHES to override)"
+  fi
   run docker run --rm --gpus all \
       -v "$ENGINE_OUT_HOST:/srv/models" \
       -v "$ENGINE_SRC_HOST:$ENGINE_SRC_HOST:ro" \
       -v "$HOLOHUB_DIR:/workspace/holohub" \
       "$TEST_IMG" bash -lc "
         cd /workspace/holohub/${APP_REL}/docs &&
-        python3 gdino_trt_export.py --stage build --from-config ../python/tcn_shm_vlm_inference.yaml \
-                --out /srv/models/active/groundingdino
+        for b in ${_batch_args}; do
+          echo \"=== GDINO batch \$b ===\" &&
+          python3 gdino_trt_export.py --stage build \$b --out /srv/models/active/groundingdino || exit 1
+        done
       " || fail "GDINO engine build failed under TRT ${TRT_VERSION}"
   info "EXPECT 'pytorch fidelity [OK] ... |d|=0.000'. That single line is the whole point of the exercise."
   # ENGINE_SRC_HOST is mounted read-only at its own path because the sam2 configs/checkpoints
@@ -275,8 +294,10 @@ stage_engines() {
       -v "$HOLOHUB_DIR:/workspace/holohub" \
       "$TEST_IMG" bash -lc "
         cd /workspace/holohub/${APP_REL}/docs &&
-        python3 sam_trt_export.py --from-config ../python/tcn_shm_vlm_inference.yaml \
-                --out /srv/models/active/sam2
+        for b in ${_batch_args}; do
+          echo \"=== SAM batch \$b ===\" &&
+          python3 sam_trt_export.py \$b --out /srv/models/active/sam2 || exit 1
+        done
       " || info "WARNING: SAM encoder rebuild failed -- GDINO is the one that matters for the fidelity question."
 }
 
