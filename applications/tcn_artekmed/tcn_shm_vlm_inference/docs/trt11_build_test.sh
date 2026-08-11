@@ -225,14 +225,28 @@ stage_engines() {
   TEST_IMG="${TEST_IMG:-$TRT11_BASE_IMG}"
   info "test image: $TEST_IMG"
   mkdir -p "$ENGINE_OUT_HOST/active/groundingdino" "$ENGINE_OUT_HOST/active/sam2"
-  # Seed the precision-neutral inputs the build stage reads (ONNX + prompts + parity ref).
+  # Seed the precision-neutral inputs each build stage reads. Engines are NOT copied -- they are
+  # what we are rebuilding, and a stale TRT 10 engine sitting in the output tree would be loaded
+  # by the app in preference to noticing it was never rebuilt.
   for f in gdino_swint_512x672_b2_tf32.onnx gdino_swint_512x672_b3_tf32.onnx \
            gdino_swint_512x672_parity_ref.npz gdino_swint_prompts.npz; do
     [[ -e "$ENGINE_OUT_HOST/active/groundingdino/$f" ]] || \
       cp -v "$ENGINE_SRC_HOST/active/groundingdino/$f" "$ENGINE_OUT_HOST/active/groundingdino/" 2>&1 | tee -a "$LOG"
   done
+  # SAM needs its model configs and checkpoint, not just an ONNX: sam_trt_export.py instantiates
+  # the SAM 2 model from sam2.1_hiera_*.yaml + the .pt weights. Missing configs is what failed the
+  # first run ("No such file: .../configs/sam2.1/sam2.1_hiera_t.yaml"). Symlink rather than copy --
+  # the checkpoints are 1.6 GB and are read-only inputs.
+  [[ -e "$ENGINE_OUT_HOST/active/sam2/configs" ]] || \
+    ln -sfn "$ENGINE_SRC_HOST/active/sam2/configs" "$ENGINE_OUT_HOST/active/sam2/configs"
+  for f in "$ENGINE_SRC_HOST"/active/sam2/*.pt; do
+    [[ -e "$ENGINE_OUT_HOST/active/sam2/$(basename "$f")" ]] || \
+      ln -sfn "$f" "$ENGINE_OUT_HOST/active/sam2/$(basename "$f")"
+  done
+  info "sam2 inputs: $(ls "$ENGINE_OUT_HOST/active/sam2" | tr '\n' ' ')"
   run docker run --rm --gpus all \
       -v "$ENGINE_OUT_HOST:/srv/models" \
+      -v "$ENGINE_SRC_HOST:$ENGINE_SRC_HOST:ro" \
       -v "$HOLOHUB_DIR:/workspace/holohub" \
       "$TEST_IMG" bash -lc "
         cd /workspace/holohub/${APP_REL}/docs &&
@@ -240,8 +254,13 @@ stage_engines() {
                 --out /srv/models/active/groundingdino
       " || fail "GDINO engine build failed under TRT ${TRT_VERSION}"
   info "EXPECT 'pytorch fidelity [OK] ... |d|=0.000'. That single line is the whole point of the exercise."
+  # ENGINE_SRC_HOST is mounted read-only at its own path because the sam2 configs/checkpoints
+  # in the output tree are absolute symlinks back into it (they are 1.6 GB of read-only inputs,
+  # not worth copying). Without this mount they dangle and the export fails on a missing yaml.
   run docker run --rm --gpus all \
-      -v "$ENGINE_OUT_HOST:/srv/models" -v "$HOLOHUB_DIR:/workspace/holohub" \
+      -v "$ENGINE_OUT_HOST:/srv/models" \
+      -v "$ENGINE_SRC_HOST:$ENGINE_SRC_HOST:ro" \
+      -v "$HOLOHUB_DIR:/workspace/holohub" \
       "$TEST_IMG" bash -lc "
         cd /workspace/holohub/${APP_REL}/docs &&
         python3 sam_trt_export.py --from-config ../python/tcn_shm_vlm_inference.yaml \
