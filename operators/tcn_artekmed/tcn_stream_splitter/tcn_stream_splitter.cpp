@@ -81,7 +81,22 @@ void TcnStreamSplitterOp::compute(holoscan::InputContext& op_input,
     auto strides = nvidia::gxf::ComputeTrivialStrides(
         src_tensor.value()->shape(), src_tensor.value()->bytes_per_element());
 
-    // Wrap the same device memory (zero-copy)
+    // Wrap the same device memory (zero-copy), keeping the SOURCE entity alive for as long as the
+    // wrapped memory is reachable.
+    //
+    // wrapMemory does not take ownership. Passing nullptr as the release callback left every output
+    // tensor pointing at memory owned solely by `input_entity`: once compute() returned and that
+    // last reference went away, the allocation returned to its pool and a later frame could reuse it
+    // while a downstream consumer was still reading. Holding a reference in the release callback --
+    // which GXF invokes when the wrapped buffer is actually freed -- ties the source's lifetime to
+    // the outputs'.
+    //
+    // The symptom was a stale or recycled image in one consumer on some frames: nondeterministic,
+    // and invisible while a single consumer read the tensor immediately after the split. It shows up
+    // once a tensor is buffered (tcn_stream_synchronizer holds entities across ticks) or read by
+    // more than one consumer, which is what the mask/depth join does.
+    auto keep_alive =
+        std::make_shared<nvidia::gxf::Entity>(static_cast<nvidia::gxf::Entity&>(input_entity));
     auto result = out_tensor.value()->wrapMemory(
         src_tensor.value()->shape(),
         src_tensor.value()->element_type(),
@@ -89,7 +104,10 @@ void TcnStreamSplitterOp::compute(holoscan::InputContext& op_input,
         strides,
         src_tensor.value()->storage_type(),
         src_tensor.value()->pointer(),
-        nullptr);
+        [keep_alive](void*) mutable -> nvidia::gxf::Expected<void> {
+          keep_alive.reset();      // the allocation's real owner frees it; we only held a reference
+          return nvidia::gxf::Success;
+        });
     if (!result) {
       throw std::runtime_error(
           "TcnStreamSplitterOp: failed to wrap tensor memory for channel '" +

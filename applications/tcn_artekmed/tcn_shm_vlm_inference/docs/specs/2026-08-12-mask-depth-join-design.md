@@ -67,9 +67,13 @@ Nearest-neighbour sampling of an integer label image through texcoords.
 | `labels_out` | out | device `[Hd, Wd, 1]` uint16 — label per depth pixel |
 | `mask_out` | out | device `[Hd, Wd, 1]` uint8 — 255 where the label's class is selected, else 0 |
 
-Parameters: `in_labels_tensor_name`, `in_texcoord_tensor_name`, `out_tensor_name`,
-`select_classes` (list of class ids; empty = every non-zero class), `emit_mask`,
+Parameters: `in_labels_tensor_name`, `in_texcoord_tensor_name`, `out_labels_tensor_name`,
+`out_mask_tensor_name`, `select_classes` (list of class ids; empty = every non-zero class),
 `unlabeled_value` (default 0), `allocator`, `cuda_device_ordinal`, `cuda_stream_pool`.
+
+Both outputs are always emitted. An `emit_mask` switch was specified and dropped during
+implementation: the mask costs one uint8 buffer on the depth grid (368 KiB at 640×576), and making
+it conditional buys nothing while adding a half-configured state in which a wired consumer starves.
 
 `mask_out` exists so the join composes with the operator that already applies a mask to a depth
 image: `tcn_depthimage_apply_mask` requires a single unnamed uint8 mask with the *same element
@@ -80,8 +84,10 @@ Semantics: `unlabeled_value` is written when the texcoord is NaN (no valid depth
 [0,1] (outside the colour frustum). Nearest neighbour is `round(u * (W-1))`, matching the existing
 sampler's `u * (W-1)` mapping so colour and label sampling address the same pixel grid.
 
-Both class-packing constants (`class = label >> 8`) live in one header shared with
-`tcn_panoptic_map`, which does the packing — the two must not drift.
+The class-packing constants (`class = label >> 8`, 256 class ids) live in the sampler's kernel
+header. They cannot be shared with `tcn_panoptic_map`, which never unpacks — it receives already
+packed `values` from Python. The convention is therefore encoded in exactly two places,
+`langsam_helpers.py` and that header, and both say so.
 
 ### 3. Calibration for the replay source
 
@@ -124,7 +130,36 @@ silently skip a camera).
    the dataset's real calibration so distortion is exercised.
 3. **Invalid gate**: depth 0 everywhere ⇒ `labels_out` is entirely `unlabeled_value` and `mask_out`
    entirely 0. Catches the (0,0)-corner bug this design fixes.
-4. **Determinism**: two replay runs byte-identical, as the existing harness gates already assert.
+4. **Mask implies depth**: a pixel can only be selected if its depth was valid (an invalid sample
+   yields a NaN texcoord, hence no label), so applying the mask must keep every selected pixel.
+   Checked per frame by `JoinCheckOp` and reported as a per-camera verdict. This is what caught the
+   splitter bug above.
+
+Status: gates 1 and 3 pass (11/11 host, 5/5 operator cases); the join runs end to end on the
+4-camera replay with 14–17% of depth pixels labeled and the mask-implies-depth invariant holding on
+every camera. Gate 2 (analytic projection against a synthetic constant-depth image) is not yet
+written — it is the one that would prove the correspondence is *correct* rather than merely present.
+Note the mask counts vary by a few tenths of a percent between runs: the GDINO/SAM stage is not
+bit-reproducible here, so the join's own determinism has to be gated with fixed input masks.
+
+## Found during implementation
+
+**`tcn_stream_splitter` wrapped memory without keeping its owner alive.** `wrapMemory` was called
+with a null release callback, so every split output pointed at memory owned solely by the input
+entity; once `compute()` returned, that allocation could be reused by a later frame while a
+downstream consumer was still reading it. Invisible while one consumer reads a split tensor
+immediately, which is all the colour path ever did. The join exposed it because the synchroniser
+buffers entities across ticks and three operators read the same split depth image. Symptom: on ~1 of
+8 frames, one camera's labels did not belong to the depth image they were applied to — caught by the
+mask-implies-depth invariant below, which is why that check earns its place. Fixed by holding a
+reference to the source entity in the release callback.
+
+**The backprojection operator rejected texcoords-without-positions** in `initialize()`, matching the
+kernel's old nesting. Removed; allocation and emission were already per-output.
+
+**`emit_depth` was hardcoded false** on the dataset source, so depth entities were empty and the
+earlier timestamp-grouping runs were grouping empty payloads (which does not invalidate that gate —
+it tests grouping, not content). Now derived from whether the join is enabled.
 
 ## Explicitly out of scope
 

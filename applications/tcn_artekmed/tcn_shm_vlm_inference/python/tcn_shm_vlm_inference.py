@@ -20,9 +20,16 @@ from holohub.tcn_shm_subscriber._tcn_shm_subscriber import discover_shm
 from holohub.tcn_stream_splitter import TcnStreamSplitterOp as StreamSplitterOp
 from holohub.tcn_convert_bgra_to_rgba import TcnConvertBgraToRgbaOp as ConvertBgraToRgbaOp
 from holohub.tcn_stream_synchronizer import TcnStreamSynchronizerOp
+from holohub.tcn_depthimage_backprojection import TcnDepthImageBackprojectionOp
+from holohub.tcn_depthimage_apply_mask import TcnDepthImageApplyMaskOp
+from holohub.tcn_label_sampler import TcnLabelSamplerOp
+from holohub.tcn_device_context._tcn_device_context import XYLookupTableSourceOp
 
 from operators.tcn_artekmed.tcn_util import RotateImage180Op
 from operators.tcn_artekmed.tcn_dataset_replayer import TcnDatasetReplayerOp
+from operators.tcn_artekmed.tcn_dataset_replayer._calibration import load_device_contexts
+
+from langsam_helpers import mask_name
 
 from mask_dump import MaskDumpOp
 
@@ -213,6 +220,71 @@ class GroupCheckOp(Operator):
                  f"{self.inconsistent} timestamp-inconsistent")
 
 
+class JoinCheckOp(Operator):
+    """Reports what the mask/depth join actually produced, per camera.
+
+    A geometric join fails quietly: wrong extrinsics still yield a full label image, just of the
+    wrong pixels. Nothing here can prove the correspondence is right -- that needs the analytic gate
+    in the operator's own tests -- but these counts catch the failures that produce *nothing*
+    (no valid depth, no texcoord in frustum, no class selected), which otherwise look identical to
+    a scene with no detections.
+    """
+
+    def __init__(self, fragment, *args, camera, stats, **kwargs):
+        self.camera = camera
+        self.stats = stats
+        self.frames = 0
+        super().__init__(fragment, *args, **kwargs)
+
+    def setup(self, spec: OperatorSpec):
+        spec.input("labels")
+        spec.input("mask")
+        spec.input("masked_depth")
+        spec.input("raw_depth")
+
+    def compute(self, op_input, op_output, context):
+        labels = cp.asarray(op_input.receive("labels").get(""))
+        mask = cp.asarray(op_input.receive("mask").get(""))
+        depth = cp.asarray(op_input.receive("masked_depth").get(""))
+        raw = cp.asarray(op_input.receive("raw_depth").get(""))
+        self.frames += 1
+        total = int(labels.size)
+        # One sync per frame for three reductions; this operator exists to be read, and the join
+        # runs at the mask rate (~5 fps), so the cost is not on any hot path.
+        labeled = int(cp.count_nonzero(labels))
+        selected = int(cp.count_nonzero(mask))
+        kept = int(cp.count_nonzero(depth))
+        # Invariant: a pixel can only be selected if it had valid depth (an invalid sample yields a
+        # NaN texcoord, hence no label, hence mask 0), so applying the mask must keep every selected
+        # pixel. A violation means either the invalidation is not working or apply_mask is indexing
+        # the mask differently from the depth image -- both silent, both wrong.
+        lost = int(cp.count_nonzero((mask.reshape(-1) != 0) & (depth.reshape(-1) == 0)))
+        # Splits the invariant violation in two: a selected pixel whose RAW depth is already zero
+        # means the labels do not belong to this depth image (a stale or aliased buffer); one whose
+        # raw depth is fine but masked depth is zero means apply_mask dropped it.
+        stale = int(cp.count_nonzero((mask.reshape(-1) != 0) & (raw.reshape(-1) == 0)))
+        if lost:
+            log.error(f"JoinCheckOp[{self.camera}]: frame {self.frames + 1}: of {lost} lost px, "
+                      f"{stale} already had zero RAW depth "
+                      f"({'labels do not match this depth image' if stale else 'apply_mask dropped them'})")
+        if lost:
+            self.stats.setdefault(self.camera, {}).setdefault("lost", 0)
+            self.stats[self.camera]["lost"] = self.stats[self.camera].get("lost", 0) + lost
+            log.error(f"JoinCheckOp[{self.camera}]: frame {self.frames + 1}: {lost} px are masked "
+                      f"as selected but have zero depth after apply_mask")
+        s = self.stats.setdefault(self.camera, {"frames": 0, "labeled": 0, "selected": 0,
+                                                "kept": 0, "total": 0})
+        s["frames"] += 1
+        s["labeled"] += labeled
+        s["selected"] += selected
+        s["kept"] += kept
+        s["total"] += total
+        if self.frames <= 2:
+            log.info(f"JoinCheckOp[{self.camera}]: frame {self.frames} "
+                     f"{labeled}/{total} px labeled ({100.0 * labeled / total:.1f}%), "
+                     f"{selected} selected, {kept} depth px kept")
+
+
 class DummySinkOp(Operator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -272,6 +344,10 @@ class App(hs.core.Application):
                 f"Set mask_dump_dir: \"\" for live runs, or source: \"dataset\" to dump."
             )
 
+        # Read once, up front: the source needs it (depth must be emitted for the join) and the
+        # join block far below needs it too, and the two must not disagree.
+        join_cfg = self.kwargs("mask_depth_join") or {}
+
         dataset_cfg = None
         dataset_cameras = None
         if source == "dataset":
@@ -288,14 +364,25 @@ class App(hs.core.Application):
             channels_config = receiver_config["channels_config"]
         else:
             shm_receiver = None
-            # No live shm channel to discover: no device calibration (DA3 handles a missing
-            # device_context by disabling metric scaling -- da3_fragment.py -- which is fine
-            # since DA2/DA3 are off by default and are not part of what this dataset path
-            # feeds), and a synthetic `channels_config` shaped just like discover_shm()'s
+            # Calibration comes from the export's own `calibration/<camera>.json`, converted to the
+            # device-context shape the SHM path produces (_calibration.py). Without it the replay
+            # source has no intrinsics, so the geometric path -- xy_table, backprojection, the
+            # mask/depth join -- could only ever run against a live stream, i.e. never against a
+            # deterministic input. `missing_ok`: an export without calibration still replays fine
+            # for everything that is not geometry, and the join refuses per camera further down
+            # rather than being disabled wholesale here.
+            device_contexts = load_device_contexts(
+                dataset_cfg["path"], dataset_cameras, missing_ok=True)
+            uncalibrated = [c for c in dataset_cameras if c not in device_contexts]
+            if uncalibrated:
+                log.warning(f"dataset export has no calibration for {uncalibrated}; the mask/depth "
+                            f"join cannot be built for those cameras")
+            else:
+                log.info(f"loaded dataset calibration for {sorted(device_contexts)}")
+            # A synthetic `channels_config` shaped just like discover_shm()'s
             # return value, containing only the fields actually read below, so the rest of
             # compose() (the color/depth stream split, pool sizing, ...) runs unchanged for
             # both sources.
-            device_contexts = {}
             channels_config = {
                 "ports": [
                     {
@@ -419,13 +506,19 @@ class App(hs.core.Application):
                 # Bounds the run to exactly the requested frames so a harness run exits on its
                 # own instead of running forever (design doc §2.1).
                 source_args = (CountCondition(self, count=int(dataset_frame_count)),)
+            # The join consumes depth, so the source must emit it. Derived rather than configured
+            # separately: `emit_depth: false` with the join on produces empty depth entities, which
+            # the splitter reports as a missing tensor -- a confusing way to say "turn depth on".
+            dataset_emit_depth = (bool(dataset_cfg.get("emit_depth", False))
+                                  or bool(join_cfg.get("enabled", False)))
+            log.info(f"dataset replayer emit_depth={dataset_emit_depth}")
             frame_source_op = TcnDatasetReplayerOp(
                 self, *source_args,
                 dataset_path=dataset_cfg["path"],
                 cameras=dataset_cameras,
                 frame_count=int(dataset_frame_count),
                 loop=bool(dataset_cfg.get("loop", True)),
-                emit_depth=False,
+                emit_depth=dataset_emit_depth,
                 playback=dataset_playback,
                 allocator=device_memory_pool,
                 cuda_stream_pool=cuda_stream_pool,
@@ -476,6 +569,108 @@ class App(hs.core.Application):
                 self.add_flow(temporal_sync, group_check, {(name, name)})
             log.info(f"Temporal sync ENABLED: streams={sync_streams} "
                      f"policy={sync_cfg.get('match_policy', 'exact')}")
+
+            # --- the real mask/depth join (docs/specs/2026-08-12-mask-depth-join-design.md) ---
+            # Per camera: depth -> backprojection -> texcoords, then the panoptic map sampled
+            # through those texcoords onto the depth grid, then apply_mask on the depth image.
+            # Both inputs come out of the synchroniser, so the mask and the depth belong to the
+            # same captured frame -- joining unsynchronised streams is the mis-registration this
+            # whole path exists to remove, which is why it is nested here rather than configurable
+            # independently.
+            if bool(join_cfg.get("enabled", False)):
+                join_cams = [c["name"].replace("_colorimage", "") for c in color_streams_config]
+                # Refuse rather than skip: a camera silently dropped from the join produces a
+                # point cloud that is simply missing its labels, which reads as "no detections".
+                missing_calib = [c for c in join_cams if not ctx_service.has_camera(c)]
+                if missing_calib:
+                    raise ValueError(
+                        f"mask_depth_join is enabled but there is no calibration for "
+                        f"{missing_calib}. The join needs per-camera intrinsics, distortion and "
+                        f"the depth->colour transform; on the dataset source these come from the "
+                        f"export's calibration/<camera>.json.")
+
+                depth_split = StreamSplitterOp(
+                    self, cuda_stream_pool,
+                    channel_names=[f"{c}_depthimage" for c in join_cams],
+                    name="join_depth_splitter")
+                mask_split = StreamSplitterOp(
+                    self, cuda_stream_pool,
+                    channel_names=[mask_name(f"{c}_colorimage") for c in join_cams],
+                    name="join_mask_splitter")
+                self.add_flow(temporal_sync, depth_split, {("depth", "receivers")})
+                self.add_flow(temporal_sync, mask_split, {("masks", "receivers")})
+
+                join_stats = {}
+                self._join_stats = join_stats          # read in run() for the end-of-run summary
+                select_classes = [int(c) for c in (join_cfg.get("select_classes") or [])]
+                for cam in join_cams:
+                    color_model = ctx_service.get_color_camera_model(cam)
+
+                    # Emits once (CountCondition) and backprojection's xy_table port carries no
+                    # condition, so later ticks are not gated on it.
+                    xylt_op = XYLookupTableSourceOp(
+                        self, CountCondition(self, count=1),
+                        allocator=device_memory_pool,
+                        camera_name=cam,
+                        name=f"join_xylt_{cam}")
+                    xylt_op.set_device_context_service(ctx_service)
+
+                    bp_op = TcnDepthImageBackprojectionOp(
+                        self, cuda_stream_pool,
+                        allocator=device_memory_pool,
+                        color_image_width=color_model.dimensions.x,
+                        color_image_height=color_model.dimensions.y,
+                        color_params=color_model,
+                        depth_extrinsics=ctx_service.get_depth_extrinsics(cam),
+                        depth_to_color=ctx_service.get_color_to_depth_inv(cam),
+                        in_tensor_name="",
+                        out_tensor_name="",
+                        # Texcoords only: the join needs the colour correspondence, not the point
+                        # cloud. This configuration used to emit an untouched texcoord buffer --
+                        # the writes were nested inside the positions branch (fixed in the kernel).
+                        enable_positions=False,
+                        enable_texcoords=True,
+                        enable_depth_float=False,
+                        cuda_device_ordinal=cuda_device_id,
+                        name=f"join_bp_{cam}",
+                        **self.kwargs("depthimage_backprojection"))
+
+                    sampler_op = TcnLabelSamplerOp(
+                        self,
+                        allocator=device_memory_pool,
+                        cuda_device_ordinal=cuda_device_id,
+                        select_classes=select_classes,
+                        unlabeled_value=int(join_cfg.get("unlabeled_value", 0)),
+                        name=f"join_sampler_{cam}")
+
+                    # Now connectable: the mask lives on the depth grid, so it satisfies
+                    # apply_mask's "single unnamed uint8 tensor, same element count as the depth
+                    # image" contract that a colour-resolution panoptic map never could.
+                    apply_op = TcnDepthImageApplyMaskOp(
+                        self,
+                        allocator=device_memory_pool,
+                        invert_mask=bool(join_cfg.get("invert_mask", False)),
+                        name=f"join_apply_mask_{cam}")
+
+                    check_op = JoinCheckOp(self, camera=cam, stats=join_stats,
+                                           name=f"join_check_{cam}")
+
+                    self.add_flow(depth_split, bp_op, {(f"{cam}_depthimage", "depth_image")})
+                    self.add_flow(xylt_op, bp_op, {("xy_table", "xy_table")})
+                    self.add_flow(mask_split, sampler_op,
+                                  {(mask_name(f"{cam}_colorimage"), "labels")})
+                    self.add_flow(bp_op, sampler_op, {("texcoords", "texcoords")})
+                    self.add_flow(depth_split, apply_op,
+                                  {(f"{cam}_depthimage", "depth_image")})
+                    self.add_flow(sampler_op, apply_op, {("mask_out", "mask_image")})
+                    self.add_flow(sampler_op, check_op, {("labels_out", "labels")})
+                    self.add_flow(sampler_op, check_op, {("mask_out", "mask")})
+                    self.add_flow(apply_op, check_op, {("output", "masked_depth")})
+                    self.add_flow(depth_split, check_op,
+                                  {(f"{cam}_depthimage", "raw_depth")})
+
+                log.info(f"Mask/depth join ENABLED for {join_cams} "
+                         f"(select_classes={select_classes or 'all non-background'})")
         else:
             di_sink = DummySinkOp(self, name="depth_image_sink")
             self.add_flow(frame_source_op, di_sink, {("depth_outputs", "input")})
@@ -710,6 +905,35 @@ def main(config_file=None, scheduler_type="greedy", log_level="info", with_track
             except KeyboardInterrupt:
                 pass
             tracker.print()
+
+    _report_join_stats(app)
+
+
+def _report_join_stats(app):
+    """End-of-run summary for the mask/depth join, or silence when it was not built.
+
+    JoinCheckOp rate-limits its per-frame logging, so without this a long run's outcome is invisible
+    -- and "the join produced nothing" must not look like "the join was off".
+    """
+    stats = getattr(app, "_join_stats", None)
+    if not stats:
+        return
+    log.info("Mask/depth join summary:")
+    for camera in sorted(stats):
+        s = stats[camera]
+        total = max(1, s["total"])
+        log.info(f"  {camera}: {s['frames']} frame(s), "
+                 f"{100.0 * s['labeled'] / total:.1f}% of depth px labeled, "
+                 f"{100.0 * s['selected'] / total:.1f}% selected, "
+                 f"{100.0 * s['kept'] / total:.1f}% depth px kept")
+        if s["labeled"] == 0:
+            log.error(f"  {camera}: NO depth pixel received a label -- either no depth was valid, "
+                      f"no texcoord fell inside the colour frustum, or the panoptic map was empty")
+        if s.get("lost"):
+            log.error(f"  {camera}: FAIL -- {s['lost']} px were selected but lost their depth; the "
+                      f"labels did not belong to the depth image they were applied to")
+        elif s["labeled"]:
+            log.info(f"  {camera}: PASS -- every selected pixel kept its depth")
 
 
 if __name__ == "__main__":

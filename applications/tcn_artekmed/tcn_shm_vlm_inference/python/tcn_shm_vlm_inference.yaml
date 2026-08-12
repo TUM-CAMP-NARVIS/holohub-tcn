@@ -57,6 +57,32 @@ temporal_sync:
   window_ns: 0              # only used by 'window'
   verbose: false
 
+# ---------------------------------------------------------------------------
+# Mask/depth join (docs/specs/2026-08-12-mask-depth-join-design.md). Requires temporal_sync.enabled:
+# joining a mask to an unsynchronised depth frame is exactly the mis-registration this path removes.
+#
+# Per camera: depth -> backprojection -> texcoords -> sample the panoptic map onto the depth grid ->
+# apply_mask. Needs per-camera calibration; the dataset source loads it from the export's
+# calibration/<camera>.json, the shm source from the device context.
+mask_depth_join:
+  enabled: false
+  # Class ids (the high byte of the packed panoptic label) whose pixels the mask marks. Empty means
+  # every non-background class. Ids follow the prompt order in langsam_multicam -- see class_id_map.
+  select_classes: []
+  # Depth pixels whose mask is 0 are zeroed. Set true to keep the background instead.
+  invert_mask: false
+  # Label written where a depth pixel has no colour correspondence (invalid depth, or projecting
+  # outside the colour frustum). 0 is background, which is almost always what you want.
+  unlabeled_value: 0
+
+# Read by the per-camera backprojection ops in the join. depth_units_per_meter is a property of the
+# capture format (Azure Kinect / Orbbec write millimetres) and a wrong value scales every unprojected
+# point linearly; the limits reject depth samples outside them, whose texcoords then come back NaN.
+depthimage_backprojection:
+  depth_units_per_meter: 1000.0
+  near_limit_m: 0.01
+  far_limit_m: 10.0
+
 shared_memory:
   stream_name: "camera_streams"
   parameter_rpc_name: "tcn_shm_receiver"

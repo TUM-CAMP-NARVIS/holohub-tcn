@@ -91,9 +91,11 @@ void TcnDepthImageBackprojectionOp::initialize() {
   texcoords_output_enabled_ = enable_conditional_port("texcoords", true);
   depth_float_output_enabled_ = enable_conditional_port("depth_float", true);
 
-  if (texcoords_output_enabled_ && !positions_output_enabled_) {
-    throw std::runtime_error("positions output must be enabled for texture-coordinates output");
-  }
+  // Texcoords without positions used to be rejected here because the kernel wrote texcoords only
+  // inside its positions branch. The kernel now drives both outputs from the same unprojected point
+  // independently, so this configuration is valid -- and it is the one the mask/depth join wants,
+  // since that path needs the colour correspondence and not the point cloud. Allocation and emission
+  // below were already per-output; this check was the only obstacle.
 
   // parent class initialize() call must be after the argument additions above
   Operator::initialize();
