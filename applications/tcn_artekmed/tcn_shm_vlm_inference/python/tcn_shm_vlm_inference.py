@@ -24,12 +24,16 @@ from holohub.tcn_depthimage_backprojection import TcnDepthImageBackprojectionOp
 from holohub.tcn_depthimage_apply_mask import TcnDepthImageApplyMaskOp
 from holohub.tcn_label_sampler import TcnLabelSamplerOp
 from holohub.tcn_labeled_pointcloud import TcnLabeledPointcloudOp
+from holohub.tcn_instance_stats import TcnInstanceStatsOp
 from holohub.tcn_stream_merger import TcnStreamMergerOp as StreamMergerOp
 from holohub.tcn_device_context._tcn_device_context import XYLookupTableSourceOp
 
 from operators.tcn_artekmed.tcn_util import RotateImage180Op
 from operators.tcn_artekmed.tcn_dataset_replayer import TcnDatasetReplayerOp
 from operators.tcn_artekmed.tcn_dataset_replayer._calibration import load_device_contexts
+from operators.tcn_artekmed.tcn_object_tracking import (
+    InstanceFusionOp, ObjectConsoleSinkOp, ObjectTrackerOp,
+)
 
 
 from holoscan.conditions import AsynchronousCondition, CountCondition
@@ -367,6 +371,9 @@ class App(hs.core.Application):
         # all three must agree.
         join_cfg = self.kwargs("mask_depth_join") or {}
         join_enabled = bool(join_cfg.get("enabled", False))
+        # Set when the tracking chain is built; the prompt publisher is wired to it later, because
+        # that publisher is created in the langsam block which runs after the join block.
+        self._object_tracker_op = None
 
         dataset_cfg = None
         dataset_cameras = None
@@ -676,6 +683,47 @@ class App(hs.core.Application):
                 # splitter use-after-free), and it is measurable overhead on a live run, so it is
                 # switchable. Default on: a silent join is the failure mode this path is prone to.
                 join_checks = bool(join_cfg.get("check", True))
+                # --- object tracking (docs/specs are in the plan; see tcn_object_tracking) ------
+                # Instance ids from the masks are per-camera, per-frame confidence RANKS, not
+                # identities. This chain turns them into one entry per physical object with a stable
+                # id: per-camera reduction -> cross-camera fusion -> temporal tracking -> console.
+                track_cfg = self.kwargs("object_tracking") or {}
+                track_enabled = bool(track_cfg.get("enabled", False))
+                fusion_op = None
+                if track_enabled:
+                    fusion_op = InstanceFusionOp(
+                        self,
+                        iou_threshold=float(track_cfg.get("fusion_iou_threshold", 0.15)),
+                        containment_threshold=float(track_cfg.get("fusion_containment", 0.6)),
+                        max_centroid_distance_m=float(track_cfg.get("fusion_max_distance_m", 1.0)),
+                        footprint_iou_threshold=float(track_cfg.get("fusion_footprint_iou", 0.4)),
+                        max_vertical_gap_m=float(track_cfg.get("fusion_max_vertical_gap_m", 0.5)),
+                        up_axis=track_cfg.get("up_axis", "axis_y"),
+                        verbose=bool(track_cfg.get("verbose", False)),
+                        name="object_fusion")
+                    tracker_op = ObjectTrackerOp(
+                        self,
+                        min_hits=int(track_cfg.get("min_hits", 3)),
+                        max_age=int(track_cfg.get("max_age", 8)),
+                        iou_threshold=float(track_cfg.get("track_iou_threshold", 0.1)),
+                        max_centroid_distance_m=float(track_cfg.get("track_max_distance_m", 1.0)),
+                        box_smoothing=float(track_cfg.get("box_smoothing", 0.5)),
+                        class_names=list((self.kwargs("text_prompts") or {}).get("prompts") or []),
+                        verbose=bool(track_cfg.get("verbose", False)),
+                        name="object_tracker")
+                    sink_op = ObjectConsoleSinkOp(
+                        self, print_every=int(track_cfg.get("print_every", 1)),
+                        name="object_console")
+                    self.add_flow(fusion_op, tracker_op, {("detections", "detections")})
+                    self.add_flow(tracker_op, sink_op, {("objects", "objects")})
+                    # A prompt change renumbers class ids, so the tracker must reset -- but the
+                    # prompt publisher only exists in the langsam block further down (it needs the
+                    # camera list). Deferred there, the same way the mask half of the temporal-sync
+                    # join is.
+                    self._object_tracker_op = tracker_op
+                    log.info(f"Object tracking ENABLED: min_hits={track_cfg.get('min_hits', 3)} "
+                             f"max_age={track_cfg.get('max_age', 8)}")
+
                 join_stats = {}
                 self._join_stats = join_stats          # read in run() for the end-of-run summary
                 select_classes = [int(c) for c in (join_cfg.get("select_classes") or [])]
@@ -771,6 +819,25 @@ class App(hs.core.Application):
                         self.add_flow(sampler_op,
                                       DummySinkOp(self, name=f"join_labels_sink_{cam}"),
                                       {("labels_out", "input")})
+
+                    # Per-camera instance statistics for the tracking path. Taps the SAME two
+                    # outputs the point cloud consumes, so it is additive: one row per panoptic
+                    # instance with its count, centroid, box and pre-trim spread.
+                    if track_enabled:
+                        stats_op = TcnInstanceStatsOp(
+                            self,
+                            allocator=join_pool,
+                            cuda_device_ordinal=cuda_device_id,
+                            camera_index=join_cams.index(cam),
+                            sigma_k=float(track_cfg.get("sigma_k", 2.5)),
+                            sigma_floor_m=float(track_cfg.get("sigma_floor_m", 0.01)),
+                            min_points=int(track_cfg.get("min_points", 64)),
+                            max_instances=int(track_cfg.get("max_instances", 64)),
+                            verbose=bool(track_cfg.get("verbose_instances", False)),
+                            name=f"join_stats_{cam}")
+                        self.add_flow(bp_op, stats_op, {("positions", "positions")})
+                        self.add_flow(sampler_op, stats_op, {("labels_out", "labels")})
+                        self.add_flow(stats_op, fusion_op, {("instances", "receivers")})
 
                     # Per-camera labeled point cloud: world-space points carrying their packed
                     # (class, instance) label, split into one entity per class.
@@ -985,6 +1052,10 @@ class App(hs.core.Application):
                     self, CountCondition(self, count=1),
                     prompts=runtime_prompts, name="text_prompt_publisher")
                 self.add_flow(prompt_pub, langsam_mc, {("out", "prompts")})
+                if self._object_tracker_op is not None:
+                    # Same message drives the tracker's class-definition reset: class ids are prompt
+                    # positions, so a vocabulary change invalidates every existing identity.
+                    self.add_flow(prompt_pub, self._object_tracker_op, {("out", "prompts")})
                 log.info(f"Prompt publisher will send: {runtime_prompts}")
             else:
                 langsam_mc = RealtimeLangSamSubgraph(

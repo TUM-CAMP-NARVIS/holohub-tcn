@@ -289,19 +289,22 @@ void TcnDepthImageBackprojectionOp::compute(holoscan::InputContext& op_input,
   const dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
   backprojection_u16_kernel<<<grid, block, 0, cuda_stream>>>(params);
 
+  // Fresh entities: forward frame identity or downstream grouping has nothing to group on.
+  const int64_t acq = op_input.get_acquisition_timestamp("depth_image").value_or(-1);
+
   if (positions_output_enabled_) {
     auto positions_message = holoscan::gxf::Entity(std::move(positions_entity));
-    op_output.emit(positions_message, "positions");
+    op_output.emit(positions_message, "positions", acq);
   }
 
   if (texcoords_output_enabled_) {
     auto texcoords_message = holoscan::gxf::Entity(std::move(texcoords_entity));
-    op_output.emit(texcoords_message, "texcoords");
+    op_output.emit(texcoords_message, "texcoords", acq);
   }
 
   if (depth_float_output_enabled_) {
     auto depth_float_message = holoscan::gxf::Entity(std::move(depth_float_entity));
-    op_output.emit(depth_float_message, "depth_float");
+    op_output.emit(depth_float_message, "depth_float", acq);
   }
 }
 

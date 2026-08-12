@@ -281,10 +281,12 @@ void TcnLabelSamplerOp::compute(holoscan::InputContext& op_input,
   const dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
   label_sampler_nearest_kernel<<<grid, block, 0, cuda_stream>>>(params);
 
+  // Fresh entities: forward frame identity (see the collection README on acquisition timestamps).
+  const int64_t acq = op_input.get_acquisition_timestamp("labels").value_or(-1);
   auto labels_message = holoscan::gxf::Entity(std::move(labels_out_entity));
-  op_output.emit(labels_message, "labels_out");
+  op_output.emit(labels_message, "labels_out", acq);
   auto mask_message = holoscan::gxf::Entity(std::move(mask_out_entity));
-  op_output.emit(mask_message, "mask_out");
+  op_output.emit(mask_message, "mask_out", acq);
 }
 
 }  // namespace tcn::ops

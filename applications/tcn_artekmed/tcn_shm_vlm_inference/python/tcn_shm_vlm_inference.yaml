@@ -91,6 +91,47 @@ mask_depth_join:
   pool_initial_size: "256MB"
   pool_max_size: "1GB"
 
+# ---------------------------------------------------------------------------
+# Object tracking: class-labelled bounding boxes with stable ids.
+#
+# Requires mask_depth_join.enabled. Instance ids in the panoptic map are per-camera, per-frame
+# CONFIDENCE RANKS, not identities -- this path turns them into one entry per physical object:
+# per-camera reduction (tcn_instance_stats) -> cross-camera fusion -> temporal tracking -> console.
+object_tracking:
+  enabled: false
+  # --- per-camera reduction ---
+  # Points further than sigma_k standard deviations from the instance mean on any axis are excluded
+  # from the box and centroid. This is what keeps a mask that bleeds onto a background surface from
+  # inflating the box; the reported spread stays un-trimmed so the bleed is still visible.
+  sigma_k: 2.5
+  sigma_floor_m: 0.01     # keeps a flat instance from rejecting all of its own points
+  min_points: 64          # fewer than this is depth noise or mask fringe, not an object
+  max_instances: 64       # per camera per frame; overflow is warned about, never silently truncated
+  # --- cross-camera fusion (metres; the world frame is metric) ---
+  fusion_iou_threshold: 0.15      # two cameras seeing the same body
+  fusion_containment: 0.6         # one view is a subset of the other (torso vs whole person)
+  fusion_footprint_iou: 0.4       # same ground footprint...
+  fusion_max_vertical_gap_m: 0.5  # ...and vertically adjacent: a mask split by an occluder
+  fusion_max_distance_m: 1.0      # stops single-linkage chaining across a room
+  # Which world axis is UP. A property of the calibration, not a convention: backprojection applies
+  # each camera's depth_extrinsics, so "up" is whatever camera_pose made it. For the artekmed exports
+  # it is y -- check by printing object centres, where the vertical axis spans a narrow plausible
+  # height band (~0.8 m) while the horizontal axes span the room (4-7 m). A wrong value does not fail
+  # loudly; it just stops vertically split objects from merging.
+  # NOTE "axis_y", not "y": yaml-cpp resolves a bare AND a quoted `y` to boolean true, so the short
+  # form arrives in the operator as True. The operator rejects that with an explanation.
+  up_axis: "axis_y"
+  # --- identity over time ---
+  min_hits: 3             # observations before an object is reported, so a blip never gets an id
+  max_age: 8              # missed frames before retirement (~1.6 s at 5 fps); then a NEW id
+  track_iou_threshold: 0.1
+  track_max_distance_m: 1.0
+  box_smoothing: 0.5      # 0 = follow the raw box; higher damps depth jitter and lags motion
+  # --- output ---
+  print_every: 1
+  verbose: false
+  verbose_instances: false
+
 # The fused labeled point cloud. Same viewer path as tcn_shm_receiver's point fusion (merge across
 # cameras, flatten, POINTS_3D), one chain per class so classes are separable by colour.
 labeled_pointcloud_holoviz:

@@ -332,8 +332,13 @@ void TcnInstanceStatsOp::compute(holoscan::InputContext& op_input,
     }
   }
 
+  // Forward the acquisition timestamp. This operator emits a FRESH entity, so frame identity does
+  // not propagate by itself -- and without it a downstream consumer that groups by frame (the
+  // cross-camera fusion does) has nothing to group on. Omitting this showed up immediately as
+  // `acq=-1` in the tracker's output.
+  const auto acq = op_input.get_acquisition_timestamp("positions");
   auto message = holoscan::gxf::Entity(std::move(out_entity));
-  op_output.emit(message, "instances");
+  op_output.emit(message, "instances", acq.value_or(-1));
 }
 
 }  // namespace tcn::ops

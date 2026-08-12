@@ -58,6 +58,11 @@ void TcnStreamSplitterOp::compute(holoscan::InputContext& op_input,
   // AND auto-configures all output ports to emit that (correctly-synced) stream.
   cudaStream_t _stream = op_input.receive_cuda_stream("receivers");
 
+  // Frame identity must be forwarded explicitly: these are FRESH entities, so the input's
+  // acquisition timestamp does not propagate by itself, and anything downstream that groups by
+  // frame would have nothing to group on. Every split output carries the input's stamp.
+  const int64_t acq = op_input.get_acquisition_timestamp("receivers").value_or(-1);
+
   for (const auto& channel_name : channel_names_.get()) {
     // Get the tensor for this channel from the input entity (as GXF tensor)
     auto src_tensor = static_cast<nvidia::gxf::Entity&>(input_entity)
@@ -114,7 +119,7 @@ void TcnStreamSplitterOp::compute(holoscan::InputContext& op_input,
           channel_name + "'.");
     }
 
-    op_output.emit(out_entity, channel_name.c_str());
+    op_output.emit(out_entity, channel_name.c_str(), acq);
   }
 }
 
