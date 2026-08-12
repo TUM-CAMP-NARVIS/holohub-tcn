@@ -81,6 +81,15 @@ mask_depth_join:
   pointcloud_classes: []
   # Log per-class point counts every frame.
   verbose: false
+  # Verification operators (JoinCheckOp / CloudFusionCheckOp). They read every output back with GPU
+  # reductions -- one sync per camera per frame -- and assert that a pixel selected by the mask kept
+  # its depth, which is what caught a use-after-free in the stream splitter. Keep on while gating;
+  # turn off for a latency-sensitive live run.
+  check: true
+  # The join allocates dozens of small, variable-sized tensors per frame, so it uses its own
+  # RMMAllocator rather than the frame-sized BlockMemoryPool the rest of the app shares.
+  pool_initial_size: "256MB"
+  pool_max_size: "1GB"
 
 # The fused labeled point cloud. Same viewer path as tcn_shm_receiver's point fusion (merge across
 # cameras, flatten, POINTS_3D), one chain per class so classes are separable by colour.

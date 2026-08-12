@@ -389,15 +389,23 @@ class App(hs.core.Application):
                 f"Set mask_dump_dir: \"\" for live runs, or source: \"dataset\" to dump."
             )
 
-        # Read once, up front: the source needs it (depth must be emitted for the join) and the
-        # join block far below needs it too, and the two must not disagree.
+        # Read once, up front: the source needs it (depth must be emitted for the join), the
+        # synthetic dataset channel config needs it, and the join block far below needs it too --
+        # all three must agree.
         join_cfg = self.kwargs("mask_depth_join") or {}
+        join_enabled = bool(join_cfg.get("enabled", False))
 
         dataset_cfg = None
         dataset_cameras = None
+        # The join consumes depth, so the source must emit it. Derived rather than configured
+        # separately: `emit_depth: false` with the join on produces empty depth entities, which the
+        # splitter reports as a missing tensor -- a confusing way to say "turn depth on".
+        dataset_emit_depth = False
         if source == "dataset":
             dataset_cfg = self.kwargs("dataset_source")
             dataset_cameras = list(dataset_cfg.get("cameras") or [])
+            dataset_emit_depth = bool(dataset_cfg.get("emit_depth", False)) or join_enabled
+            log.info(f"dataset replayer emit_depth={dataset_emit_depth}")
             if not dataset_cameras:
                 raise ValueError("dataset_source.cameras must list at least one camera id")
 
@@ -428,6 +436,9 @@ class App(hs.core.Application):
             # return value, containing only the fields actually read below, so the rest of
             # compose() (the color/depth stream split, pool sizing, ...) runs unchanged for
             # both sources.
+            # Depth ports are declared only when depth is actually emitted, so what this
+            # synthetic config says about the source stays true -- the join discovers its depth
+            # channels from here exactly as it does from a live segment.
             channels_config = {
                 "ports": [
                     {
@@ -438,7 +449,16 @@ class App(hs.core.Application):
                         },
                     }
                     for cam in dataset_cameras
-                ]
+                ] + ([
+                    {
+                        "name": f"{cam}_depthimage",
+                        "status": {
+                            "portType": "depthimage",
+                            "bufferInfo": {"frameSize": _DATASET_MAX_FRAME_BYTES},
+                        },
+                    }
+                    for cam in dataset_cameras
+                ] if dataset_emit_depth else [])
             }
 
         # Register the ctx_service with the fragment
@@ -551,12 +571,6 @@ class App(hs.core.Application):
                 # Bounds the run to exactly the requested frames so a harness run exits on its
                 # own instead of running forever (design doc §2.1).
                 source_args = (CountCondition(self, count=int(dataset_frame_count)),)
-            # The join consumes depth, so the source must emit it. Derived rather than configured
-            # separately: `emit_depth: false` with the join on produces empty depth entities, which
-            # the splitter reports as a missing tensor -- a confusing way to say "turn depth on".
-            dataset_emit_depth = (bool(dataset_cfg.get("emit_depth", False))
-                                  or bool(join_cfg.get("enabled", False)))
-            log.info(f"dataset replayer emit_depth={dataset_emit_depth}")
             frame_source_op = TcnDatasetReplayerOp(
                 self, *source_args,
                 dataset_path=dataset_cfg["path"],
@@ -622,7 +636,7 @@ class App(hs.core.Application):
             # same captured frame -- joining unsynchronised streams is the mis-registration this
             # whole path exists to remove, which is why it is nested here rather than configurable
             # independently.
-            if bool(join_cfg.get("enabled", False)):
+            if join_enabled:
                 join_cams = [c["name"].replace("_colorimage", "") for c in color_streams_config]
                 # Refuse rather than skip: a camera silently dropped from the join produces a
                 # point cloud that is simply missing its labels, which reads as "no detections".
@@ -633,6 +647,31 @@ class App(hs.core.Application):
                         f"{missing_calib}. The join needs per-camera intrinsics, distortion and "
                         f"the depth->colour transform; on the dataset source these come from the "
                         f"export's calibration/<camera>.json.")
+
+                # Depth tensor names come from the channels the SOURCE actually declares, matched to
+                # each camera by name prefix -- not built as f"{cam}_depthimage". The convention
+                # happens to hold for both sources today, but a live segment that names its depth
+                # channel anything else would fail at the first tick inside the splitter
+                # ("input entity missing tensor"), pointing at the splitter rather than at the
+                # mismatch. Refusing here names the camera and lists what the source does provide.
+                depth_channel_for = {}
+                for cam in join_cams:
+                    candidates = [c["name"] for c in depth_streams_config
+                                  if c["name"] == f"{cam}_depthimage"
+                                  or c["name"].startswith(f"{cam}_")]
+                    if not candidates:
+                        raise ValueError(
+                            f"mask_depth_join is enabled but the source declares no depth channel "
+                            f"for camera {cam!r}. Depth channels found: "
+                            f"{[c['name'] for c in depth_streams_config]}. The join unprojects the "
+                            f"depth image, so a camera without depth cannot take part; on the "
+                            f"dataset source check dataset_source.emit_depth.")
+                    if len(candidates) > 1:
+                        raise ValueError(
+                            f"mask_depth_join found {len(candidates)} depth channels for camera "
+                            f"{cam!r}: {candidates}. Cannot tell which to unproject.")
+                    depth_channel_for[cam] = candidates[0]
+                log.info(f"mask/depth join depth channels: {depth_channel_for}")
 
                 # The join needs its OWN allocator. The shared device_memory_pool is a
                 # BlockMemoryPool whose blocks are sized for a whole camera frame (16 MiB), and the
@@ -650,7 +689,7 @@ class App(hs.core.Application):
 
                 depth_split = StreamSplitterOp(
                     self, cuda_stream_pool,
-                    channel_names=[f"{c}_depthimage" for c in join_cams],
+                    channel_names=[depth_channel_for[c] for c in join_cams],
                     name="join_depth_splitter")
                 mask_split = StreamSplitterOp(
                     self, cuda_stream_pool,
@@ -659,6 +698,11 @@ class App(hs.core.Application):
                 self.add_flow(temporal_sync, depth_split, {("depth", "receivers")})
                 self.add_flow(temporal_sync, mask_split, {("masks", "receivers")})
 
+                # The verification operators read every output back with GPU reductions -- one
+                # sync per camera per frame. That is worth it while gating (it is what caught the
+                # splitter use-after-free), and it is measurable overhead on a live run, so it is
+                # switchable. Default on: a silent join is the failure mode this path is prone to.
+                join_checks = bool(join_cfg.get("check", True))
                 join_stats = {}
                 self._join_stats = join_stats          # read in run() for the end-of-run summary
                 select_classes = [int(c) for c in (join_cfg.get("select_classes") or [])]
@@ -727,22 +771,33 @@ class App(hs.core.Application):
                         invert_mask=bool(join_cfg.get("invert_mask", False)),
                         name=f"join_apply_mask_{cam}")
 
-                    check_op = JoinCheckOp(self, camera=cam, stats=join_stats,
-                                           name=f"join_check_{cam}")
+                    check_op = None
+                    if join_checks:
+                        check_op = JoinCheckOp(self, camera=cam, stats=join_stats,
+                                               name=f"join_check_{cam}")
 
-                    self.add_flow(depth_split, bp_op, {(f"{cam}_depthimage", "depth_image")})
+                    self.add_flow(depth_split, bp_op,
+                                  {(depth_channel_for[cam], "depth_image")})
                     self.add_flow(xylt_op, bp_op, {("xy_table", "xy_table")})
                     self.add_flow(mask_split, sampler_op,
                                   {(mask_name(f"{cam}_colorimage"), "labels")})
                     self.add_flow(bp_op, sampler_op, {("texcoords", "texcoords")})
                     self.add_flow(depth_split, apply_op,
-                                  {(f"{cam}_depthimage", "depth_image")})
+                                  {(depth_channel_for[cam], "depth_image")})
                     self.add_flow(sampler_op, apply_op, {("mask_out", "mask_image")})
-                    self.add_flow(sampler_op, check_op, {("labels_out", "labels")})
-                    self.add_flow(sampler_op, check_op, {("mask_out", "mask")})
-                    self.add_flow(apply_op, check_op, {("output", "masked_depth")})
-                    self.add_flow(depth_split, check_op,
-                                  {(f"{cam}_depthimage", "raw_depth")})
+                    if check_op is not None:
+                        self.add_flow(sampler_op, check_op, {("labels_out", "labels")})
+                        self.add_flow(sampler_op, check_op, {("mask_out", "mask")})
+                        self.add_flow(apply_op, check_op, {("output", "masked_depth")})
+                        self.add_flow(depth_split, check_op,
+                                      {(depth_channel_for[cam], "raw_depth")})
+                    else:
+                        # apply_mask still needs a consumer, or it back-pressures the whole join.
+                        self.add_flow(apply_op, DummySinkOp(self, name=f"join_apply_sink_{cam}"),
+                                      {("output", "input")})
+                        self.add_flow(sampler_op,
+                                      DummySinkOp(self, name=f"join_labels_sink_{cam}"),
+                                      {("labels_out", "input")})
 
                     # Per-camera labeled point cloud: world-space points carrying their packed
                     # (class, instance) label, split into one entity per class.
@@ -791,13 +846,14 @@ class App(hs.core.Application):
                     cloud_specs.append(spec)
                     cloud_merge_ops.append(merge_op)
 
-                cloud_fusion_stats = {}
-                self._cloud_fusion_stats = cloud_fusion_stats
-                fusion_check = CloudFusionCheckOp(self, classes=cloud_classes,
-                                                  stats=cloud_fusion_stats,
-                                                  name="cloud_fusion_check")
-                for cls, merge_op in zip(cloud_classes, cloud_merge_ops):
-                    self.add_flow(merge_op, fusion_check, {("output", f"class_{cls}")})
+                if join_checks:
+                    cloud_fusion_stats = {}
+                    self._cloud_fusion_stats = cloud_fusion_stats
+                    fusion_check = CloudFusionCheckOp(self, classes=cloud_classes,
+                                                      stats=cloud_fusion_stats,
+                                                      name="cloud_fusion_check")
+                    for cls, merge_op in zip(cloud_classes, cloud_merge_ops):
+                        self.add_flow(merge_op, fusion_check, {("output", f"class_{cls}")})
 
                 cloud_visualizer = HolovizOp(
                     self,
