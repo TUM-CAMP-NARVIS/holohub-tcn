@@ -73,6 +73,23 @@ many times the preloaded selection has fully wrapped) are exposed as read-only p
 harness can label dumps with the true source frame number rather than a raw tick counter --
 essential once `loop=True` and the run outlives one pass through the dataset.
 
+## Acquisition timestamps
+
+Both output ports carry one acquisition timestamp per frame group, mirroring the live subscriber,
+which stamps one time per SHM composite buffer shared by every camera in it. The value is the
+minimum of the selected cameras' `<camera>_colorimage` stamps; an export carrying no timestamps gets
+synthetic 30 fps spacing, with a warning so it cannot be mistaken for real capture times.
+
+Under `loop=True` each completed pass shifts the timestamps forward by one dataset span (the plan's
+extent plus its smallest inter-frame gap, `_planning.loop_span_ns`). Without that shift a looping
+replay re-emits times it has already emitted, and a consumer that keys on acquisition time -- such as
+`tcn_stream_synchronizer` -- correctly rejects them, so only the first pass would ever be processed.
+Pass 0 is unshifted, so a single-pass run still carries the dataset's genuine capture times.
+
+If the plan's timestamps do not strictly increase in plan order, `start()` warns: the dataset's frame
+order and its capture order disagree, frames then collide *within* a pass, and no loop offset can
+fix that.
+
 ## Frame selection
 
 The exact list of source frame numbers a run selects (before looping) is computed by the pure,

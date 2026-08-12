@@ -60,3 +60,42 @@ def plan_frame_sequence(
     n = len(selection)
     full_cycles, remainder = divmod(ticks, n)
     return selection * full_cycles + selection[:remainder]
+
+
+#: Fallback inter-frame spacing (30 fps) when a cadence cannot be measured. Matches the synthetic
+#: timestamps `TcnDatasetReplayerOp` invents for an export that carries none.
+DEFAULT_INTERVAL_NS = 33_333_333
+
+
+def loop_span_ns(stamps: Sequence[int], default_interval_ns: int = DEFAULT_INTERVAL_NS) -> int:
+    """Nanoseconds to add per completed loop so replayed timestamps keep advancing.
+
+    A consumer that keys on acquisition time treats a timestamp as a frame's identity, so it must
+    reject one that does not advance -- two frames cannot BE the same frame. Replaying a dataset's
+    real capture times verbatim therefore makes every pass after the first look like a repeat, and a
+    looping run only ever synchronises pass 0.
+
+    The span is the timestamps' extent plus one inter-frame interval, so the first frame of the next
+    pass lands one interval after the last frame of this one, as if capture had simply continued.
+    The interval is the smallest positive gap between consecutive stamps in time order, which is the
+    dataset's own cadence; `default_interval_ns` covers the degenerate cases (fewer than two stamps,
+    or all stamps equal).
+
+    Order-independent: `stamps` may be in any order, since only the extent and the gaps matter.
+    """
+    ordered = sorted(stamps)
+    if len(ordered) < 2:
+        return default_interval_ns
+    gaps = [b - a for a, b in zip(ordered, ordered[1:]) if b > a]
+    interval = min(gaps) if gaps else default_interval_ns
+    return (ordered[-1] - ordered[0]) + interval
+
+
+def is_strictly_increasing(values: Sequence[int]) -> bool:
+    """Whether `values` strictly increases in the order given.
+
+    Checked in PLAN order, not sorted order: sorting is what hides the defect this detects -- a
+    frame plan whose capture times disagree with its frame order. No loop offset can fix that, since
+    the frames collide within a single pass.
+    """
+    return all(b > a for a, b in zip(values, values[1:]))

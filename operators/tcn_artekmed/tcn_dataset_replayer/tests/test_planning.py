@@ -1,4 +1,4 @@
-"""Host tests for `_planning.py` (pure numpy-free frame-plan arithmetic).
+"""Host tests for `_planning.py` (pure numpy-free frame-plan and timestamp arithmetic).
 
 Run directly: `python3 operators/tcn_artekmed/tcn_dataset_replayer/tests/test_planning.py`
 
@@ -11,7 +11,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from _planning import plan_frame_sequence
+from _planning import (DEFAULT_INTERVAL_NS, is_strictly_increasing, loop_span_ns,
+                       plan_frame_sequence)
 
 CONTIGUOUS = [0, 1, 2, 3, 4, 5]
 # Non-contiguous frame numbers: an index/number confusion (e.g. returning the selected
@@ -127,6 +128,73 @@ def test_loop_with_ticks_shorter_than_selection_truncates():
     # loop=True but ticks smaller than one full cycle: still just the first `ticks` entries.
     got = plan_frame_sequence(CONTIGUOUS, count=4, loop=True, ticks=2)
     assert got == [0, 1]
+
+
+
+# --- loop_span_ns / is_strictly_increasing --------------------------------------------------------
+# The property that matters: replaying the plan with `k * span` added must produce a strictly
+# increasing timestamp sequence across passes. Tests assert that directly where they can, rather
+# than restating the extent-plus-interval formula.
+
+MS = 1_000_000
+
+
+def _replayed(stamps, span, passes):
+    """The timestamps a looping replay would emit over `passes` passes."""
+    return [t + k * span for k in range(passes) for t in stamps]
+
+
+def test_span_keeps_uniform_cadence_strictly_increasing_across_passes():
+    stamps = [0, 33 * MS, 66 * MS, 99 * MS]
+    assert is_strictly_increasing(_replayed(stamps, loop_span_ns(stamps), passes=4))
+
+
+def test_span_keeps_irregular_cadence_strictly_increasing_across_passes():
+    # Gaps 10, 5, 40 ms: the span must clear the LARGEST stamp, using the smallest gap as the
+    # step, so an uneven export loops just as safely as an even one.
+    stamps = [100 * MS, 110 * MS, 115 * MS, 155 * MS]
+    assert is_strictly_increasing(_replayed(stamps, loop_span_ns(stamps), passes=3))
+
+
+def test_span_equals_extent_plus_smallest_gap():
+    stamps = [1000, 1003, 1010]            # extent 10, smallest gap 3
+    assert loop_span_ns(stamps) == 13
+
+
+def test_span_is_order_independent():
+    stamps = [50 * MS, 10 * MS, 30 * MS]
+    assert loop_span_ns(stamps) == loop_span_ns(sorted(stamps))
+
+
+def test_single_stamp_falls_back_to_default_interval():
+    assert loop_span_ns([12345]) == DEFAULT_INTERVAL_NS
+
+
+def test_empty_falls_back_to_default_interval():
+    assert loop_span_ns([]) == DEFAULT_INTERVAL_NS
+
+
+def test_all_stamps_equal_falls_back_to_default_interval():
+    # Extent 0 and no positive gap: the span is the fallback interval alone, which is still enough
+    # to separate one pass from the next.
+    assert loop_span_ns([7, 7, 7]) == DEFAULT_INTERVAL_NS
+    assert is_strictly_increasing([7 + k * loop_span_ns([7, 7, 7]) for k in range(3)])
+
+
+def test_custom_default_interval_is_honoured():
+    assert loop_span_ns([1], default_interval_ns=500) == 500
+
+
+def test_strictly_increasing_detects_plan_order_not_sorted_order():
+    # The point of checking in plan order: this sequence sorts fine but replays out of order.
+    assert not is_strictly_increasing([30 * MS, 10 * MS, 20 * MS])
+    assert is_strictly_increasing([10 * MS, 20 * MS, 30 * MS])
+
+
+def test_strictly_increasing_rejects_duplicates_and_accepts_short_sequences():
+    assert not is_strictly_increasing([5, 5])
+    assert is_strictly_increasing([5])
+    assert is_strictly_increasing([])
 
 
 if __name__ == "__main__":

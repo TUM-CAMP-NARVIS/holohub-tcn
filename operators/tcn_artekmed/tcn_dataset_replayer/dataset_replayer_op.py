@@ -24,7 +24,7 @@ import numpy as np
 from holoscan.conditions import AsynchronousEventState
 from holoscan.core import Operator, OperatorSpec
 
-from ._planning import plan_frame_sequence
+from ._planning import is_strictly_increasing, loop_span_ns, plan_frame_sequence
 
 log = logging.getLogger("TcnDatasetReplayerOp")
 
@@ -131,6 +131,7 @@ class TcnDatasetReplayerOp(Operator):
         self._frame_index: Optional[int] = None
         self._loop_count = 0
         self._exhausted_warned = False
+        self._acq_loop_span_ns = 0        # measured in start(); 0 leaves pass 0 unshifted
 
         # Need to call the base class constructor last (tcn_util convention).
         super().__init__(fragment, *args, **kwargs)
@@ -191,6 +192,26 @@ class TcnDatasetReplayerOp(Operator):
             log.warning("TcnDatasetReplayerOp: dataset has no colorimage timestamps; synthesising "
                         "monotonic acquisition times at 30 fps for frame grouping")
         return int(frame_number) * 33_333_333
+
+    def _compute_acq_loop_span(self):
+        """Per-loop timestamp offset for this frame plan, and a warning if the plan is out of order.
+
+        Arithmetic lives in `_planning.loop_span_ns` so it is testable without holoscan/cupy; see its
+        docstring for why a looping replay needs the offset at all.
+        """
+        stamps = [self._acq_ns[f] for f in self._plan]       # PLAN order, not sorted -- see below
+        if not is_strictly_increasing(stamps):
+            # The dataset's frame order and its capture order disagree, so frames collide WITHIN a
+            # pass and downstream grouping drops them. No loop offset can fix that; say so at
+            # startup rather than let the run quietly come up short.
+            log.warning("TcnDatasetReplayerOp: acquisition timestamps are not strictly increasing "
+                        "across the frame plan; downstream timestamp grouping will discard the "
+                        "non-advancing frames")
+        span = loop_span_ns(stamps)
+        if self.loop:
+            log.info("TcnDatasetReplayerOp: looping replay shifts acquisition timestamps by "
+                     "%.3f ms per pass so replayed time keeps advancing", span / 1e6)
+        return span
 
     def start(self):
         # Imported lazily: pyarrow/tifffile/PIL are not available on a plain host, only inside
@@ -288,6 +309,8 @@ class TcnDatasetReplayerOp(Operator):
             len(self._plan), len(self._camera_ids), self.emit_depth, total_bytes / (1024 * 1024),
         )
 
+        self._acq_loop_span_ns = self._compute_acq_loop_span()
+
         self._tick = 0
         self._frame_index = None
         self._loop_count = 0
@@ -359,8 +382,10 @@ class TcnDatasetReplayerOp(Operator):
                 device_array.set(host_array)
                 depth_message[f"{camera_id}_depthimage"] = hs.as_tensor(device_array)
 
-        # Both ports carry the SAME group timestamp, as the live subscriber does.
-        acq = int(self._acq_ns.get(frame_number, -1))
+        # Both ports carry the SAME group timestamp, as the live subscriber does. Each completed
+        # loop shifts it forward by one dataset span so replayed time keeps advancing across passes
+        # -- see _compute_acq_loop_span(). Pass 0 is unshifted.
+        acq = int(self._acq_ns.get(frame_number, -1)) + self._loop_count * self._acq_loop_span_ns
         op_output.emit(color_message, "color_outputs", acq_timestamp=acq)
         op_output.emit(depth_message, "depth_outputs", acq_timestamp=acq)
 
