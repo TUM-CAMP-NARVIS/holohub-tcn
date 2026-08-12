@@ -1,0 +1,36 @@
+{
+  "library": {
+    "authors": [
+      {
+        "name": "Ulrich Eck",
+        "affiliation": "TUM-CAMP-NARVIS"
+      }
+    ],
+    "language": [
+      "C++"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0": "Initial Release"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "3.3.0",
+      "tested_versions": [
+        "3.3.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "packages": []
+    },
+    "name": "tcn_cdr_serde",
+    "description": "CDR serialisation and the runtime type registry used by the Zenoh transport operators.",
+    "tags": [
+      "Streaming"
+    ]
+  }
+}

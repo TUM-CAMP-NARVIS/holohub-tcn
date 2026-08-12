@@ -1,0 +1,38 @@
+{
+  "operator": {
+    "name": "TcnStreamMergerOp",
+    "description": "Merges several entities into one, optionally concatenating their tensors along dimension 1.",
+    "authors": [
+      {
+        "name": "Ulrich Eck",
+        "affiliation": "TUM-CAMP-NARVIS"
+      }
+    ],
+    "language": [
+      "C++",
+      "Python"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0": "Initial Release"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "3.3.0",
+      "tested_versions": [
+        "3.3.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Streaming",
+      "Pointcloud Processing"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "packages": []
+    }
+  }
+}
