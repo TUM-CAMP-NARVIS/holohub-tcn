@@ -14,6 +14,7 @@ This is a behaviour-neutral refactor: same stage boundaries, same NVTX names, sa
 including quirks (see the spec's "behaviour that must not change").
 """
 import logging
+from operators.tcn_artekmed.tcn_util.frame_identity import acq_timestamp
 import os
 
 import cupy as cp
@@ -21,13 +22,12 @@ import torch
 import holoscan as hs
 from holoscan.core import Operator, OperatorSpec
 
-from langsam_common import (
-    SAM, GDINO, GDinoTrtDetector, class_id_map, build_panoptic_map, build_panoptic_map_auto,
-    worker_engine_path,
+from .models import (
+    SAM, GDINO, GDinoTrtDetector, class_id_map, build_panoptic_map, build_panoptic_map_auto, worker_engine_path,
 )
 # Shared with langsam_multicam_fragment.py so the output-key convention can't drift between the
 # monolithic and split ops; imported directly (not via langsam_common's re-export list).
-from langsam_helpers import mask_name
+from .helpers import mask_name
 
 log = logging.getLogger(__name__)
 

@@ -6,7 +6,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from langsam_helpers import gdino_postprocess, build_class_token_masks, gdino_postprocess_batch
+from helpers import gdino_postprocess, build_class_token_masks, gdino_postprocess_batch
 
 
 def _sig_inv(p):  # logit that yields target prob p

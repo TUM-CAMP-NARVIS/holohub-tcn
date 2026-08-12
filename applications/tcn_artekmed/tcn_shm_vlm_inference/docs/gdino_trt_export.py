@@ -49,8 +49,11 @@ import numpy as np
 import tensorrt as trt
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
-from langsam_helpers import resolve_workers, distinct_batches      # noqa: E402
+# The langsam helpers and model wrappers now live in the reusable operator package, so the
+# repo root goes on sys.path rather than the application's python directory.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "..", "..", ".."))
+from operators.tcn_artekmed.tcn_langsam.helpers import resolve_workers, distinct_batches      # noqa: E402
 
 MAX_TEXT_LEN = 256
 INPUT_NAMES = ["img", "input_ids", "attention_mask", "position_ids", "token_type_ids", "text_token_mask"]

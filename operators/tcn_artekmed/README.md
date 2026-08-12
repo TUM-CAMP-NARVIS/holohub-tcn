@@ -42,6 +42,15 @@ Each operator has its own README with ports, parameters and caveats. This page c
 | [tcn_depthimage_max_distance](tcn_depthimage_max_distance/README.md) | Per-pixel running maximum, for building a background reference |
 | [tcn_depthimage_temporal_filter](tcn_depthimage_temporal_filter/README.md) | Persistence/EMA temporal filter for depth noise |
 
+### Models and inference sub-flows
+
+Python sub-flows: whole pipelines packaged as `Subgraph`s, reusable across applications.
+
+| package | purpose |
+|---|---|
+| [tcn_langsam](tcn_langsam/README.md) | Open-vocabulary segmentation (Grounding DINO + SAM 2) — a TensorRT multi-camera realtime path with baked prompts, and a PyTorch path with runtime prompting |
+| [tcn_depth_anything](tcn_depth_anything/README.md) | Monocular metric depth, Depth-Anything V2 and V3 |
+
 ### Segmentation and point clouds
 
 | operator | purpose |
@@ -67,7 +76,7 @@ Each operator has its own README with ports, parameters and caveats. This page c
 
 | directory | purpose |
 |---|---|
-| [tcn_util](tcn_util/README.md) | Python operators: rotate, channel convert, flatten, split/merge, depth helpers |
+| [tcn_util](tcn_util/README.md) | Python operators: rotate, channel convert, flatten, split/merge, depth helpers; plus `frame_identity` (acquisition timestamps and tensor-map filtering) |
 | [tcn_shm_io](tcn_shm_io/README.md) | Python SHM receiver, RPC and subscriber operator |
 | [tcn_processing](tcn_processing/README.md) | Python reference implementations (e.g. simple backprojection) |
 | [tcn_slang_renderer](tcn_slang_renderer/README.md) | slangpy-based renderers for point clouds and meshes |

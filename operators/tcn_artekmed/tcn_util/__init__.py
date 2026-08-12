@@ -141,3 +141,13 @@ from .RotateImage180Op import RotateImage180Op
 __all__ = ["StreamMergerOp", "StreamSplitterOp", "FlattenTensorOp",
            "DepthImageMaxDistanceOp", "DepthImageForegroundBackgroundMaskOp",
            "DepthImageApplyMaskOp", "ConvertBgraToRgbaOp", "RotateImage180Op"]
+
+# ── frame identity (acquisition timestamps + tensor-map filtering) ──
+# Pure Python with no C++ counterpart: these wrap Holoscan's own accessors.
+from .frame_identity import (  # noqa: E402
+    NO_ACQ_TIMESTAMP,
+    NON_TENSOR_COMPONENTS,
+    acq_timestamp,
+    acq_timestamp_consensus,
+    tensor_names,
+)

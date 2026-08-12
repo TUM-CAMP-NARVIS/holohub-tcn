@@ -18,13 +18,14 @@ no dataset frame number to report in the first place, so a tick counter IS the c
 there.
 """
 import logging
+from operators.tcn_artekmed.tcn_util.frame_identity import tensor_names
 import os
 
 import cupy as cp
 import numpy as np
 from holoscan.core import Operator, OperatorSpec
 
-from langsam_common import tensor_names
+
 
 log = logging.getLogger("MaskDumpOp")
 

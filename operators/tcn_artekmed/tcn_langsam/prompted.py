@@ -5,12 +5,12 @@ from holoscan.core import Subgraph
 from holoscan.resources import UnboundedAllocator
 
 from operators.tcn_artekmed.tcn_util import ConvertBgraToRgbaOp
-from langsam2operator import LangSAM2Operator, LangSamPostprocessorOp, TextPromptPublisher
+from .prompted_ops import LangSAM2Operator, LangSamPostprocessorOp, TextPromptPublisher
 
 log = logging.getLogger(__name__)
 
 
-class LangSamProcessingSubgraph(Subgraph):
+class PromptedLangSamSubgraph(Subgraph):
     """Subgraph containing LangSAM inference pipeline (Grounding DINO + SAM2)"""
 
     def __init__(self, fragment, name, allocator, kwargs):

@@ -23,7 +23,7 @@ import numpy as np
 # Make the app's python/ dir importable regardless of how the tests are launched.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from langsam_helpers import (
+from helpers import (
     class_id_map,
     build_panoptic_map,
     plan_panoptic_paint,

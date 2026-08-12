@@ -1,0 +1,36 @@
+{
+  "operator": {
+    "name": "TCN LangSAM",
+    "authors": [
+      {
+        "name": "Ulrich Eck",
+        "affiliation": "TUM"
+      }
+    ],
+    "version": "1.0",
+    "changelog": {
+      "1.0": "Initial Release"
+    },
+    "language": [
+      "Python"
+    ],
+    "holoscan_sdk": {
+      "minimum_required_version": "3.9.0",
+      "tested_versions": [
+        "3.9.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Segmentation",
+      "Vision-Language",
+      "Streaming"
+    ],
+    "ranking": 2,
+    "requirements": {},
+    "description": "Open-vocabulary segmentation (Grounding DINO + SAM 2) as two reusable sub-flows: a TensorRT multi-camera realtime path with baked prompts, and a PyTorch single-camera path with runtime prompting."
+  }
+}

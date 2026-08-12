@@ -25,7 +25,7 @@ import torch
 from holoscan.core import Operator, OperatorSpec
 from holoscan.gxf import Entity
 from PIL import Image
-from utils import CupyArrayPainter, DecoderInputData, PointMover, save_cupy_tensor
+from ._viz import CupyArrayPainter, DecoderInputData, PointMover, save_cupy_tensor
 
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
@@ -33,7 +33,7 @@ from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
 from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 from sam2.sam2_image_predictor import SAM2ImagePredictor
-from langsam_common import (
+from .models import (
     SAM, GDINO, SAM_MODELS, class_id_map, build_panoptic_map, build_panoptic_lut,
 )
 

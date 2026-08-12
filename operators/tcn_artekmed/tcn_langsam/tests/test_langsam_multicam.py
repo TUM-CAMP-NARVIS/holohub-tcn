@@ -13,7 +13,7 @@ import numpy as np
 # Make the app's python/ dir importable regardless of how the tests are launched.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from langsam_helpers import (
+from helpers import (
     resolve_workers,
     class_id_map,
     class_id_for_label,

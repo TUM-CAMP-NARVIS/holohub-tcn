@@ -6,7 +6,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from langsam_helpers import build_prompt_remap
+from helpers import build_prompt_remap
 
 
 def _tcid():
@@ -70,7 +70,7 @@ def test_empty_active_set_raises():
     raise AssertionError("expected ValueError for an empty prompt set")
 
 
-from langsam_helpers import plan_batch_padding
+from helpers import plan_batch_padding
 
 
 def test_padding_exact_fit_needs_no_padding():

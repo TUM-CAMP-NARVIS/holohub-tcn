@@ -7,6 +7,7 @@ See docs/specs/2026-07-28-langsam-multicam-design.md.
 """
 
 import logging
+from operators.tcn_artekmed.tcn_util.frame_identity import acq_timestamp, acq_timestamp_consensus, tensor_names
 import math
 import os
 
@@ -18,15 +19,13 @@ import holoscan as hs
 from holoscan.core import Operator, OperatorSpec, Subgraph, IOSpec
 from holoscan.operators import HolovizOp
 
-from langsam_common import (
-    SAM, GDINO, GDinoTrtDetector, resolve_workers, worker_batch, worker_engine_path,
-    class_id_map, build_panoptic_map, build_panoptic_map_auto, build_panoptic_lut,
-    acq_timestamp, acq_timestamp_consensus, tensor_names,
+from .models import (
+    SAM, GDINO, GDinoTrtDetector, resolve_workers, worker_batch, worker_engine_path, class_id_map, build_panoptic_map, build_panoptic_map_auto, build_panoptic_lut,
 )
 # Shared with langsam_pipelined.py so the output-key convention can't drift between the
 # monolithic and split ops; imported directly (not via langsam_common's re-export list).
-from langsam_helpers import mask_name
-from langsam_pipelined import GdinoOp, SamOp, PanopticOp
+from .helpers import mask_name
+from .realtime_ops import GdinoOp, SamOp, PanopticOp
 
 log = logging.getLogger(__name__)
 
@@ -271,7 +270,7 @@ class LabelMapColorizeOp(Operator):
         return specs
 
 
-class LangSamMultiCamProcessingSubgraph(Subgraph):
+class RealtimeLangSamSubgraph(Subgraph):
     """Wires N per-GPU LangSamBatchOp workers -> collector -> colorize."""
 
     def __init__(self, fragment, name, kwargs, all_color_cameras):

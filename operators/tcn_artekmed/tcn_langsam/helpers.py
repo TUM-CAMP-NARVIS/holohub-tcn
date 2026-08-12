@@ -342,3 +342,37 @@ def plan_batch_padding(n_frames, engine_batch):
     if n > b:
         raise ValueError(f"{n} frames but the engine is built for batch {b}")
     return b - n
+
+
+def validate_source_cameras(source, provided_cameras, gpu_workers_cfg):
+    """`gpu_workers.workers` must name exactly the cameras the active source provides.
+
+    Both directions matter, on ANY source: a camera listed in `workers` that the source
+    doesn't emit gets silently-empty masks that look like a real regression (e.g. a 4-camera
+    dataset export replayed against a 5-camera worker config); the reverse -- a camera the
+    source emits that no worker claims -- gets silently dropped output (e.g. a 5-camera export
+    against a 4-camera worker config). 4-camera and 5-camera rigs are BOTH real, supported
+    deployment topologies, not "test" vs "production", so a mismatch here is always a
+    misconfiguration to fix, never an expected condition to silently work around.
+    """
+    provided = sorted(set(provided_cameras))
+    workers = (gpu_workers_cfg or {}).get("workers") or []
+    configured = sorted({cam for w in workers for cam in (w.get("cameras") or [])})
+    missing = sorted(set(configured) - set(provided))    # configured, source doesn't provide
+    extra = sorted(set(provided) - set(configured))       # provided, no worker claims it
+    if missing or extra:
+        detail = [
+            f"source {source!r} provides {len(provided)} camera(s): {provided}",
+            f"gpu_workers.workers is configured for {len(configured)} camera(s): {configured}",
+        ]
+        if missing:
+            detail.append(f"  missing (configured, but NOT provided by the source): {missing}")
+        if extra:
+            detail.append(f"  extra (provided by the source, but NO worker claims them): {extra}")
+        raise ValueError(
+            "gpu_workers.workers camera set does not match the cameras the active source "
+            "provides.\n  " + "\n  ".join(detail) +
+            "\nAdjust gpu_workers.workers to match this source's cameras -- see the "
+            "commented alternative camera-count profile next to gpu_workers/dataset_source "
+            "in the yaml."
+        )

@@ -1,0 +1,35 @@
+{
+  "operator": {
+    "name": "TCN Depth Anything",
+    "authors": [
+      {
+        "name": "Ulrich Eck",
+        "affiliation": "TUM"
+      }
+    ],
+    "version": "1.0",
+    "changelog": {
+      "1.0": "Initial Release"
+    },
+    "language": [
+      "Python"
+    ],
+    "holoscan_sdk": {
+      "minimum_required_version": "3.9.0",
+      "tested_versions": [
+        "3.9.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Depth Estimation",
+      "Streaming"
+    ],
+    "ranking": 2,
+    "requirements": {},
+    "description": "Monocular metric-depth sub-flows built on Depth-Anything V2 and V3."
+  }
+}

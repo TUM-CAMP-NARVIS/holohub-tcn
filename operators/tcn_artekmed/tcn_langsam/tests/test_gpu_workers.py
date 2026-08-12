@@ -4,7 +4,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from langsam_helpers import (resolve_workers, worker_batch, distinct_batches,
+from helpers import (resolve_workers, worker_batch, distinct_batches,
                              worker_engine_path)
 
 CFG = {"workers": [
