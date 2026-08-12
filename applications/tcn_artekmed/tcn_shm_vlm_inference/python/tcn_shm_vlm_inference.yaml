@@ -99,12 +99,20 @@ mask_depth_join:
 # per-camera reduction (tcn_instance_stats) -> cross-camera fusion -> temporal tracking -> console.
 object_tracking:
   enabled: true
-  # --- per-camera reduction ---
-  # Points further than sigma_k standard deviations from the instance mean on any axis are excluded
-  # from the box and centroid. This is what keeps a mask that bleeds onto a background surface from
-  # inflating the box; the reported spread stays un-trimmed so the bleed is still visible.
-  sigma_k: 2.5
-  sigma_floor_m: 0.01     # keeps a flat instance from rejecting all of its own points
+  # --- per-camera reduction: outlier rejection before the box is measured ---
+  # Discard this fraction of points from EACH end of every axis, by COUNT, before measuring the box.
+  # Percentiles rather than standard deviations: a blob holding a quarter of an instance's points
+  # inflates sigma enough that the +-k*sigma window contains the blob itself (the masking effect), and
+  # iterating the clip cannot escape it -- the first pass rejects nothing, so it is already at a fixed
+  # point. Iterating also erodes a clean cluster, since each pass discards the tails of the last.
+  #
+  # The BREAKDOWN POINT is exactly this value: outliers up to this fraction are removed however far
+  # away they lie, and a larger population survives. Rejecting an arbitrarily large second mode needs
+  # density or connected-component selection (see the operator README) -- not a bigger percentile,
+  # which would start eating the object itself.
+  trim_percentile: 0.02   # keep the 2nd..98th percentile per axis
+  trim_margin: 0.05       # widen the kept range by 5%, so bin resolution does not shave real extremes
+  min_range_m: 0.01       # keeps a perfectly flat instance from rejecting all of its own points
   min_points: 500         # fewer than this is depth noise or mask fringe, not an object. At
                           # depth-camera resolution 64 admitted 100-point "people"; several hundred
                           # corresponds to a patch of real size.
@@ -370,7 +378,7 @@ langsam_inference:
   # and needs no resampling, which is why this is safe where an arbitrary angle would not be.
   # Accepts "camera01" or "camera01_colorimage"; an unknown name is refused, because a typo would
   # silently leave that camera unrotated and look like a model problem.
-  flip_cameras: []
+  flip_cameras: ["camera01", "camera03", "camera04"]
   # e.g. at NARVIS, where 1, 3 and 4 are inverted:
   # flip_cameras: ["camera01", "camera03", "camera04"]
 

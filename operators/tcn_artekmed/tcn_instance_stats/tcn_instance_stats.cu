@@ -75,15 +75,22 @@ void TcnInstanceStatsOp::setup(holoscan::OperatorSpec& spec) {
              "Written into every row, so a consumer receiving several cameras on one ANY_SIZE port "
              "can tell which camera an observation came from.",
              static_cast<int64_t>(0));
-  spec.param(sigma_k_, "sigma_k",
-             "Sigma K",
-             "Points further than this many standard deviations from the instance mean on any axis "
-             "are excluded from the box and centroid.",
-             2.5);
-  spec.param(sigma_floor_m_, "sigma_floor_m",
-             "Sigma Floor",
-             "Lower bound on the per-axis sigma used for trimming, in metres. Without it a "
-             "perfectly flat instance (sigma ~ 0 on one axis) rejects all of its own points.",
+  spec.param(trim_percentile_, "trim_percentile",
+             "Trim Percentile",
+             "Fraction of points to discard from EACH end of every axis before the box is measured. "
+             "0.02 keeps the 2nd..98th percentile. Percentiles rather than standard deviations, "
+             "because sigma cannot survive a large outlier population -- see the kernel's header.",
+             0.02);
+  spec.param(trim_margin_, "trim_margin",
+             "Trim Margin",
+             "Widen the kept range by this fraction of itself. The bound sits on a histogram bin edge, "
+             "and a small margin keeps the object's genuine extremes from being shaved off by binning "
+             "resolution alone.",
+             0.05);
+  spec.param(min_range_m_, "min_range_m",
+             "Minimum Range",
+             "Floor on the kept range per axis, in metres, so a perfectly flat instance (a wall patch) "
+             "keeps its own points instead of rejecting all of them.",
              0.01);
   spec.param(min_points_, "min_points",
              "Minimum Points",
@@ -110,10 +117,11 @@ void TcnInstanceStatsOp::start() {
   cu_device_ = cu_device;
   CudaCheck(cuDevicePrimaryCtxRetain(&cu_context_, cu_device_));
 
-  if (sigma_k_.get() <= 0.0) {
-    throw std::runtime_error("TcnInstanceStatsOp: sigma_k must be > 0 (got " +
-                             std::to_string(sigma_k_.get()) + "); to disable trimming use a large "
-                             "value rather than zero, which would reject every point");
+  if (trim_percentile_.get() < 0.0 || trim_percentile_.get() >= 0.5) {
+    throw std::runtime_error(
+        "TcnInstanceStatsOp: trim_percentile must be in [0, 0.5) (got " +
+        std::to_string(trim_percentile_.get()) + "); 0 disables trimming, and 0.5 would discard "
+        "every point from both ends at once");
   }
   if (max_instances_.get() < 1) {
     throw std::runtime_error("TcnInstanceStatsOp: max_instances must be >= 1");
@@ -121,8 +129,9 @@ void TcnInstanceStatsOp::start() {
 
   ScopedDevice guard(cuda_device_ordinal_.get());
   allocate_scratch();
-  HOLOSCAN_LOG_INFO("TcnInstanceStatsOp: camera_index={} sigma_k={} min_points={} max_instances={}",
-                    camera_index_.get(), sigma_k_.get(), min_points_.get(), max_instances_.get());
+  HOLOSCAN_LOG_INFO("TcnInstanceStatsOp: camera_index={} trim_percentile={} margin={} "
+                    "min_points={} max_instances={}", camera_index_.get(), trim_percentile_.get(),
+                    trim_margin_.get(), min_points_.get(), max_instances_.get());
 }
 
 void TcnInstanceStatsOp::allocate_scratch() {
@@ -134,8 +143,13 @@ void TcnInstanceStatsOp::allocate_scratch() {
   alloc(reinterpret_cast<void**>(&acc_.count1), slots * sizeof(uint32_t), "count1");
   alloc(reinterpret_cast<void**>(&acc_.sum1), slots * 3 * sizeof(float), "sum1");
   alloc(reinterpret_cast<void**>(&acc_.sqsum1), slots * 3 * sizeof(float), "sqsum1");
-  alloc(reinterpret_cast<void**>(&acc_.mean), slots * 3 * sizeof(float), "mean");
-  alloc(reinterpret_cast<void**>(&acc_.sigma), slots * 3 * sizeof(float), "sigma");
+  alloc(reinterpret_cast<void**>(&acc_.sigmaRaw), slots * 3 * sizeof(float), "sigmaRaw");
+  alloc(reinterpret_cast<void**>(&acc_.rawMinEnc), slots * 3 * sizeof(int32_t), "rawMinEnc");
+  alloc(reinterpret_cast<void**>(&acc_.rawMaxEnc), slots * 3 * sizeof(int32_t), "rawMaxEnc");
+  alloc(reinterpret_cast<void**>(&acc_.hist),
+        slots * 3 * kInstanceHistBins * sizeof(uint32_t), "histogram");
+  alloc(reinterpret_cast<void**>(&acc_.loBound), slots * 3 * sizeof(float), "loBound");
+  alloc(reinterpret_cast<void**>(&acc_.hiBound), slots * 3 * sizeof(float), "hiBound");
   alloc(reinterpret_cast<void**>(&acc_.count2), slots * sizeof(uint32_t), "count2");
   alloc(reinterpret_cast<void**>(&acc_.sum2), slots * 3 * sizeof(float), "sum2");
   alloc(reinterpret_cast<void**>(&acc_.minEnc), slots * 3 * sizeof(int32_t), "minEnc");
@@ -152,9 +166,12 @@ void TcnInstanceStatsOp::allocate_scratch() {
 
 void TcnInstanceStatsOp::free_scratch() {
   for (void* p : {reinterpret_cast<void*>(acc_.count1), reinterpret_cast<void*>(acc_.sum1),
-                  reinterpret_cast<void*>(acc_.sqsum1), reinterpret_cast<void*>(acc_.mean),
-                  reinterpret_cast<void*>(acc_.sigma), reinterpret_cast<void*>(acc_.count2),
-                  reinterpret_cast<void*>(acc_.sum2), reinterpret_cast<void*>(acc_.minEnc),
+                  reinterpret_cast<void*>(acc_.sqsum1), reinterpret_cast<void*>(acc_.sigmaRaw),
+                  reinterpret_cast<void*>(acc_.rawMinEnc), reinterpret_cast<void*>(acc_.rawMaxEnc),
+                  reinterpret_cast<void*>(acc_.hist), reinterpret_cast<void*>(acc_.loBound),
+                  reinterpret_cast<void*>(acc_.hiBound),
+                  reinterpret_cast<void*>(acc_.count2), reinterpret_cast<void*>(acc_.sum2),
+                  reinterpret_cast<void*>(acc_.minEnc),
                   reinterpret_cast<void*>(acc_.maxEnc), reinterpret_cast<void*>(rows_d_),
                   reinterpret_cast<void*>(row_labels_d_), reinterpret_cast<void*>(row_count_d_)}) {
     if (p) cudaFree(p);
@@ -236,11 +253,18 @@ void TcnInstanceStatsOp::compute(holoscan::InputContext& op_input,
   HOLOSCAN_CUDA_CALL_THROW_ERROR(cudaMemsetAsync(row_count_d_, 0, sizeof(uint32_t), cuda_stream),
                                  "TcnInstanceStatsOp: failed to reset the row counter");
   launch_instance_reset(acc_, cuda_stream);
+  // Four passes over the points, no host round trip between them:
+  //   1. raw moments and range      -> the reported (untrimmed) sigma, and the histogram's edges
+  //   2. per-axis histogram         -> the distribution, at 64-bin resolution of each instance's range
+  //   3. percentile bounds          -> robust limits, unmoved by how far the outliers lie
+  //   4. aggregates within bounds   -> the box and centroid that get reported
   launch_instance_pass1(positions_d, labels_d, label_count, acc_, cuda_stream);
-  launch_instance_finalize1(acc_, cuda_stream);
-  launch_instance_pass2(positions_d, labels_d, label_count,
-                        static_cast<float>(sigma_k_.get()),
-                        static_cast<float>(sigma_floor_m_.get()), acc_, cuda_stream);
+  launch_instance_finalize_raw(acc_, cuda_stream);
+  launch_instance_histogram(positions_d, labels_d, label_count, acc_, cuda_stream);
+  launch_instance_bounds(acc_, static_cast<float>(trim_percentile_.get()),
+                         static_cast<float>(trim_margin_.get()),
+                         static_cast<float>(min_range_m_.get()), cuda_stream);
+  launch_instance_trimmed(positions_d, labels_d, label_count, acc_, cuda_stream);
   launch_instance_compact(acc_, static_cast<int>(camera_index_.get()),
                           static_cast<uint32_t>(std::max<int64_t>(min_points_.get(), 0)),
                           rows_d_, row_labels_d_, row_count_d_,

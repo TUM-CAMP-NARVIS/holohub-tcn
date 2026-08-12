@@ -105,7 +105,7 @@ def case_exact_box_and_centroid():
     """A planted cuboid, no outliers: box and centroid must be exact."""
     pts = [(x, y, z) for x in (1.0, 2.0) for y in (10.0, 11.0) for z in (-5.0, -4.0)]  # 8 corners
     label = PACK(1, 1)
-    rows, labels = run({label: pts}, min_points=1, sigma_k=100.0)
+    rows, labels = run({label: pts}, min_points=1, trim_percentile=0.0)
     r = row_for(rows, labels, label)
     if r is None:
         return ["no row emitted for the planted instance"]
@@ -126,7 +126,7 @@ def case_negative_coordinates_survive_the_minmax_encoding():
     """atomicMin/Max run on ordered-int-encoded floats; negatives are where that encoding breaks."""
     pts = [(-3.0, -2.0, -1.0), (-1.0, -4.0, -9.0), (2.0, 0.0, 0.5)]
     label = PACK(2, 1)
-    rows, labels = run({label: pts}, min_points=1, sigma_k=100.0)
+    rows, labels = run({label: pts}, min_points=1, trim_percentile=0.0)
     r = row_for(rows, labels, label)
     problems = []
     if not np.allclose(r[[MNX, MNY, MNZ]], np.min(pts, axis=0), atol=1e-5):
@@ -139,7 +139,7 @@ def case_negative_coordinates_survive_the_minmax_encoding():
 
 def case_background_is_excluded():
     pts = [(0.0, 0.0, 0.0)] * 10
-    rows, labels = run({np.uint16(0): pts}, min_points=1, sigma_k=100.0)
+    rows, labels = run({np.uint16(0): pts}, min_points=1, trim_percentile=0.0)
     if len(labels) and labels[0] != 0:
         return [f"unexpected labels {labels}"]
     if rows.shape[0] != 1 or int(rows[0][CNT]) != 0:
@@ -157,25 +157,90 @@ def case_outlier_blob_is_trimmed():
             (0.05, 0.05, 0.05), (0.02, 0.08, 0.03), (0.07, 0.01, 0.09), (0.03, 0.06, 0.02)] * 4
     blob = [(9.0, 9.0, 9.0)]
     label = PACK(3, 1)
-    loose = row_for(*run({label: core + blob}, min_points=1, sigma_k=100.0), label)
-    tight = row_for(*run({label: core + blob}, min_points=1, sigma_k=1.5), label)
+    loose = row_for(*run({label: core + blob}, min_points=1, trim_percentile=0.0), label)
+    # 1 outlier in 33 points is 3%, so the trim must discard at least that from each end.
+    tight = row_for(*run({label: core + blob}, min_points=1, trim_percentile=0.05), label)
     problems = []
     if loose[MXX] < 8.0:
         problems.append(f"untrimmed box should include the blob, got max_x {loose[MXX]}")
     if tight[MXX] > 1.0:
         problems.append(f"trimmed box still includes the blob: max_x {tight[MXX]}")
-    if int(tight[CNT]) != len(core):
-        problems.append(f"trimmed count {int(tight[CNT])} != {len(core)} (core points)")
+    if int(tight[CNT]) > len(core):
+        problems.append(f"trimmed count {int(tight[CNT])} exceeds the {len(core)} core points")
     # sigma is reported BEFORE trimming, so it stays large -- that is the bleed indicator.
     if tight[SGX] < 1.0:
         problems.append(f"pre-trim sigma_x {tight[SGX]} should stay large as a bleed signal")
     return problems
 
 
+def case_percentile_trim_survives_the_masking_effect():
+    """The case sigma-based trimming provably cannot handle.
+
+    A blob holding 23% of an instance's points, 3 m away, inflates sigma to ~1.2 m -- so a +-2 sigma
+    window spans [-1.6, 3.3] and CONTAINS the blob. Iterating cannot escape it: the first pass rejects
+    nothing, so it is already at a fixed point.
+
+    A percentile bound has a BREAKDOWN POINT equal to trim_percentile: it discards that fraction from
+    each end by count, so it removes outliers up to that fraction however far away they are. Sigma's
+    breakdown point is effectively zero, which is the whole difference.
+    """
+    core = [(0.0 + 0.01 * i, 0.0, 0.0) for i in range(40)]       # tight cluster near the origin
+    blob = [(3.0 + 0.01 * i, 0.0, 0.0) for i in range(12)]        # 23% of the points, 3 m away
+    label = PACK(5, 1)
+    untrimmed = row_for(*run({label: core + blob}, min_points=1, trim_percentile=0.0), label)
+    trimmed = row_for(*run({label: core + blob}, min_points=1, trim_percentile=0.25), label)
+    if untrimmed is None or trimmed is None:
+        return ["no row emitted"]
+    problems = []
+    if untrimmed[MXX] < 2.9:
+        problems.append(f"untrimmed box should span the blob, got max_x {untrimmed[MXX]:.2f}")
+    if trimmed[MXX] > 1.0:
+        problems.append(f"a 25% trim did not expel a 23% blob: max_x {trimmed[MXX]:.2f}")
+    if int(trimmed[CNT]) > len(core):
+        problems.append(f"trimmed count {int(trimmed[CNT])} exceeds the {len(core)} core points")
+    return problems
+
+
+def case_trim_breaks_down_above_its_percentile():
+    """The documented limit, asserted so it cannot be forgotten.
+
+    An outlier population LARGER than trim_percentile survives, because the bound is defined by count.
+    Rejecting an arbitrarily large second mode needs density or connected-component selection, which is
+    the escalation named in the README -- not a bigger percentile, which would start eating the object.
+    """
+    core = [(0.0 + 0.01 * i, 0.0, 0.0) for i in range(40)]
+    blob = [(3.0 + 0.01 * i, 0.0, 0.0) for i in range(12)]        # 23%
+    label = PACK(7, 1)
+    r = row_for(*run({label: core + blob}, min_points=1, trim_percentile=0.10), label)
+    if r is None:
+        return ["no row emitted"]
+    if r[MXX] < 2.0:
+        return [f"a 10% trim unexpectedly expelled a 23% blob (max_x {r[MXX]:.2f}); the breakdown "
+                f"point is no longer trim_percentile and the documentation is wrong"]
+    return []
+
+
+def case_reported_sigma_is_the_untrimmed_one():
+    """Sigma must stay the PRE-trim value: it is the evidence a mask covered two surfaces."""
+    core = [(0.0, 0.0, 0.0)] * 40
+    blob = [(3.0, 0.0, 0.0)] * 12
+    label = PACK(6, 1)
+    r = row_for(*run({label: core + blob}, min_points=1, trim_percentile=0.25), label)
+    if r is None:
+        return ["no row emitted"]
+    # The trimmed points span ~0, but the untrimmed spread is >1 m -- that difference is the signal.
+    if r[SGX] < 0.5:
+        problems = [f"sigma_x {r[SGX]:.3f} looks trimmed; it must report the untrimmed spread"]
+        return problems
+    if (r[MXX] - r[MNX]) > 0.5:
+        return [f"box was not trimmed: extent_x {r[MXX] - r[MNX]:.3f}"]
+    return []
+
+
 def case_min_points_drops_small_instances():
     small, big = PACK(4, 1), PACK(4, 2)
     rows, labels = run({small: [(0.0, 0.0, 0.0)] * 3,
-                        big: [(5.0, 5.0, 5.0)] * 20}, min_points=10, sigma_k=100.0)
+                        big: [(5.0, 5.0, 5.0)] * 20}, min_points=10, trim_percentile=0.0)
     problems = []
     if row_for(rows, labels, small) is not None:
         problems.append("a 3-point instance survived min_points=10")
@@ -187,7 +252,7 @@ def case_min_points_drops_small_instances():
 def case_multiple_instances_and_classes_are_separate():
     a, b, c = PACK(1, 1), PACK(1, 2), PACK(2, 1)
     pts = {a: [(0.0, 0.0, 0.0)] * 8, b: [(4.0, 0.0, 0.0)] * 8, c: [(0.0, 7.0, 0.0)] * 8}
-    rows, labels = run(pts, min_points=1, sigma_k=100.0)
+    rows, labels = run(pts, min_points=1, trim_percentile=0.0)
     problems = []
     if sorted(int(x) for x in labels) != sorted(int(x) for x in pts):
         problems.append(f"labels {sorted(int(x) for x in labels)} != {sorted(int(x) for x in pts)}")
@@ -200,7 +265,7 @@ def case_multiple_instances_and_classes_are_separate():
 
 def case_camera_index_is_stamped():
     label = PACK(1, 1)
-    rows, labels = run({label: [(1.0, 1.0, 1.0)] * 8}, min_points=1, sigma_k=100.0, camera_index=3)
+    rows, labels = run({label: [(1.0, 1.0, 1.0)] * 8}, min_points=1, trim_percentile=0.0, camera_index=3)
     r = row_for(rows, labels, label)
     return [] if int(r[CAM]) == 3 else [f"camera_index {int(r[CAM])} != 3"]
 
@@ -215,6 +280,9 @@ def case_empty_frame_emits_a_zero_row():
 
 CASES = [
     case_exact_box_and_centroid,
+    case_percentile_trim_survives_the_masking_effect,
+    case_trim_breaks_down_above_its_percentile,
+    case_reported_sigma_is_the_untrimmed_one,
     case_negative_coordinates_survive_the_minmax_encoding,
     case_background_is_excluded,
     case_outlier_blob_is_trimmed,

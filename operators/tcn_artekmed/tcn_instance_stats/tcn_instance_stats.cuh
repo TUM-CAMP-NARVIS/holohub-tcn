@@ -53,8 +53,9 @@ class TcnInstanceStatsOp : public holoscan::Operator {
   holoscan::Parameter<std::string> out_rows_tensor_name_;
   holoscan::Parameter<std::string> out_labels_tensor_name_;
   holoscan::Parameter<int64_t> camera_index_;
-  holoscan::Parameter<double> sigma_k_;
-  holoscan::Parameter<double> sigma_floor_m_;
+  holoscan::Parameter<double> trim_percentile_;
+  holoscan::Parameter<double> trim_margin_;
+  holoscan::Parameter<double> min_range_m_;
   holoscan::Parameter<int64_t> min_points_;
   holoscan::Parameter<int64_t> max_instances_;
   holoscan::Parameter<bool> verbose_;
