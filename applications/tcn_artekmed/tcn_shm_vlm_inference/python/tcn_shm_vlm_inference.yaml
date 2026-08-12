@@ -50,7 +50,7 @@ mask_dump_dir: ""
 # `match_policy: exact` is correct while every camera arrives through ONE shared-memory segment:
 # the subscriber stamps one acquisition time per composite buffer and all cameras share it.
 temporal_sync:
-  enabled: false
+  enabled: true
   masks_capacity: 4
   depth_capacity: 16
   match_policy: "exact"     # exact | window
@@ -65,7 +65,7 @@ temporal_sync:
 # apply_mask. Needs per-camera calibration; the dataset source loads it from the export's
 # calibration/<camera>.json, the shm source from the device context.
 mask_depth_join:
-  enabled: false
+  enabled: true
   # Class ids (the high byte of the packed panoptic label) whose pixels the mask marks. Empty means
   # every non-background class. Ids follow the prompt order in langsam_multicam -- see class_id_map.
   select_classes: []
@@ -85,7 +85,7 @@ mask_depth_join:
   # reductions -- one sync per camera per frame -- and assert that a pixel selected by the mask kept
   # its depth, which is what caught a use-after-free in the stream splitter. Keep on while gating;
   # turn off for a latency-sensitive live run.
-  check: true
+  check: false
   # The join allocates dozens of small, variable-sized tensors per frame, so it uses its own
   # RMMAllocator rather than the frame-sized BlockMemoryPool the rest of the app shares.
   pool_initial_size: "256MB"
