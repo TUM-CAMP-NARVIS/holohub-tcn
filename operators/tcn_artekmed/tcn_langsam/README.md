@@ -292,6 +292,34 @@ python3 docs/compare_mask_dumps.py <before_dir> <after_dir>
 A structural problem (missing directory, differing frame counts) exits with a distinct code from an
 ordinary mask difference, so "the gate could not run" cannot be mistaken for "the masks differ".
 
+## Upside-down cameras
+
+A camera mounted inverted feeds Grounding DINO and SAM an upside-down image, and both are trained on
+upright scenes — recognition measurably suffers. Name those cameras and they are rotated 180° on the
+way **into** the models and their masks rotated back on the way **out**:
+
+```yaml
+langsam_inference:
+  flip_cameras: ["camera01", "camera03", "camera04"]   # or *_colorimage; either form works
+```
+
+Nothing outside this operator ever sees rotated data, so every geometric consumer — texcoord
+sampling, point clouds, boxes, the viewer — keeps working in the camera's native orientation. That is
+only safe because **180° is exactly invertible**: it is `arr[::-1, ::-1]`, its own inverse, with no
+resampling and no interpolation. No other angle has that property with array slicing, so this
+mechanism does not generalise to arbitrary mounting rotations.
+
+The rotation is `tcn_util.rotate.rotate180`, shared with `RotateImage180Op` — one implementation. The
+function is called directly rather than inserting that operator per camera, because LangSAM receives
+every camera in one entity and a graph node would mean splitting and re-merging it for no gain.
+
+An unknown camera name is **refused** (validated once at the subgraph, against the full camera set —
+a worker sees only its own share). A typo would otherwise silently leave that camera unrotated, which
+presents as a recognition problem rather than a configuration one.
+
+Applies to both multi-camera variants, and to the split (`pipelined`) operators as well: `GdinoOp`
+rotates in, `PanopticOp` rotates back.
+
 ## Prompts and class ids
 
 Class ids are **1-based positions in the prompt list** (`class_id_map`), so prompt order is part of

@@ -60,6 +60,50 @@ def worker_engine_path(template, batch):
     return out
 
 
+def camera_key(name):
+    """`camera01_colorimage` -> `camera01`, so a config may name either form."""
+    return str(name).strip().lower().replace("_colorimage", "").replace("_mask", "")
+
+
+def validate_flip_cameras(all_cameras, configured):
+    """Check `flip_cameras` against the FULL camera set, returning the normalised keys.
+
+    Must be called once where every camera is known -- i.e. at the subgraph, not at a worker: a worker
+    owns only its share of the cameras, so a name it does not recognise is usually another worker's.
+
+    Refuses an unknown name, because a typo would otherwise silently leave that camera unrotated,
+    which presents as a recognition problem rather than a configuration one.
+    """
+    if not configured:
+        return set()
+    known = {camera_key(c) for c in all_cameras}
+    wanted = {camera_key(c) for c in configured}
+    unknown = sorted(wanted - known)
+    if unknown:
+        raise ValueError(
+            f"flip_cameras names {unknown}, which are not cameras of this source "
+            f"({sorted(known)}). A typo here silently leaves the camera unrotated, which looks like "
+            f"a recognition problem rather than a configuration one.")
+    return wanted
+
+
+def resolve_flipped_cameras(cameras, configured):
+    """Which of `cameras` are configured as inverted, as a set of the ORIGINAL names.
+
+    Intersection only, no validation: this runs per worker, and a name belonging to another worker's
+    cameras is normal. `validate_flip_cameras` does the typo check once, against the full set.
+
+    A camera mounted upside down feeds Grounding DINO and SAM an inverted image, which measurably
+    hurts them -- both are trained on upright scenes. Rotating 180 degrees on the way in and rotating
+    the resulting mask back on the way out fixes recognition WITHOUT disturbing any geometry:
+    everything outside the LangSAM path still sees the camera's native orientation.
+    """
+    if not configured:
+        return set()
+    wanted = {camera_key(c) for c in configured}
+    return {c for c in cameras if camera_key(c) in wanted}
+
+
 def class_id_map(prompts):
     """Normalized prompt -> 1-based class id (0 reserved for background)."""
     return {str(p).strip().lower(): i + 1 for i, p in enumerate(prompts)}

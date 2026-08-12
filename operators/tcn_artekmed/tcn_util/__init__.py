@@ -151,3 +151,7 @@ from .frame_identity import (  # noqa: E402
     acq_timestamp_consensus,
     tensor_names,
 )
+
+# 180-degree rotation as a plain function, for callers that need it inline rather than as a
+# graph node (see rotate.py).
+from .rotate import rotate180  # noqa: E402

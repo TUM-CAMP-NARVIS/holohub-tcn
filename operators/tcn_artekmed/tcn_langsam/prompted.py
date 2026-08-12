@@ -39,7 +39,7 @@ import logging
 
 from holoscan.core import Subgraph
 
-from .helpers import resolve_workers
+from .helpers import resolve_workers, validate_flip_cameras
 from .realtime import LabelMapColorizeOp, LangSamBatchOp, MaskCollectorOp
 
 log = logging.getLogger(__name__)
@@ -92,6 +92,12 @@ class PromptedLangSamSubgraph(Subgraph):
                 "rejected per update and the previous prompts stay in force.")
 
         prompts = (self._get("text_prompts") or {}).get("prompts", [])
+        # Cameras mounted upside down: rotated only while passing through the models. Validated
+        # here, against every camera, because a worker sees only its own share.
+        flip_cameras = list(langsam_cfg.get("flip_cameras") or [])
+        validate_flip_cameras(self.all_color_cameras, flip_cameras)
+        if flip_cameras:
+            log.info(f"Rotating 180 deg through LangSAM for: {flip_cameras}")
         workers = resolve_workers(multicam_cfg, self.all_color_cameras)
         log.info(f"PromptedLangSam workers: {workers} (initial prompts: {prompts})")
 
@@ -114,7 +120,7 @@ class PromptedLangSamSubgraph(Subgraph):
             op = LangSamBatchOp(self, name=self._n(f"worker{i}"),
                                 cameras=w["cameras"], device=w["device"],
                                 langsam_cfg=langsam_cfg, prompts=prompts,
-                                promptable=True)
+                                promptable=True, flip_cameras=flip_cameras)
             self.add_flow(op, collector, {("masks", "receivers")})
             # Both interface ports fan out to every worker: one external colour stream and one
             # external prompt stream feed all of them, which is what makes the vocabulary shared.

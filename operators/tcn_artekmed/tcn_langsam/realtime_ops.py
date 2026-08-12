@@ -27,7 +27,8 @@ from .models import (
 )
 # Shared with langsam_multicam_fragment.py so the output-key convention can't drift between the
 # monolithic and split ops; imported directly (not via langsam_common's re-export list).
-from .helpers import mask_name
+from .helpers import mask_name, resolve_flipped_cameras
+from operators.tcn_artekmed.tcn_util.rotate import rotate180
 
 log = logging.getLogger(__name__)
 
@@ -60,10 +61,11 @@ class GdinoOp(Operator):
     cameras with no detection, so only what SAM needs crosses to the next stage.
     """
 
-    def __init__(self, fragment, *args, cameras, device, langsam_cfg, prompts, **kwargs):
+    def __init__(self, fragment, *args, cameras, device, langsam_cfg, prompts, flip_cameras=None, **kwargs):
         self.cameras = list(cameras)
         self.device = device if isinstance(device, torch.device) else torch.device(f"cuda:{int(device)}")
         self.prompts = list(prompts)
+        self._flip = resolve_flipped_cameras(self.cameras, flip_cameras)
         self.batch = len(self.cameras)
         self.box_threshold = float(langsam_cfg.get("box_threshold", 0.3))
         self.text_threshold = float(langsam_cfg.get("text_threshold", 0.25))
@@ -122,6 +124,8 @@ class GdinoOp(Operator):
                     continue
                 img = torch.from_dlpack(cp.asarray(t))
                 img = img.to(self.device)[..., [2, 1, 0]].contiguous()
+                if cam in self._flip:
+                    img = torch.flip(img, dims=(0, 1)).contiguous()   # see LangSamBatchOp
                 rgb_gpu.append(img)
                 names.append(cam)
                 hw = (int(img.shape[0]), int(img.shape[1]))   # last camera's shape, preserved
@@ -223,7 +227,7 @@ class SamOp(Operator):
     own GPU work and destroy the overlap this split exists to create.
     """
 
-    def __init__(self, fragment, *args, cameras, device, langsam_cfg, prompts, **kwargs):
+    def __init__(self, fragment, *args, cameras, device, langsam_cfg, prompts, flip_cameras=None, **kwargs):
         self.cameras = list(cameras)
         self.device = device if isinstance(device, torch.device) else torch.device(f"cuda:{int(device)}")
         self.batch = len(self.cameras)
@@ -289,10 +293,11 @@ class PanopticOp(Operator):
     that on its first tick, same as SamOp (see `self._stream_checked`).
     """
 
-    def __init__(self, fragment, *args, cameras, device, langsam_cfg, prompts, **kwargs):
+    def __init__(self, fragment, *args, cameras, device, langsam_cfg, prompts, flip_cameras=None, **kwargs):
         self.device = device if isinstance(device, torch.device) else torch.device(f"cuda:{int(device)}")
         self.prompts = list(prompts)
         self._cmap = class_id_map(self.prompts)
+        self._flip = resolve_flipped_cameras(self.cameras, flip_cameras)
         self.panoptic_backend = langsam_cfg.get("panoptic_backend", "cupy")
         self._stream_checked = False
         super().__init__(fragment, *args, **kwargs)
@@ -331,5 +336,8 @@ class PanopticOp(Operator):
                         self._cmap, hw[0], hw[1], backend=self.panoptic_backend)
                 torch.cuda.nvtx.range_pop()
             for i, cam in enumerate(names):
-                out[mask_name(cam)] = hs.as_tensor(cp.ascontiguousarray(pmaps[i]))
+                pmap = pmaps[i]
+                if cam in self._flip:
+                    pmap = rotate180(pmap)      # undo GdinoOp's input rotation; see LangSamBatchOp
+                out[mask_name(cam)] = hs.as_tensor(cp.ascontiguousarray(pmap))
         op_output.emit(out, "masks", acq_timestamp=acq)

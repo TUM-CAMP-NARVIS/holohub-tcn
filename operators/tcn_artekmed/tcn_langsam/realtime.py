@@ -24,7 +24,8 @@ from .models import (
 )
 # Shared with langsam_pipelined.py so the output-key convention can't drift between the
 # monolithic and split ops; imported directly (not via langsam_common's re-export list).
-from .helpers import mask_name
+from .helpers import mask_name, resolve_flipped_cameras, validate_flip_cameras
+from operators.tcn_artekmed.tcn_util.rotate import rotate180
 from .realtime_ops import GdinoOp, SamOp, PanopticOp
 
 log = logging.getLogger(__name__)
@@ -38,7 +39,7 @@ class LangSamBatchOp(Operator):
          on `device`).
     """
 
-    def __init__(self, fragment, *args, cameras, device, langsam_cfg, prompts, promptable=False, **kwargs):
+    def __init__(self, fragment, *args, cameras, device, langsam_cfg, prompts, promptable=False, flip_cameras=None, **kwargs):
         self.cameras = list(cameras)
         # This worker's engines are built for exactly its camera count. Resolving the paths
         # here -- rather than passing one fixed path for every worker -- is what lets a
@@ -61,6 +62,13 @@ class LangSamBatchOp(Operator):
         self.prompts = list(prompts)
         self._prompt_key = None          # set by _apply_prompts; see _receive_prompts
         self.promptable = bool(promptable)
+        # Cameras mounted upside down: rotate 180 degrees on the way INTO the models and rotate the
+        # resulting mask back on the way out. Recognition improves because both models are trained on
+        # upright scenes; nothing outside this operator ever sees the rotated data, so every geometric
+        # consumer downstream still works in the camera's native orientation.
+        self._flip = resolve_flipped_cameras(self.cameras, flip_cameras)
+        if self._flip:
+            log.info(f"LangSamBatchOp[{device}]: rotating 180 deg for {sorted(self._flip)}")
         self.box_threshold = float(langsam_cfg.get("box_threshold", 0.3))
         self.text_threshold = float(langsam_cfg.get("text_threshold", 0.25))
         self.gdino_backend = langsam_cfg.get("gdino_backend", "pytorch")
@@ -191,6 +199,9 @@ class LangSamBatchOp(Operator):
                     continue
                 img = torch.from_dlpack(cp.asarray(t))               # (H,W,4) BGRA uint8, cuda:0
                 img = img.to(self.device)[..., [2, 1, 0]].contiguous()  # -> RGB on this device
+                if cam in self._flip:
+                    # 180 deg = reverse both spatial axes. Exactly invertible, no resampling.
+                    img = torch.flip(img, dims=(0, 1)).contiguous()
                 rgb_gpu.append(img)
                 names.append(cam)
                 hw = (int(img.shape[0]), int(img.shape[1]))
@@ -239,7 +250,12 @@ class LangSamBatchOp(Operator):
                 torch.cuda.nvtx.range_pop()
 
             for i, cam in enumerate(names):
-                out[mask_name(cam)] = hs.as_tensor(cp.ascontiguousarray(pmaps[i]))
+                pmap = pmaps[i]
+                if cam in self._flip:
+                    # Undo the input rotation so the map is in the camera's native orientation --
+                    # which is what tcn_label_sampler's texcoords index.
+                    pmap = rotate180(pmap)
+                out[mask_name(cam)] = hs.as_tensor(cp.ascontiguousarray(pmap))
         op_output.emit(out, "masks", acq_timestamp=acq)
 
 
@@ -361,6 +377,12 @@ class RealtimeLangSamSubgraph(Subgraph):
         multicam_cfg = self._get("gpu_workers") or {}
         langsam_cfg = self.kwargs("langsam_inference")
         prompts = (self._get("text_prompts") or {}).get("prompts", [])
+        # Cameras mounted upside down: rotated only while passing through the models. Validated
+        # here, against every camera, because a worker sees only its own share.
+        flip_cameras = list(langsam_cfg.get("flip_cameras") or [])
+        validate_flip_cameras(self.all_color_cameras, flip_cameras)
+        if flip_cameras:
+            log.info(f"Rotating 180 deg through LangSAM for: {flip_cameras}")
         workers = resolve_workers(multicam_cfg, self.all_color_cameras)
         log.info(f"LangSAM multicam workers: {workers}")
 
@@ -372,7 +394,8 @@ class RealtimeLangSamSubgraph(Subgraph):
         log.info(f"LangSAM worker structure: {'pipelined (3 ops)' if pipelined else 'monolithic'}")
         for i, w in enumerate(workers):
             kw = dict(cameras=w["cameras"], device=w["device"],
-                      langsam_cfg=langsam_cfg, prompts=prompts)
+                      langsam_cfg=langsam_cfg, prompts=prompts,
+                      flip_cameras=flip_cameras)
             if pipelined:
                 gd = GdinoOp(self, name=self._n(f"worker{i}_gdino"), **kw)
                 sm = SamOp(self, name=self._n(f"worker{i}_sam"), **kw)
