@@ -699,6 +699,15 @@ class App(hs.core.Application):
                         footprint_iou_threshold=float(track_cfg.get("fusion_footprint_iou", 0.4)),
                         max_vertical_gap_m=float(track_cfg.get("fusion_max_vertical_gap_m", 0.5)),
                         up_axis=track_cfg.get("up_axis", "axis_y"),
+                        min_extent_m=float(track_cfg.get("min_extent_m", 0.0)),
+                        min_points=int(track_cfg.get("fusion_min_points", 0)),
+                        aggregate_containment=float(track_cfg.get("aggregate_containment", 0.7)),
+                        aggregate_min_children=int(track_cfg.get("aggregate_min_children", 2)),
+                        aggregate_min_volume_ratio=float(
+                            track_cfg.get("aggregate_min_volume_ratio", 1.5)),
+                        min_cameras=int(track_cfg.get("min_cameras", 1)),
+                        min_detection_points=int(track_cfg.get("min_detection_points", 0)),
+                        min_detection_extent_m=float(track_cfg.get("min_detection_extent_m", 0.0)),
                         verbose=bool(track_cfg.get("verbose", False)),
                         name="object_fusion")
                     tracker_op = ObjectTrackerOp(

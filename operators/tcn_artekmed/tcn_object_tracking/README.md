@@ -38,7 +38,7 @@ tcn_object_tracking/
   tracker.py       pure: Track, lifecycle, id allocation, class-change reset
   ops.py           InstanceFusionOp, ObjectTrackerOp, ObjectConsoleSinkOp
   render.py        ObjectBoxRendererOp, box_input_specs, box_line_vertices
-  tests/           46 host checks, no holoscan/cupy/numpy needed for the algorithm ones
+  tests/           56 host checks, no holoscan/cupy/numpy needed for the algorithm ones
 ```
 
 `association.py` and `tracker.py` import **nothing** — that is deliberate. Identity bugs (swapped ids,
@@ -71,6 +71,42 @@ the footprint rule simply stops merging vertically split objects.
 In a **YAML config write `up_axis: "axis_y"`, not `"y"`** — yaml-cpp resolves a bare *and a quoted*
 `y` to boolean `true`, so the short form arrives as `True`. The operator rejects a boolean with an
 error that says so.
+
+## Rejecting non-objects and aggregates
+
+This is what controls object *count*, and it needs calibrating against a scene whose contents you know.
+Five mechanisms, applied in this order:
+
+| stage | parameter | what it removes |
+|---|---|---|
+| per observation | `min_points` (in `tcn_instance_stats`) | specks |
+| per observation | `min_extent_m` | flat slivers a mask fringe produces (e.g. 0.27 × 0.33 × **0.03** m), which no volume or overlap rule catches |
+| per observation | `aggregate_*` | a box containing ≥ `aggregate_min_children` **mutually disjoint** smaller boxes of its class — a mask covering several objects. It is dropped and its constituents kept. |
+| per detection | `min_cameras` | objects only one camera ever saw |
+| per detection | `min_detection_points` | fused objects with too little evidence |
+
+**The aggregate rule is why containment can be used as a merge rule at all.** One contained box is a
+partial view (a torso inside a person) and still merges; several *disjoint* contained boxes mean the
+container is a class-level blob, and merging through it would fuse distinct people into one identity.
+
+Order matters: slivers are rejected first so one cannot count as a "child" that condemns a container.
+
+### Measured, on the 4-camera replay (8 frames)
+
+| `min_detection_points` | objects/frame | distinct ids | id-set changes |
+|---|---|---|---|
+| 0 | 22.0 | 24 | 4 |
+| 2000 | 15.9 | 17 | 2 |
+| **3000** (default) | **9.5** | **10** | **1** |
+
+`min_cameras: 2` reaches the same place (8.5 / 9 / 1) by dropping single-camera objects outright.
+Filtering on **evidence quantity** is preferred to filtering on **viewpoint count**, because a person
+at the edge of the room may genuinely be visible to only one camera — so `min_cameras` stays at 1 by
+default.
+
+Counter-intuitively, **tightening `fusion_max_distance_m` makes the count worse** (18 → 22 → 24
+detections at 1.0 → 0.4 → 0.25 m): the residual count is dominated by *under*-merging of one object's
+views, not by over-merging of distinct objects. Measure before turning that knob.
 
 ## Identity: what an id means
 
@@ -122,7 +158,7 @@ self.add_flow(box_renderer, cloud_visualizer, {("boxes", "receivers")})
 ## Tests
 
 ```bash
-python3 tests/test_association.py   # 23 -- geometry, fusion, matching (host, no deps)
+python3 tests/test_association.py   # 33 -- geometry, fusion, filters, matching (host, no deps)
 python3 tests/test_tracker.py       # 16 -- lifecycle, id stability, class reset (host, no deps)
 python3 tests/test_render.py        #  7 -- box edges, degenerate cases (host, numpy only)
 ```
@@ -136,9 +172,9 @@ swap; per-frame instance-id churn does not churn the track id.
 - **No confidence.** Association is purely geometric.
 - **Mask bleed at occlusion boundaries** puts points on background surfaces; the σ-trim in
   `tcn_instance_stats` mitigates it and does not eliminate it.
-- **Over-segmentation is the current failure mode**, not crashes: on the 4-camera replay this reports
-  ~24 objects/frame for a scene with a few people, with some boxes 2.5 m across. The thresholds and
-  `min_points` need calibrating against a scene whose true contents are known — the console dump
-  exists to make that visible.
+- **Object count needs calibrating per scene.** The defaults bring the 4-camera replay to ~9.5
+  objects/frame (from 22), but the right thresholds depend on depth resolution and scene scale. Some
+  boxes remain larger than a person, which is either genuinely-merged pairs or mask bleed — the box
+  overlay in the viewer is the fastest way to tell them apart.
 - **Calibration error inflates fused boxes** directly, and the analytic-projection gate for the
   mask/depth join is still unwritten.

@@ -145,6 +145,86 @@ class Detection:
                 f"c={tuple(round(v, 3) for v in self.centroid)} cams={self.cameras})")
 
 
+def box_extent(box: Box) -> Vec3:
+    return tuple(max(0.0, box[1][d] - box[0][d]) for d in range(3))
+
+
+def filter_observations(observations: Sequence[Observation],
+                        min_extent_m: float = 0.0,
+                        min_points: int = 0) -> List[Observation]:
+    """Drop specks and slivers before anything else looks at them.
+
+    Two independent rejections:
+
+    - **`min_points`** -- a few hundred points at depth-camera resolution is a patch a few centimetres
+      across. `tcn_instance_stats` applies its own `min_points`; this is a second, scene-level gate.
+    - **`min_extent_m`** -- a box must be at least this large on EVERY axis. This is what removes the
+      flat slivers a mask fringe produces (extents like 0.27 x 0.33 x 0.03 m), which no volume or
+      overlap rule catches because they are legitimately small.
+
+    Order matters: this runs before aggregate suppression, so a sliver cannot count as one of the
+    "children" that condemns a container.
+    """
+    out = []
+    for o in observations:
+        if o.num_points < min_points:
+            continue
+        if min_extent_m > 0.0 and min(box_extent(o.box)) < min_extent_m:
+            continue
+        out.append(o)
+    return out
+
+
+def suppress_aggregates(observations: Sequence[Observation],
+                        containment_threshold: float = 0.7,
+                        min_children: int = 2,
+                        min_volume_ratio: float = 1.5) -> List[Observation]:
+    """Drop boxes that are aggregates of several distinct objects, keeping the individuals.
+
+    A mask that covers two people produces one box containing both. Without this, the containment
+    merge rule then fuses those people into a single identity -- the rule meant to recognise "one
+    camera sees a torso, another the whole person" instead makes class-level blobs.
+
+    The discriminator is **how many distinct children a box contains**:
+
+    - a partial view contains, or is contained by, exactly ONE other view of the same object -> keep
+      both and let the merge rules union them
+    - an aggregate contains `min_children` or more others that are **mutually disjoint** -- and
+      therefore cannot all be views of one object -> drop the aggregate and prefer the individuals
+
+    `min_volume_ratio` guards the degenerate case where two boxes of nearly the same size each contain
+    the other: a container must be meaningfully larger than the children it is accused of swallowing.
+
+    This is what makes the pipeline prefer individual identities over class-like aggregates, and it is
+    also why a smaller box wins over the box that contains it.
+    """
+    keep = [True] * len(observations)
+    for i, container in enumerate(observations):
+        vol_c = box_volume(container.box)
+        if vol_c <= 0.0:
+            continue
+        children = []
+        for j, child in enumerate(observations):
+            if i == j or child.class_id != container.class_id:
+                continue
+            vol_ch = box_volume(child.box)
+            if vol_ch <= 0.0 or vol_c < min_volume_ratio * vol_ch:
+                continue                       # not meaningfully larger: not a container
+            if box_containment(container.box, child.box) >= containment_threshold:
+                children.append(j)
+        if len(children) < min_children:
+            continue
+        # The children must be mutually disjoint, or they may all be views of the same object seen
+        # from different angles -- which is a legitimate merge, not an aggregate.
+        disjoint = []
+        for j in children:
+            if all(box_iou(observations[j].box, observations[k].box) <= 0.0 for k in disjoint):
+                disjoint.append(j)
+        if len(disjoint) >= min_children:
+            keep[i] = False
+    return [o for o, k in zip(observations, keep) if k]
+
+
 def merge_observations(group: Sequence[Observation]) -> Detection:
     """Combine several views of one object: box union, point-weighted centroid.
 
@@ -169,7 +249,15 @@ def fuse_observations(observations: Sequence[Observation],
                       max_centroid_distance_m: float = 1.0,
                       footprint_iou_threshold: float = 0.4,
                       max_vertical_gap_m: float = 0.5,
-                      up_axis: int = UP_AXIS_Y) -> List[Detection]:
+                      up_axis: int = UP_AXIS_Y,
+                      min_extent_m: float = 0.0,
+                      min_points: int = 0,
+                      suppress_aggregates_containment: float = 0.7,
+                      suppress_aggregates_min_children: int = 2,
+                      suppress_aggregates_min_volume_ratio: float = 1.5,
+                      min_cameras: int = 1,
+                      min_detection_points: int = 0,
+                      min_detection_extent_m: float = 0.0) -> List[Detection]:
     """Group observations of the same physical object into detections, per class.
 
     Deliberately merges observations from the SAME camera as well as across cameras: one physical
@@ -196,10 +284,20 @@ def fuse_observations(observations: Sequence[Observation],
     them into one object. The vertical rule is safe against two people side by side, because both span
     the full height and so neither is *above* the other.
     """
+    usable = [o for o in observations if o.class_id != 0 and o.num_points > 0]
+    # Order is deliberate: reject specks and slivers first so they cannot count as the children that
+    # condemn a container, then drop aggregates so the containment merge below cannot fuse distinct
+    # objects into a class-level blob.
+    usable = filter_observations(usable, min_extent_m=min_extent_m, min_points=min_points)
+    if suppress_aggregates_min_children > 0:
+        usable = suppress_aggregates(
+            usable,
+            containment_threshold=suppress_aggregates_containment,
+            min_children=suppress_aggregates_min_children,
+            min_volume_ratio=suppress_aggregates_min_volume_ratio)
+
     by_class: Dict[int, List[Observation]] = {}
-    for o in observations:
-        if o.class_id == 0 or o.num_points <= 0:
-            continue                      # background, or an empty placeholder row
+    for o in usable:
         by_class.setdefault(o.class_id, []).append(o)
 
     detections: List[Detection] = []
@@ -239,7 +337,40 @@ def fuse_observations(observations: Sequence[Observation],
         merged = [merge_observations(g) for g in groups.values()]
         merged.sort(key=lambda d: (-d.num_points, d.centroid))
         detections.extend(merged)
-    return detections
+    # Corroboration and size gates apply to the FUSED object, so several small partial views that
+    # together make a plausible object survive where each alone would not.
+    return filter_detections(detections, min_cameras=min_cameras,
+                             min_points=min_detection_points,
+                             min_extent_m=min_detection_extent_m)
+
+
+def filter_detections(detections: Sequence[Detection],
+                      min_cameras: int = 1,
+                      min_points: int = 0,
+                      min_extent_m: float = 0.0) -> List[Detection]:
+    """Drop fused detections that nothing corroborates.
+
+    `min_cameras` is the strongest filter available on this data: an object seen by only ONE camera,
+    with few points, is usually mask fringe or a partial detection that no other viewpoint confirms.
+    Requiring two cameras removes those outright.
+
+    It is off by default (1) because it has a real cost: an object at the edge of the room, genuinely
+    visible to one camera only, disappears. Raise it when the rig has overlapping coverage everywhere
+    that matters, and leave it at 1 when it does not.
+
+    `min_points` and `min_extent_m` apply to the FUSED object, so a detection assembled from several
+    small partial views can still pass where each view alone would not.
+    """
+    out = []
+    for d in detections:
+        if len(d.cameras) < min_cameras:
+            continue
+        if d.num_points < min_points:
+            continue
+        if min_extent_m > 0.0 and min(box_extent(d.box)) < min_extent_m:
+            continue
+        out.append(d)
+    return out
 
 
 def match_detections_to_tracks(detections: Sequence["object"],

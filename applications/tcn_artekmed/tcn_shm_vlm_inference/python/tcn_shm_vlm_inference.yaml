@@ -98,14 +98,16 @@ mask_depth_join:
 # CONFIDENCE RANKS, not identities -- this path turns them into one entry per physical object:
 # per-camera reduction (tcn_instance_stats) -> cross-camera fusion -> temporal tracking -> console.
 object_tracking:
-  enabled: false
+  enabled: true
   # --- per-camera reduction ---
   # Points further than sigma_k standard deviations from the instance mean on any axis are excluded
   # from the box and centroid. This is what keeps a mask that bleeds onto a background surface from
   # inflating the box; the reported spread stays un-trimmed so the bleed is still visible.
   sigma_k: 2.5
   sigma_floor_m: 0.01     # keeps a flat instance from rejecting all of its own points
-  min_points: 64          # fewer than this is depth noise or mask fringe, not an object
+  min_points: 500         # fewer than this is depth noise or mask fringe, not an object. At
+                          # depth-camera resolution 64 admitted 100-point "people"; several hundred
+                          # corresponds to a patch of real size.
   max_instances: 64       # per camera per frame; overflow is warned about, never silently truncated
   # --- cross-camera fusion (metres; the world frame is metric) ---
   fusion_iou_threshold: 0.15      # two cameras seeing the same body
@@ -113,6 +115,35 @@ object_tracking:
   fusion_footprint_iou: 0.4       # same ground footprint...
   fusion_max_vertical_gap_m: 0.5  # ...and vertically adjacent: a mask split by an occluder
   fusion_max_distance_m: 1.0      # stops single-linkage chaining across a room
+  # --- rejecting non-objects and aggregates (this is what controls object COUNT) ---
+  # A box must be at least this large on EVERY axis. Removes the flat slivers a mask fringe produces
+  # (extents like 0.27 x 0.33 x 0.03 m), which no volume or overlap rule catches.
+  min_extent_m: 0.12
+  # A second, scene-level point threshold on top of the per-camera one above.
+  fusion_min_points: 800
+  # Prefer individual identities over class-like aggregates: a box that contains this many MUTUALLY
+  # DISJOINT smaller boxes of its class is a mask covering several objects, so it is dropped and its
+  # constituents kept. One contained box is a partial view (a torso inside a person) and still merges.
+  # Set aggregate_min_children: 0 to disable.
+  aggregate_containment: 0.7
+  aggregate_min_children: 2
+  aggregate_min_volume_ratio: 1.5   # a container must be meaningfully larger than its children
+  # --- corroboration: the strongest lever on object COUNT for this data ---
+  # An object only ONE camera ever saw is usually mask fringe or a partial detection nothing else
+  # confirms. 2 removes those outright; the cost is that an object at the edge of the room, genuinely
+  # visible to one camera only, disappears. Keep 1 where coverage does not overlap.
+  min_cameras: 1
+  # Applied to the FUSED object, so several small partial views that together make a plausible object
+  # survive where each alone would not. THIS is the effective lever on object count for this data:
+  # measured on the 4-camera replay (8 frames), everything else at these defaults --
+  #     min_detection_points     0 -> 22.0 objects/frame, 24 ids, 4 id-set changes
+  #                           2000 -> 15.9              , 17    , 2
+  #                           3000 ->  9.5              , 10    , 1
+  #   (min_cameras: 2 gives 8.5 / 9 / 1, i.e. the same, but by dropping single-camera objects
+  #    outright -- filtering on evidence quantity is preferred to filtering on viewpoint count.)
+  # Scene-scale dependent: 3000 points is a patch of real size at this depth resolution.
+  min_detection_points: 3000
+  min_detection_extent_m: 0.0
   # Which world axis is UP. A property of the calibration, not a convention: backprojection applies
   # each camera's depth_extrinsics, so "up" is whatever camera_pose made it. For the artekmed exports
   # it is y -- check by printing object centres, where the vertical axis spans a narrow plausible
@@ -132,7 +163,9 @@ object_tracking:
   # points use, so a box reads as "the box around those points".
   render_boxes: true
   box_line_width: 3.0
-  print_every: 1
+  # Per-frame console block: 0 = shutdown summary only. The boxes are in the viewer; set to 1 (or N)
+  # when debugging the numbers behind them.
+  print_every: 0
   verbose: false
   verbose_instances: false
 

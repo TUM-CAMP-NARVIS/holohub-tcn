@@ -8,7 +8,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from association import (UP_AXIS_Y, UP_AXIS_Z, Observation, box_containment,
+from association import (UP_AXIS_Y, UP_AXIS_Z, Observation, box_containment, box_extent,
+                         filter_detections, filter_observations, suppress_aggregates,
                          box_intersection, box_iou, box_union, box_volume,
                          centroid_distance, footprint_iou, fuse_observations,
                          merge_observations, match_detections_to_tracks)
@@ -173,6 +174,92 @@ def test_fusion_output_order_is_deterministic():
     second = [(d.class_id, d.num_points) for d in fuse_observations([b, a])]
     assert first == second, "output depends on input order"
     assert first[0][1] == 30000, "largest object should come first"
+
+
+# ── small-object and aggregate rejection ──────────────────────────────────────────────────────────
+
+def test_min_points_rejects_specks():
+    keep = filter_observations([obs(1, 1, 0, 50, 0, 0, 0.9), obs(1, 2, 0, 5000, 3, 0, 0.9)],
+                               min_points=500)
+    assert [o.num_points for o in keep] == [5000]
+
+
+def test_min_extent_rejects_a_flat_sliver():
+    """A mask fringe produces a legitimately small, very flat box; no volume rule catches it."""
+    sliver = Observation(1, 1, 0, 9000, (0, 0, 0.9), box(0, 0, 0.9, 0.27, 0.33, 0.03))
+    person = obs(1, 2, 0, 9000, 3.0, 0, 0.9)
+    keep = filter_observations([sliver, person], min_extent_m=0.10)
+    assert len(keep) == 1 and keep[0].instance_id == 2, [box_extent(o.box) for o in keep]
+
+
+def test_aggregate_containing_two_disjoint_objects_is_dropped():
+    """A mask covering two people must not become one identity -- prefer the individuals."""
+    a = obs(1, 1, 0, 20000, -0.6, 0, 0.9)                       # person A
+    b = obs(1, 2, 0, 20000, +0.6, 0, 0.9)                       # person B, disjoint from A
+    blob = Observation(1, 3, 1, 45000, (0.0, 0, 0.9), box(0.0, 0, 0.9, 2.0, 1.0, 2.0))
+    keep = suppress_aggregates([a, b, blob])
+    assert {o.instance_id for o in keep} == {1, 2}, [o.instance_id for o in keep]
+
+
+def test_a_single_contained_partial_view_is_kept_and_merged():
+    """The legitimate case the containment rule exists for: torso inside whole person -> one object."""
+    person = obs(1, 1, 0, 40000, 0.0, 0, 0.9)
+    torso = Observation(1, 1, 1, 12000, (0.0, 0, 1.2), box(0.0, 0, 1.2, 0.4, 0.4, 0.5))
+    keep = suppress_aggregates([person, torso])
+    assert len(keep) == 2, "a single-child container was mistaken for an aggregate"
+    assert len(fuse_observations([person, torso])) == 1, "the partial view stopped merging"
+
+
+def test_aggregate_of_similar_sized_boxes_is_not_dropped():
+    """Two boxes of nearly equal size can each 'contain' the other; neither is an aggregate."""
+    a = obs(1, 1, 0, 20000, 0.0, 0, 0.9)
+    b = obs(1, 2, 1, 20000, 0.02, 0, 0.9)
+    assert len(suppress_aggregates([a, b], min_volume_ratio=1.5)) == 2
+
+
+def test_aggregate_containing_views_of_one_object_is_not_dropped():
+    """Its children overlap each other, so they are views of one object, not distinct objects."""
+    big = Observation(1, 1, 0, 40000, (0, 0, 0.9), box(0, 0, 0.9, 1.0, 1.0, 2.0))
+    v1 = Observation(1, 2, 1, 10000, (0, 0, 0.9), box(0, 0, 0.9, 0.4, 0.4, 1.0))
+    v2 = Observation(1, 3, 2, 10000, (0.05, 0, 0.95), box(0.05, 0, 0.95, 0.4, 0.4, 1.0))
+    keep = suppress_aggregates([big, v1, v2])
+    assert len(keep) == 3, "overlapping child views were treated as distinct objects"
+
+
+def test_fusion_end_to_end_prefers_individuals_over_the_blob():
+    a = obs(1, 1, 0, 20000, -0.6, 0, 0.9)
+    b = obs(1, 2, 0, 20000, +0.6, 0, 0.9)
+    blob = Observation(1, 3, 1, 45000, (0.0, 0, 0.9), box(0.0, 0, 0.9, 2.0, 1.0, 2.0))
+    d = fuse_observations([a, b, blob], max_centroid_distance_m=1.0)
+    assert len(d) == 2, f"expected two identities, got {len(d)}: {d}"
+    assert all(x.num_points == 20000 for x in d), [x.num_points for x in d]
+
+
+def test_min_cameras_drops_uncorroborated_detections():
+    """An object only one camera ever saw is usually fringe; two cameras is corroboration."""
+    seen_by_two = [obs(1, 1, 0, 20000, 0.0, 0, 0.9), obs(1, 1, 1, 18000, 0.03, 0, 0.9)]
+    seen_by_one = [obs(1, 2, 2, 3000, 5.0, 0, 0.9)]
+    d = fuse_observations(seen_by_two + seen_by_one, min_cameras=2)
+    assert len(d) == 1, [x.cameras for x in d]
+    assert d[0].cameras == (0, 1)
+    # ...and with the default it survives, because a one-camera object can be real.
+    assert len(fuse_observations(seen_by_two + seen_by_one)) == 2
+
+
+def test_detection_gates_apply_to_the_FUSED_object():
+    """Two partial views, each below the point threshold, together pass it."""
+    partial = [obs(1, 1, 0, 600, 0.0, 0, 0.9), obs(1, 1, 1, 600, 0.02, 0, 0.9)]
+    assert len(fuse_observations(partial, min_detection_points=1000)) == 1
+    assert len(fuse_observations(partial, min_detection_points=2000)) == 0
+
+
+def test_filter_detections_is_independent_of_fusion():
+    from association import Detection
+    d = [Detection(1, 5000, (0, 0, 0.9), box(0, 0, 0.9, 0.5, 0.5, 1.8), cameras=[0]),
+         Detection(1, 5000, (3, 0, 0.9), box(3, 0, 0.9, 0.5, 0.5, 1.8), cameras=[0, 2])]
+    assert len(filter_detections(d, min_cameras=2)) == 1
+    assert len(filter_detections(d, min_points=6000)) == 0
+    assert len(filter_detections(d, min_extent_m=1.0)) == 0     # 0.5 m on two axes
 
 
 # ── matching ──────────────────────────────────────────────────────────────────────────────────────

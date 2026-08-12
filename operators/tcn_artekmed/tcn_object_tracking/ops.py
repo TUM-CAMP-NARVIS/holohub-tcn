@@ -68,7 +68,11 @@ class InstanceFusionOp(Operator):
 
     def __init__(self, fragment, *args, iou_threshold=0.15, containment_threshold=0.6,
                  max_centroid_distance_m=1.0, footprint_iou_threshold=0.4,
-                 max_vertical_gap_m=0.5, up_axis="y", verbose=False, **kwargs):
+                 max_vertical_gap_m=0.5, up_axis="y", min_extent_m=0.0, min_points=0,
+                 aggregate_containment=0.7, aggregate_min_children=2,
+                 aggregate_min_volume_ratio=1.5, min_cameras=1,
+                 min_detection_points=0, min_detection_extent_m=0.0,
+                 verbose=False, **kwargs):
         # The vertical world axis is a property of the calibration, not a convention: for the
         # artekmed exports it is y. A wrong value does not fail loudly -- the footprint rule simply
         # stops merging vertically split objects -- so it is configured, never assumed.
@@ -94,7 +98,16 @@ class InstanceFusionOp(Operator):
         self.max_centroid_distance_m = float(max_centroid_distance_m)
         self.footprint_iou_threshold = float(footprint_iou_threshold)
         self.max_vertical_gap_m = float(max_vertical_gap_m)
+        self.min_extent_m = float(min_extent_m)
+        self.min_points = int(min_points)
+        self.aggregate_containment = float(aggregate_containment)
+        self.aggregate_min_children = int(aggregate_min_children)
+        self.aggregate_min_volume_ratio = float(aggregate_min_volume_ratio)
+        self.min_cameras = int(min_cameras)
+        self.min_detection_points = int(min_detection_points)
+        self.min_detection_extent_m = float(min_detection_extent_m)
         self.verbose = bool(verbose)
+        self.dropped = 0
         self.frames = 0
         super().__init__(fragment, *args, **kwargs)
 
@@ -119,7 +132,15 @@ class InstanceFusionOp(Operator):
             max_centroid_distance_m=self.max_centroid_distance_m,
             footprint_iou_threshold=self.footprint_iou_threshold,
             max_vertical_gap_m=self.max_vertical_gap_m,
-            up_axis=self.up_axis)
+            up_axis=self.up_axis,
+            min_extent_m=self.min_extent_m,
+            min_points=self.min_points,
+            suppress_aggregates_containment=self.aggregate_containment,
+            suppress_aggregates_min_children=self.aggregate_min_children,
+            suppress_aggregates_min_volume_ratio=self.aggregate_min_volume_ratio,
+            min_cameras=self.min_cameras,
+            min_detection_points=self.min_detection_points,
+            min_detection_extent_m=self.min_detection_extent_m)
         self.frames += 1
         if self.verbose:
             log.info(f"InstanceFusionOp: frame {self.frames}: {len(observations)} observation(s) "
@@ -192,8 +213,10 @@ class ObjectConsoleSinkOp(Operator):
     per-frame print cannot.
     """
 
-    def __init__(self, fragment, *args, print_every=1, **kwargs):
-        self.print_every = max(1, int(print_every))
+    def __init__(self, fragment, *args, print_every=0, **kwargs):
+        # 0 = summary only. The per-frame block is a debugging tool, not something a running
+        # application should pipe to a console -- the boxes are visible in the viewer.
+        self.print_every = max(0, int(print_every))
         self.frames = 0
         self.ids_seen = set()
         self.id_sets = []
@@ -212,7 +235,7 @@ class ObjectConsoleSinkOp(Operator):
         self.ids_seen.update(frame_ids)
         self.id_sets.append(frame_ids)
 
-        if self.frames % self.print_every:
+        if self.print_every == 0 or self.frames % self.print_every:
             return
         log.info(f"--- tracked objects, frame {self.frames} "
                  f"(acq={msg.get('acq_timestamp')}): {len(objects)} object(s)")
