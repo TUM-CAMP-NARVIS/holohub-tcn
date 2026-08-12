@@ -71,6 +71,87 @@ exporter produces an NCHW graph that TensorRT silently misreads. See
 [`docs/da3_onnx_export.md`](docs/da3_onnx_export.md) for the how-to and
 [`docs/da3_export.py`](docs/da3_export.py) for the ready-to-run patched exporter.
 
+## Segmented point clouds (mask/depth join)
+
+Gives every depth pixel the panoptic label of the scene point it observes, then emits one point cloud
+per class and fuses them across cameras into a single view. Design:
+[docs/specs/2026-08-12-mask-depth-join-design.md](docs/specs/2026-08-12-mask-depth-join-design.md).
+
+Per camera the chain is
+
+```
+depth ─► backprojection ─┬─► texcoords ─┐
+                         └─► positions ─┼─► label_sampler ─┬─► labels ─► labeled_pointcloud ─┐
+masks (panoptic map) ────────────────────┘                 └─► mask ─► apply_mask            │
+                                                                                             ▼
+                                            one merger per class (fuses all cameras) ─► HolovizOp
+```
+
+Sampling the panoptic map through backprojection's texcoords is the only correct correspondence:
+the depth and colour sensors differ in resolution, intrinsics, distortion and optical centre, so
+rescaling a mask onto the depth grid is spatially wrong in a depth-dependent way that no aggregate
+test detects.
+
+### Enabling it
+
+```yaml
+temporal_sync:      { enabled: true }     # required -- see below
+mask_depth_join:    { enabled: true }
+camera_stream_processing: { enable_langsam_multicam: true }
+```
+
+`temporal_sync` is not optional. The mask path runs at roughly a third of the source rate and a
+couple of frames behind it, so joining a mask to "whatever depth is current" mis-registers it by a
+varying amount — which is the error this whole path exists to remove.
+
+Classes come from `text_prompts.prompts` (ids are 1-based prompt positions) unless
+`mask_depth_join.pointcloud_classes` overrides them, and each class takes its colour from the same
+LUT the 2D mask overlay uses, so a class looks the same in both views.
+
+`mask_depth_join.check` (default on) builds the verification operators. They read every output back
+with GPU reductions — one sync per camera per frame — and assert that a pixel selected by the mask
+kept its depth. That invariant caught a use-after-free in `tcn_stream_splitter`; keep it on while
+gating and turn it off for a latency-sensitive run.
+
+### Running on a live shm stream
+
+Works on `source: "shm"` with no extra configuration: calibration comes from the device contexts
+`discover_shm()` returns, the subscriber already emits `depth_outputs`, and the join discovers each
+camera's depth channel from the segment rather than assuming its name. Preconditions:
+
+- **Engines must match the active worker split.** A 5-camera rig needs engines built for its own
+  batch sizes (see [docs/trt11-upgrade-runbook.md](../../../docs/trt11-upgrade-runbook.md)).
+- **The publisher must set acquisition timestamps.** The subscriber forwards `frame.timestamp`; if it
+  is never set, every frame carries the same value, the synchroniser rejects non-advancing timestamps
+  and publishes nothing. The shutdown line says so directly — `non-monotonic` rising with
+  `published 0 groups`.
+- **`temporal_sync.depth_capacity` must exceed the mask/depth skew.** If it does not, the
+  synchroniser reports `forced drops` rather than silently losing frames.
+- **`depthimage_backprojection.depth_units_per_meter` is a yaml constant** (1000.0 = millimetres).
+  The live device context carries the real value but `DeviceContextService` exposes no getter for it,
+  so a camera using different units would scale every point linearly.
+
+### Measured cost
+
+Live 5-camera run, 529 frames (`/tmp/tcn/vlm_inference_profile.nsys-rep`, 2026-08-12): the period
+went from 197.2 ms to **209.8 ms (4.77 fps)** — the whole geometric path costs **+12.6 ms/frame**,
+about 6%. Per camera per frame:
+
+| stage | avg |
+|---|---|
+| backprojection | 0.8–1.0 ms |
+| label sampler | 1.1–1.4 ms |
+| apply_mask | 0.6–1.7 ms |
+| **labeled_pointcloud** | **24.4–24.8 ms** |
+| fusion (5 mergers, once per frame) | ~25 ms total |
+| point-cloud Holoviz | 68.8 ms/tick, asynchronous |
+
+`tcn_labeled_pointcloud` is 87% of the per-camera cost, and 32% of its time is measured inside
+`cudaStreamSynchronize`: it runs one `thrust::copy_if` per class and each one ends with a host-side
+count, so a 5-class configuration synchronises five times per camera per frame. Computing all class
+counts in one pass — one kernel, one device-to-host copy of K counts, then per-class scatter — would
+cut that to one sync. Not done yet.
+
 ## Development
 
 ### Project Structure

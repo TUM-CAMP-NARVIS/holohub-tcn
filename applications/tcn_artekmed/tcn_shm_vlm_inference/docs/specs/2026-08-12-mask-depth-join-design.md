@@ -1,6 +1,6 @@
 # Mask ↔ depth join via backprojection texcoords — design
 
-**Status:** design
+**Status:** implemented and validated on a live 5-camera stream
 **Date:** 2026-08-12
 **Depends on:** `2026-08-11-temporal-sync-design.md` (frame grouping), `2026-08-10-replay-harness-design.md` (deterministic source)
 
@@ -189,6 +189,31 @@ gates useless.
 The join gets its own `RMMAllocator`. The shared pool is a `BlockMemoryPool` with frame-sized blocks,
 and the join adds dozens of small, variable-sized tensors per frame; each would consume a whole
 block, exhausting the pool while wasting most of what it handed out.
+
+## Live validation (2026-08-12)
+
+Ran on the live shm source, 5 cameras, 529 frames / 111 s
+(`/tmp/tcn/vlm_inference_profile.nsys-rep`). The segmented point cloud was visually correct.
+
+`temporal_sync` published a group for essentially every frame — 529 subscriber ticks against 527
+join frames — which also settles the one thing that could not be checked on the replay source: the
+subscriber's `Timestamp` **write** side works against real publisher timestamps. Had the publisher
+not set them, every frame would carry the same value and the synchroniser would have published
+nothing.
+
+Cost: the period went from 197.2 ms to **209.8 ms (4.77 fps)**, so the entire geometric path costs
+**+12.6 ms/frame (~6%)**. Per camera per frame: backprojection 0.8–1.0 ms, label sampler 1.1–1.4 ms,
+apply_mask 0.6–1.7 ms, `labeled_pointcloud` **24.4–24.8 ms**; per frame: 5 class mergers ~25 ms
+total, and the point-cloud Holoviz 68.8 ms/tick asynchronously (0% of it inside a sync).
+
+**Known hotspot, not yet addressed.** `tcn_labeled_pointcloud` is 87% of the per-camera join cost,
+and 32% of its time is measured inside `cudaStreamSynchronize`. The cause is structural: one
+`thrust::copy_if` per class, each ending with a host-side count (`end - indices_d_`) that forces a
+stream synchronise, so K classes cost K syncs per camera per frame — 25 syncs/frame at 5 cameras ×
+5 classes. Computing every class's count in a single pass (one kernel producing K counts, one
+device-to-host copy, then per-class scatter from precomputed offsets) reduces that to one sync per
+camera. The host round-trip cannot be removed entirely, because the output tensor must be sized to
+the point count before it is allocated.
 
 ## Explicitly out of scope
 
