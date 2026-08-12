@@ -183,6 +183,14 @@ cost**, and an operator off the critical path can be made nearly free without mo
 
 ## Development
 
+**[docs/development-loop.md](docs/development-loop.md)** — the edit → test-in-container → verify loop
+used to build this application: how to run checks inside the already-running container, how to build a
+gate whose output distinguishes *passed* from *did not run*, why a deterministic replay source is a
+prerequisite for any correctness claim, and how to tier gates so the fast ones run on every edit. Worth
+reading before changing anything here; most of the subtle defects in this pipeline were found by a gate
+rather than by reading code.
+
+
 ### Project Structure
 
 ```
