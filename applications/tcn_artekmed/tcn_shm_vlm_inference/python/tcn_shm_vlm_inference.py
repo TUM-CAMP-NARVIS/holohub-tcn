@@ -32,7 +32,7 @@ from operators.tcn_artekmed.tcn_util import RotateImage180Op
 from operators.tcn_artekmed.tcn_dataset_replayer import TcnDatasetReplayerOp
 from operators.tcn_artekmed.tcn_dataset_replayer._calibration import load_device_contexts
 from operators.tcn_artekmed.tcn_object_tracking import (
-    InstanceFusionOp, ObjectConsoleSinkOp, ObjectTrackerOp,
+    InstanceFusionOp, ObjectBoxRendererOp, ObjectConsoleSinkOp, ObjectTrackerOp, box_input_specs,
 )
 
 
@@ -895,6 +895,19 @@ class App(hs.core.Application):
                     for cls, merge_op in zip(cloud_classes, cloud_merge_ops):
                         self.add_flow(merge_op, fusion_check, {("output", f"class_{cls}")})
 
+                # Bounding-box overlay, into the same view as the points. Built here because it
+                # needs `lut` and appends to `cloud_specs`, and wired from the tracker created above.
+                if track_enabled and bool(track_cfg.get("render_boxes", True)):
+                    box_renderer = ObjectBoxRendererOp(
+                        self, classes=cloud_classes, device=cuda_device_id,
+                        name="object_box_renderer")
+                    self.add_flow(tracker_op, box_renderer, {("objects", "objects")})
+                    cloud_specs.extend(box_input_specs(
+                        cloud_classes, lut,
+                        line_width=float(track_cfg.get("box_line_width", 3.0))))
+                else:
+                    box_renderer = None
+
                 cloud_visualizer = HolovizOp(
                     self,
                     name="labeled_pointcloud_visualizer",
@@ -904,6 +917,8 @@ class App(hs.core.Application):
                     **self.kwargs("labeled_pointcloud_holoviz"))
                 for merge_op in cloud_merge_ops:
                     self.add_flow(merge_op, cloud_visualizer, {("output", "receivers")})
+                if box_renderer is not None:
+                    self.add_flow(box_renderer, cloud_visualizer, {("boxes", "receivers")})
 
                 log.info(f"Mask/depth join ENABLED for {join_cams} "
                          f"(select_classes={select_classes or 'all non-background'}, "

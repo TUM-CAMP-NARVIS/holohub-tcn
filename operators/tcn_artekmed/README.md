@@ -59,6 +59,8 @@ Python sub-flows: whole pipelines packaged as `Subgraph`s, reusable across appli
 | [tcn_label_sampler](tcn_label_sampler/README.md) | Samples a panoptic map through texcoords onto the depth grid |
 | [tcn_labeled_pointcloud](tcn_labeled_pointcloud/README.md) | Compacts a labeled depth grid into one point cloud per class |
 | [tcn_texture_sampler](tcn_texture_sampler/README.md) | Samples a colour image through texcoords (bilinear) |
+| [tcn_instance_stats](tcn_instance_stats/README.md) | Reduces a labeled point grid to one row per instance: count, centroid, box, spread |
+| [tcn_object_tracking](tcn_object_tracking/README.md) | Cross-camera fusion, persistent object ids over time, console dump and box overlay |
 
 ### Transport
 
