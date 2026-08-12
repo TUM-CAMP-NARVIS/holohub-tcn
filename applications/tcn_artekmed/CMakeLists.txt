@@ -87,6 +87,7 @@ add_holohub_application(tcn_shm_vlm_inference DEPENDS OPERATORS
         tcn_depthimage_backprojection
         tcn_label_sampler
         tcn_labeled_pointcloud
+        tcn_instance_stats
         tcn_stream_merger
         tcn_flatten_tensor
         tcn_depthimage_apply_mask

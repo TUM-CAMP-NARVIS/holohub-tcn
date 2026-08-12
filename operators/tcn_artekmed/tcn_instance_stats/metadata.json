@@ -1,0 +1,38 @@
+{
+  "operator": {
+    "name": "TcnInstanceStatsOp",
+    "description": "Reduces a labeled point grid to one row per panoptic instance: point count, centroid, axis-aligned bounding box and per-axis spread.",
+    "authors": [
+      {
+        "name": "Ulrich Eck",
+        "affiliation": "TUM-CAMP-NARVIS"
+      }
+    ],
+    "language": [
+      "C++",
+      "Python"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0": "Initial Release"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "3.3.0",
+      "tested_versions": [
+        "3.3.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Pointcloud Processing",
+      "Segmentation"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "packages": []
+    }
+  }
+}
