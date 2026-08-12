@@ -20,6 +20,7 @@ __all__ = [
     # sub-flows
     "RealtimeLangSamSubgraph",
     "PromptedLangSamSubgraph",
+    "SingleCameraLangSamSubgraph",
     # realtime per-stage operators, exported so an application can wire them directly
     "GdinoOp",
     "SamOp",
@@ -28,8 +29,10 @@ __all__ = [
     "MaskCollectorOp",
     "LabelMapColorizeOp",
     # prompted path
-    "LangSAM2Operator",
     "TextPromptPublisher",
+    # Single-camera PyTorch reference path, superseded for multi-camera use by
+    # PromptedLangSamSubgraph; kept because it is the simplest thing that runs one camera.
+    "LangSAM2Operator",
     "LangSamPostprocessorOp",
     # models and helpers, used by the offline engine builders as well as the operators
     "SAM",
@@ -58,6 +61,7 @@ _LAZY = {
     "MaskCollectorOp": (".realtime", "MaskCollectorOp"),
     "LabelMapColorizeOp": (".realtime", "LabelMapColorizeOp"),
     "PromptedLangSamSubgraph": (".prompted", "PromptedLangSamSubgraph"),
+    "SingleCameraLangSamSubgraph": (".single_camera", "SingleCameraLangSamSubgraph"),
     "LangSAM2Operator": (".prompted_ops", "LangSAM2Operator"),
     "TextPromptPublisher": (".prompted_ops", "TextPromptPublisher"),
     "LangSamPostprocessorOp": (".prompted_ops", "LangSamPostprocessorOp"),

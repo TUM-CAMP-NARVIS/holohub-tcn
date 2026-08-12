@@ -60,6 +60,8 @@ from operators.tcn_artekmed.tcn_langsam import (
     MaskDumpOp,
     PromptedLangSamSubgraph,
     RealtimeLangSamSubgraph,
+    SingleCameraLangSamSubgraph,
+    TextPromptPublisher,
     build_panoptic_lut,
     class_id_map,
     mask_name,
@@ -926,9 +928,11 @@ class App(hs.core.Application):
             have_camera_consumer = True
 
         if camera_streams_config.get("enable_langsam", False):
-            langsam_pipeline = PromptedLangSamSubgraph(self, "camera01_langsam_pipeline",
-                                                         device_memory_pool,
-                                                         self.kwargs)
+            # Single camera, prompts from configuration. The multi-camera promptable path is
+            # PromptedLangSamSubgraph -- see the tcn_langsam README for which to pick.
+            langsam_pipeline = SingleCameraLangSamSubgraph(self, "camera01_langsam_pipeline",
+                                                          device_memory_pool,
+                                                          self.kwargs)
 
             holoviz_args = self.kwargs("langsam_holoviz")
 
@@ -955,8 +959,36 @@ class App(hs.core.Application):
             # otherwise-harmless gpu_workers block.
             validate_source_cameras(source, all_color_cams, self.kwargs("gpu_workers"))
 
-            langsam_mc = RealtimeLangSamSubgraph(
-                self, "langsam_multicam", self.kwargs, all_color_cams)
+            # Two multi-camera variants, identical downstream: `realtime` runs Grounding DINO as a
+            # prebuilt TRT engine with its vocabulary baked in; `prompted` runs it in PyTorch and
+            # takes the vocabulary from a `prompts` port, so it can change while the pipeline runs.
+            # Both keep the SAM TRT encoder, the batched decode and the fused panoptic paint, because
+            # none of those depend on the prompt set.
+            langsam_variant = str(camera_streams_config.get("langsam_variant", "realtime")).lower()
+            if langsam_variant not in ("realtime", "prompted"):
+                raise ValueError(
+                    f"camera_stream_processing.langsam_variant must be 'realtime' or 'prompted', "
+                    f"got {langsam_variant!r}")
+            log.info(f"LangSAM multicam variant: {langsam_variant}")
+
+            if langsam_variant == "prompted":
+                langsam_mc = PromptedLangSamSubgraph(
+                    self, "langsam_multicam", self.kwargs, all_color_cams)
+                # Publish once: prompt-derived state is rebuilt on change, so a per-tick publisher
+                # would be pure overhead. An application wanting interactive prompting replaces this
+                # operator with its own source (UI, RPC, file watch) on the same port and message
+                # shape -- {"text_prompts": [...]}.
+                prompt_cfg = self.kwargs("text_prompts") or {}
+                runtime_prompts = list(prompt_cfg.get("runtime_prompts")
+                                       or prompt_cfg.get("prompts") or [])
+                prompt_pub = TextPromptPublisher(
+                    self, CountCondition(self, count=1),
+                    prompts=runtime_prompts, name="text_prompt_publisher")
+                self.add_flow(prompt_pub, langsam_mc, {("out", "prompts")})
+                log.info(f"Prompt publisher will send: {runtime_prompts}")
+            else:
+                langsam_mc = RealtimeLangSamSubgraph(
+                    self, "langsam_multicam", self.kwargs, all_color_cams)
 
             langsam_mc_holoviz = HolovizOp(
                 self,

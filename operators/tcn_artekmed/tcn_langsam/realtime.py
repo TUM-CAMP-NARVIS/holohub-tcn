@@ -16,7 +16,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import holoscan as hs
-from holoscan.core import Operator, OperatorSpec, Subgraph, IOSpec
+from holoscan.core import ConditionType, Operator, OperatorSpec, Subgraph, IOSpec
 from holoscan.operators import HolovizOp
 
 from .models import (
@@ -38,7 +38,7 @@ class LangSamBatchOp(Operator):
          on `device`).
     """
 
-    def __init__(self, fragment, *args, cameras, device, langsam_cfg, prompts, **kwargs):
+    def __init__(self, fragment, *args, cameras, device, langsam_cfg, prompts, promptable=False, **kwargs):
         self.cameras = list(cameras)
         # This worker's engines are built for exactly its camera count. Resolving the paths
         # here -- rather than passing one fixed path for every worker -- is what lets a
@@ -59,6 +59,8 @@ class LangSamBatchOp(Operator):
                     f"  SAM (container):             sam_trt_export.py --batch {self.batch} ...")
         self.device = device if isinstance(device, torch.device) else torch.device(f"cuda:{int(device)}")
         self.prompts = list(prompts)
+        self._prompt_key = None          # set by _apply_prompts; see _receive_prompts
+        self.promptable = bool(promptable)
         self.box_threshold = float(langsam_cfg.get("box_threshold", 0.3))
         self.text_threshold = float(langsam_cfg.get("text_threshold", 0.25))
         self.gdino_backend = langsam_cfg.get("gdino_backend", "pytorch")
@@ -111,13 +113,52 @@ class LangSamBatchOp(Operator):
         raises otherwise; the pytorch backend tokenises per call and accepts anything.
         """
         prompts = list(prompts)
+        if [str(x).strip().lower() for x in prompts] == self._prompt_key:
+            return False                             # unchanged: the publisher re-sends every tick
         if self.gdino_trt is not None:
             self.gdino_trt.set_prompts(prompts)      # raises first, before any state moves
         self.prompts = prompts
         self._cmap = class_id_map(self.prompts)
+        self._prompt_key = [str(x).strip().lower() for x in prompts]
+        return True
+
+    def _receive_prompts(self, op_input):
+        """Apply a prompt update if one is waiting. No-op when the port is absent or empty.
+
+        The port carries no condition, so a promptable worker still ticks on colour frames alone --
+        prompts arrive only when someone changes them, and gating compute() on them would stall the
+        pipeline until the first update.
+
+        A prompt change is NOT atomic across workers: each applies the update on its own next tick,
+        so for one frame two workers can label with different class ids and the collector will merge
+        them. That is visible as a single frame of mixed colours, and is the reason a prompt change
+        should be treated as a scene change rather than a per-frame control.
+        """
+        if not self.promptable:
+            return
+        try:
+            msg = op_input.receive("prompts")
+        except Exception:
+            return
+        if not msg:
+            return
+        new_prompts = msg.get("text_prompts") if hasattr(msg, "get") else None
+        if not new_prompts:
+            return
+        try:
+            if self._apply_prompts(list(new_prompts)):
+                log.info(f"LangSamBatchOp[{self.device}]: prompts now {self.prompts}")
+        except ValueError as e:
+            # A TRT-backed detector can only express a subset/reordering of its baked vocabulary.
+            # Keep running on the previous prompts rather than killing the graph mid-stream.
+            log.error(f"LangSamBatchOp[{self.device}]: rejected prompt update {list(new_prompts)}: "
+                      f"{e}; staying on {self.prompts}")
 
     def setup(self, spec: OperatorSpec):
         spec.input("color_input")
+        if self.promptable:
+            # See _receive_prompts: conditionless, so colour frames alone keep the worker ticking.
+            spec.input("prompts").condition(ConditionType.NONE)
         spec.output("masks")
 
     def _extract_result(self, r):
@@ -136,6 +177,7 @@ class LangSamBatchOp(Operator):
         return boxes, [str(x) for x in labels]
 
     def compute(self, op_input, op_output, context):
+        self._receive_prompts(op_input)
         msg = op_input.receive("color_input")
         # Frame identity must be forwarded explicitly -- see acq_timestamp's docstring.
         acq = acq_timestamp(op_input, "color_input")
@@ -230,18 +272,45 @@ class MaskCollectorOp(Operator):
 class LabelMapColorizeOp(Operator):
     """Colorize per-camera label maps via a class LUT -> RGBA, and emit tiled Holoviz specs."""
 
-    def __init__(self, fragment, *args, num_classes, alpha=180, **kwargs):
+    def __init__(self, fragment, *args, num_classes, alpha=180, promptable=False, **kwargs):
         # Panoptic LUT indexed directly by the packed uint16 value (class<<8|instance):
         # class = large color difference, instance = subtle brightness variation.
-        self._lut = build_panoptic_lut(num_classes, alpha=alpha)
+        self._alpha = alpha
+        self._num_classes = int(num_classes)
+        self._lut = build_panoptic_lut(self._num_classes, alpha=alpha)
+        self.promptable = bool(promptable)
         super().__init__(fragment, *args, **kwargs)
+
+    def _receive_prompts(self, op_input):
+        """Grow the LUT when a prompt update adds classes.
+
+        The LUT is indexed by the packed label, so it must cover the highest class id in use; a map
+        containing class 6 against a 5-class LUT indexes out of bounds. It is only ever grown, never
+        shrunk, so a class that disappears and comes back keeps its colour -- stable colours across
+        prompt edits matter more than a few unused LUT rows.
+        """
+        if not self.promptable:
+            return
+        try:
+            msg = op_input.receive("prompts")
+        except Exception:
+            return
+        prompts = msg.get("text_prompts") if msg and hasattr(msg, "get") else None
+        if not prompts or len(prompts) <= self._num_classes:
+            return
+        self._num_classes = len(prompts)
+        self._lut = build_panoptic_lut(self._num_classes, alpha=self._alpha)
+        log.info(f"LabelMapColorizeOp: LUT grown to {self._num_classes} classes")
 
     def setup(self, spec: OperatorSpec):
         spec.input("masks")
+        if self.promptable:
+            spec.input("prompts").condition(ConditionType.NONE)
         spec.output("viz")
         spec.output("specs")
 
     def compute(self, op_input, op_output, context):
+        self._receive_prompts(op_input)
         msg = op_input.receive("masks")
         acq = acq_timestamp(op_input, "masks")
         names = tensor_names(msg)
