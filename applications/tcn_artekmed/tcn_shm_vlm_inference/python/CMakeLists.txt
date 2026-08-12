@@ -31,7 +31,8 @@ target_link_libraries(tcn_shm_vlm_inference INTERFACE
     holoscan::ops::tcn_device_context
     holoscan::ops::tcn_convert_bgra_to_rgba
     # Fused panoptic-map paint (docs/specs/2026-08-10-panoptic-cuda-design.md). Listed here so
-    # the pybind module gets BUILT: langsam_common imports holohub.tcn_panoptic_map lazily and
+    # the pybind module gets BUILT: tcn_langsam/models.py imports holohub.tcn_panoptic_map
+    # lazily and
     # falls back to cupy with a warning if it is absent, so a missing entry here degrades
     # silently to the slow path rather than failing.
     holoscan::ops::tcn_panoptic_map

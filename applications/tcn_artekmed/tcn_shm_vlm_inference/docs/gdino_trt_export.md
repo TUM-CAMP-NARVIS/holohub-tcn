@@ -97,9 +97,9 @@ Notes / gotchas (found during the spike + first real export):
 
 **Do NOT copy the tool into the checkout.** Run it **in place** from this repo, with the
 GroundingDINO checkout as the working directory. Copying it breaks `--from-config`: the tool
-locates `langsam_helpers` relative to its own file (`<tool dir>/../python`), so a copy sitting in
+locates `tcn_langsam.helpers` relative to its own file (`<tool dir>/../python`), so a copy sitting in
 the checkout root looks for `~/develop/vision/python` and fails with
-`ModuleNotFoundError: No module named 'langsam_helpers'`.
+`ModuleNotFoundError: No module named 'tcn_langsam.helpers'`.
 
 ```bash
 cd ~/develop/vision/GroundingDINO-TensorRT-and-ONNX-Inference   # relative --config/--checkpoint/
@@ -123,7 +123,7 @@ Why each piece is needed:
 | `cd` into the checkout | `--config`, `--checkpoint` and `--parity-image` above are relative paths |
 | `PYTHONPATH=$PWD` | resolves `import groundingdino` to the wingdzero fork |
 | the `.venv-gdino-export` python | has torch, `transformers==4.44.2` and tensorrt |
-| the tool's **absolute repo path** | lets its own `sys.path` insert find `langsam_helpers` for `--from-config` |
+| the tool's **absolute repo path** | lets its own `sys.path` insert find `tcn_langsam.helpers` for `--from-config` |
 | `--out` is a **host** path | this is the host stage; `/srv/models` only exists in the container |
 
 `--batch N` is the batch this artifact set is for — set it to the busiest LangSAM worker's
@@ -248,7 +248,7 @@ order, with the SAME `--batch N`, then update the YAML.
 3. Re-run **stage 2** in the container (same command as above — the filenames do not change).
 4. Update `text_prompts.prompts` in `tcn_shm_vlm_inference.yaml`. It does not need to be an exact
    copy of what you just baked: at runtime `GDinoTrtDetector.set_prompts` (`build_prompt_remap`
-   in `langsam_helpers.py`) accepts **any subset and/or reordering** of the engine's baked
+   in `operators/tcn_artekmed/tcn_langsam/helpers.py`) accepts **any subset and/or reordering** of the engine's baked
    prompts and renumbers the class ids to match, with no rebuild. Only a term that was never
    baked into the engine at all raises, e.g.:
    `prompts ['robot'] are not baked into the GDINO TRT engine (baked: ['floor', 'person'])`.
@@ -313,7 +313,7 @@ langsam_inference:
 ```
 
 **`text_prompts.prompts` may be any subset and/or reordering of the engine's baked prompts.**
-`GDinoTrtDetector.set_prompts` (`build_prompt_remap` in `langsam_helpers.py`) renumbers the
+`GDinoTrtDetector.set_prompts` (`build_prompt_remap` in `operators/tcn_artekmed/tcn_langsam/helpers.py`) renumbers the
 class ids to match at runtime — no rebuild needed. Only a prompt term the engine never baked
 raises (`ValueError: prompts [...] are not baked into the GDINO TRT engine ...`), and only that
 case requires re-running this tool (both stages), with the new term included. Changing the input

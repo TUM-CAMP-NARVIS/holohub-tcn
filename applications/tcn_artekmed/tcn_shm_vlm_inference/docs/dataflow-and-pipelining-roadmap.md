@@ -17,10 +17,10 @@ that produced these numbers.
 One `LangSamBatchOp.compute()` per worker per tick. **Everything below is sequential inside that
 single call** — that is the central fact for Part 3.
 
-Code: `python/langsam_multicam_fragment.py` (`LangSamBatchOp.compute`),
-`python/langsam_common.py` (`GDinoTrtDetector.detect_batch`, `SamTrtEncoder.encode`,
+Code: `python/operators/tcn_artekmed/tcn_langsam/realtime.py` (`LangSamBatchOp.compute`),
+`python/operators/tcn_artekmed/tcn_langsam/models.py` (`GDinoTrtDetector.detect_batch`, `SamTrtEncoder.encode`,
 `SAM._set_image_batch_gpu`, `SAM.predict_batch_gpu`),
-`python/langsam_helpers.py` (`gdino_postprocess_batch`, `build_panoptic_map`).
+`python/operators/tcn_artekmed/tcn_langsam/helpers.py` (`gdino_postprocess_batch`, `build_panoptic_map`).
 
 ```
 msg = op_input.receive("color_input")     composite entity; tensors live on cuda:0
@@ -227,7 +227,7 @@ about here. A single fused kernel removes both the sync *and* most of those laun
 now a stronger case than "removes ~7 ms and N syncs" alone. See
 [`optimization-playbook.md`](./optimization-playbook.md) §7.11–§7.12 for how that was measured.
 
-**Today** (`python/langsam_helpers.py`): `argsort(scores).tolist()` (D2H sync), a host loop doing
+**Today** (`python/operators/tcn_artekmed/tcn_langsam/helpers.py`): `argsort(scores).tolist()` (D2H sync), a host loop doing
 instance numbering, then one boolean-mask scatter per detection into the `(H,W)` uint16 map.
 
 **Target:** one launch. Compute per-detection packed values `(class_id << 8) | instance_id` on
@@ -245,11 +245,11 @@ device), then a single kernel that paints `(M,H,W)` masks into the map in ascend
   `python/tests/test_langsam_multicam.py`. Gate the kernel against it exactly as
   `gdino_postprocess_batch` was gated against `gdino_postprocess` — random masks/scores/labels,
   several M, including the empty and unknown-label cases.
-- **Careful: there are TWO `argsort(scores).tolist()` sites in `langsam_helpers.py`.**
+- **Careful: there are TWO `argsort(scores).tolist()` sites in `operators/tcn_artekmed/tcn_langsam/helpers.py`.**
   `build_label_map` (~line 71) is the superseded predecessor that produced a flat class-id map;
   `build_panoptic_map` (~line 105) is the one in the hot path, producing the packed
   `(class << 8) | instance` map. `build_label_map` now has no runtime caller — only tests and a
-  re-export in `langsam_common`. Optimise the right one, and consider deleting the other.
+  re-export in `tcn_langsam.models`. Optimise the right one, and consider deleting the other.
 - Expected: ~7 ms/tick and N syncs per worker. Modest alone; it matters because it removes the
   last sync that would otherwise serialise a pipelined stage.
 
@@ -259,7 +259,7 @@ device), then a single kernel that paints `(M,H,W)` masks into the map in ascend
 
 **STATUS (2026-08-09): the stage-level pipelining variant of this step was built and measured —
 DONE, but NOT ADOPTED.** Splitting `LangSamBatchOp` into three chained operators
-(`GdinoOp → SamOp → PanopticOp`, `python/langsam_pipelined.py`, gated behind
+(`GdinoOp → SamOp → PanopticOp`, `python/operators/tcn_artekmed/tcn_langsam/realtime_ops.py`, gated behind
 `gpu_workers.pipelined`) produced **−12.2% fps** (195.0 → 221.9 ms tick period), against a gate
 that had predicted +55% to +72%. The pipelining mechanism worked exactly as designed — 100%
 within-worker stage overlap, period tracking `max(stage)` instead of `sum(stages)` — but each
@@ -276,7 +276,7 @@ stays `pipelined: false`**; the three-operator code remains as the structural fo
 work across the operator edges (SamOp's GPU work must be provably complete, via an event wait, not
 just enqueued, before PanopticOp's kernels that consume its output are launched — and equivalently
 GdinoOp→SamOp). **This deliberately invalidates the default-stream guard `SamOp` carries today** —
-see the docstring on `SamOp` in `python/langsam_pipelined.py`, which exists precisely because the
+see the docstring on `SamOp` in `python/operators/tcn_artekmed/tcn_langsam/realtime_ops.py`, which exists precisely because the
 current design's correctness depends on every operator sharing the one legacy default stream (item
 1 in that docstring: "A Holoscan `CudaStreamPool` attached to this path... would silently
 invalidate this"). Introducing per-stage streams is exactly that invalidating change. The guard

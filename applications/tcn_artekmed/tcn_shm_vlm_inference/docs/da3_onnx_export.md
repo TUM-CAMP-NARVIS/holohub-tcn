@@ -1,6 +1,6 @@
 # Exporting Depth-Anything-3 to ONNX for the DA3 fragment
 
-The `da3_fragment.py` pipeline runs Depth-Anything-3 through the Holoscan `InferenceOp`
+The `operators/tcn_artekmed/tcn_depth_anything/da3.py` pipeline runs Depth-Anything-3 through the Holoscan `InferenceOp`
 (TensorRT backend). The ONNX model it consumes must follow the **same input contract as
 the Depth-Anything-V2 model**, otherwise the depth output is garbage.
 

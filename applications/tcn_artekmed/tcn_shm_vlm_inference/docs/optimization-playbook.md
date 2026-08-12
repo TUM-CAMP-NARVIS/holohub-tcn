@@ -57,7 +57,7 @@ been read wrongly for weeks, and only an isolated timing loop settled it.
 
 ### 2.3 Instrumentation to build into the operator
 
-Both of these are in `langsam2operator.py` / `langsam_common.py` and are worth copying:
+Both of these are in `langsam2operator.py` / `operators/tcn_artekmed/tcn_langsam/models.py` and are worth copying:
 
 **Opt-in per-stage timing.** A `timing: bool` and `timing_log_every: int` config pair, logging a
 rolling average. It calls `torch.cuda.synchronize()`, so it *changes* what it measures — keep it
@@ -411,7 +411,7 @@ evidence never was.
 them all, then exit.
 
 **Make the pure logic host-testable.** The numeric post-processing lives in a numpy-only module
-(`langsam_helpers.py`) with no torch/cupy/TensorRT imports, so it unit-tests on the host without
+(`operators/tcn_artekmed/tcn_langsam/helpers.py`) with no torch/cupy/TensorRT imports, so it unit-tests on the host without
 a GPU. The batched post-process is verified against the original per-image implementation as an
 oracle over randomised inputs — that equivalence test is what made replacing it safe.
 

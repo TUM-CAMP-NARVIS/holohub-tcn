@@ -2,7 +2,7 @@
 
 Builds the fixed-batch FP16 TensorRT engine for the SAM 2 Hiera image encoder, for a future
 `sam_backend: "trt"` path alongside the existing PyTorch `SAM._set_image_batch_gpu` (see
-`langsam_common.py`). Companion tool: [`sam_trt_export.py`](./sam_trt_export.py).
+`operators/tcn_artekmed/tcn_langsam/models.py`). Companion tool: [`sam_trt_export.py`](./sam_trt_export.py).
 
 ## Why this exists
 
