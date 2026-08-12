@@ -75,6 +75,21 @@ mask_depth_join:
   # outside the colour frustum). 0 is background, which is almost always what you want.
   unlabeled_value: 0
 
+  # Classes the fused point-cloud view draws, one HolovizOp spec (hence one colour) each. Empty
+  # derives them from text_prompts.prompts, which is what keeps them from drifting out of step with
+  # what LangSAM actually detects: class ids are 1-based prompt positions.
+  pointcloud_classes: []
+  # Log per-class point counts every frame.
+  verbose: false
+
+# The fused labeled point cloud. Same viewer path as tcn_shm_receiver's point fusion (merge across
+# cameras, flatten, POINTS_3D), one chain per class so classes are separable by colour.
+labeled_pointcloud_holoviz:
+  width: 1280
+  height: 720
+  window_title: "Labeled Point Cloud (fused)"
+  headless: false
+
 # Read by the per-camera backprojection ops in the join. depth_units_per_meter is a property of the
 # capture format (Azure Kinect / Orbbec write millimetres) and a wrong value scales every unprojected
 # point linearly; the limits reject depth samples outside them, whose texcoords then come back NaN.

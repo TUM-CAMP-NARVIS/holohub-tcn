@@ -33,8 +33,7 @@ add_holohub_application(tcn_shm_receiver DEPENDS OPERATORS
                           tcn_depthimage_apply_mask
                           tcn_depthimage_fgbg_mask
                           tcn_depthimage_max_distance
-                          tcn_flatten_tensor
-                          tcn_stream_splitter
+                                            tcn_stream_splitter
                           tcn_stream_merger
                           tcn_shm_serde
                           tcn_shm_subscriber
@@ -87,6 +86,9 @@ add_holohub_application(tcn_shm_vlm_inference DEPENDS OPERATORS
         # them, and apply_mask consumes the depth-grid mask that falls out.
         tcn_depthimage_backprojection
         tcn_label_sampler
+        tcn_labeled_pointcloud
+        tcn_stream_merger
+        tcn_flatten_tensor
         tcn_depthimage_apply_mask
 )
 

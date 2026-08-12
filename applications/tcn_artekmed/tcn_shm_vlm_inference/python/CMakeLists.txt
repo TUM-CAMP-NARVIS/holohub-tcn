@@ -38,5 +38,7 @@ target_link_libraries(tcn_shm_vlm_inference INTERFACE
     holoscan::ops::tcn_stream_synchronizer
     holoscan::ops::tcn_depthimage_backprojection
     holoscan::ops::tcn_label_sampler
+    holoscan::ops::tcn_labeled_pointcloud
+    holoscan::ops::tcn_stream_merger
     holoscan::ops::tcn_depthimage_apply_mask
 )

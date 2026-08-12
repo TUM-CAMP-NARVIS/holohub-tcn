@@ -161,10 +161,42 @@ kernel's old nesting. Removed; allocation and emission were already per-output.
 earlier timestamp-grouping runs were grouping empty payloads (which does not invalidate that gate —
 it tests grouping, not content). Now derived from whether the join is enabled.
 
+## Labeled point clouds and the fused view
+
+Each camera's join produces a point cloud rather than only a masked depth image: backprojection's
+`positions` (world space, via `depth_extrinsics`) carry one point per depth pixel, and
+`tcn_label_sampler`'s labels index the same grid, so the two are aligned by construction.
+`tcn_labeled_pointcloud` compacts them into one entity per class — positions plus the *packed* label,
+so the instance id survives into the data and not just the class.
+
+Fusion follows `tcn_shm_receiver`: one `tcn_stream_merger` per class concatenating the cameras along
+dimension 1 (per-frame point counts differ, which that axis allows), straight into a `HolovizOp`
+`POINTS_3D` spec per class. One chain per class because Holoviz colours an InputSpec, not a vertex —
+that is what makes classes separable in the fused view, and each class takes its base colour from the
+same `build_panoptic_lut` the 2D overlay uses, so a class looks the same in both views.
+
+No flatten step: `tcn_flatten_tensor` maps `[H, W, …]` to `[1, H*W, …]`, which for an already
+`[1, N, 3]` cloud is an exact no-op.
+
+A class with no points still emits one NaN point. An empty tensor would starve the merger, which
+needs every input every frame, and a zero position would draw a stray point at the origin; a NaN
+vertex is culled instead.
+
+Compaction is order-preserving (a stable scan, not an atomic append), so identical input gives an
+identical point order — an atomic append would reorder points run to run and make byte-comparison
+gates useless.
+
+The join gets its own `RMMAllocator`. The shared pool is a `BlockMemoryPool` with frame-sized blocks,
+and the join adds dozens of small, variable-sized tensors per frame; each would consume a whole
+block, exhausting the pool while wasting most of what it handed out.
+
 ## Explicitly out of scope
 
 - Occlusion. A depth pixel visible to the depth camera but occluded in the colour view gets the
   occluder's label. Correct handling needs a depth test in colour space; the error is confined to
   grazing surfaces and is not addressed here.
 - Sub-pixel or class-aware filtering (majority vote in a neighbourhood).
-- Feeding the labels into the point-cloud renderer or publishing them.
+- Per-instance colouring in the view. Instance ids are carried in the data, but the fused view
+  colours by class, since Holoviz has one colour per InputSpec. Per-point colour would mean adding a
+  colour vertex buffer to `tcn_slang_renderer`'s pointcloud renderable.
+- Publishing the labeled clouds (e.g. over zenoh).

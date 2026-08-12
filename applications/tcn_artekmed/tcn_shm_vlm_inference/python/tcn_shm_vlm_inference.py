@@ -23,13 +23,16 @@ from holohub.tcn_stream_synchronizer import TcnStreamSynchronizerOp
 from holohub.tcn_depthimage_backprojection import TcnDepthImageBackprojectionOp
 from holohub.tcn_depthimage_apply_mask import TcnDepthImageApplyMaskOp
 from holohub.tcn_label_sampler import TcnLabelSamplerOp
+from holohub.tcn_labeled_pointcloud import TcnLabeledPointcloudOp
+from holohub.tcn_stream_merger import TcnStreamMergerOp as StreamMergerOp
 from holohub.tcn_device_context._tcn_device_context import XYLookupTableSourceOp
 
 from operators.tcn_artekmed.tcn_util import RotateImage180Op
 from operators.tcn_artekmed.tcn_dataset_replayer import TcnDatasetReplayerOp
 from operators.tcn_artekmed.tcn_dataset_replayer._calibration import load_device_contexts
 
-from langsam_helpers import mask_name
+from langsam_helpers import class_id_map, mask_name
+from langsam_common import build_panoptic_lut
 
 from mask_dump import MaskDumpOp
 
@@ -283,6 +286,48 @@ class JoinCheckOp(Operator):
             log.info(f"JoinCheckOp[{self.camera}]: frame {self.frames} "
                      f"{labeled}/{total} px labeled ({100.0 * labeled / total:.1f}%), "
                      f"{selected} selected, {kept} depth px kept")
+
+
+class CloudFusionCheckOp(Operator):
+    """Reports the fused point count per class, so fusion is verified rather than assumed.
+
+    Holoviz not erroring says nothing about whether the merge actually concatenated all cameras --
+    a chain that silently forwarded one camera's cloud would look identical. The count is checkable
+    against the per-camera counts (`mask_depth_join.verbose`), which must sum to it.
+    """
+
+    def __init__(self, fragment, *args, classes, stats, **kwargs):
+        self.classes = list(classes)
+        self.stats = stats
+        self.frames = 0
+        super().__init__(fragment, *args, **kwargs)
+
+    def setup(self, spec: OperatorSpec):
+        for cls in self.classes:
+            spec.input(f"class_{cls}")
+
+    def compute(self, op_input, op_output, context):
+        counts = {}
+        for cls in self.classes:
+            msg = op_input.receive(f"class_{cls}")
+            tensor = msg.get(f"class_{cls}")
+            if tensor is None:
+                log.error(f"CloudFusionCheckOp: class_{cls} has no tensor named 'class_{cls}'; "
+                          f"present: {sorted(k for k in msg.keys())}")
+                counts[cls] = 0
+                continue
+            arr = cp.asarray(tensor)
+            if self.frames == 0:
+                log.info(f"CloudFusionCheckOp: class_{cls} arrives as shape {arr.shape}")
+            # The point count is the product of every dimension but the trailing xyz, so this reads
+            # correctly whether the producer hands over [N,3] or [1,N,3].
+            counts[cls] = int(arr.size // arr.shape[-1])
+        self.frames += 1
+        for cls, n in counts.items():
+            self.stats[cls] = max(self.stats.get(cls, 0), n)
+        if self.frames <= 2:
+            log.info(f"CloudFusionCheckOp: frame {self.frames} fused points per class: "
+                     + " ".join(f"class_{c}={n}" for c, n in sorted(counts.items())))
 
 
 class DummySinkOp(Operator):
@@ -589,6 +634,20 @@ class App(hs.core.Application):
                         f"the depth->colour transform; on the dataset source these come from the "
                         f"export's calibration/<camera>.json.")
 
+                # The join needs its OWN allocator. The shared device_memory_pool is a
+                # BlockMemoryPool whose blocks are sized for a whole camera frame (16 MiB), and the
+                # join adds dozens of small, VARIABLE-sized tensors per frame -- two per class per
+                # camera, plus a merge each. Every one of those would consume a full
+                # block, exhausting the pool ("Too many chunks allocated") while wasting most of
+                # what it did hand out. RMM sub-allocates from a pool, which is what variable sizes
+                # want.
+                join_pool = RMMAllocator(
+                    self,
+                    name="join_pool",
+                    dev_id=cuda_device_id,
+                    device_memory_initial_size=str(join_cfg.get("pool_initial_size", "256MB")),
+                    device_memory_max_size=str(join_cfg.get("pool_max_size", "1GB")))
+
                 depth_split = StreamSplitterOp(
                     self, cuda_stream_pool,
                     channel_names=[f"{c}_depthimage" for c in join_cams],
@@ -603,6 +662,21 @@ class App(hs.core.Application):
                 join_stats = {}
                 self._join_stats = join_stats          # read in run() for the end-of-run summary
                 select_classes = [int(c) for c in (join_cfg.get("select_classes") or [])]
+
+                # Classes the fused view draws, one HolovizOp InputSpec (hence one colour) each.
+                # Derived from the prompts by default so they cannot drift from what LangSAM
+                # actually detects -- class ids are 1-based prompt positions (class_id_map).
+                prompts = list((self.kwargs("text_prompts") or {}).get("prompts") or [])
+                cloud_classes = [int(c) for c in (join_cfg.get("pointcloud_classes") or [])]
+                if not cloud_classes:
+                    cloud_classes = sorted(class_id_map(prompts).values())
+                if not cloud_classes:
+                    raise ValueError(
+                        "mask_depth_join is enabled but there are no classes to build point clouds "
+                        "for: text_prompts.prompts is empty and mask_depth_join.pointcloud_classes "
+                        "was not set.")
+                cloud_merge_connections = {cls: [] for cls in cloud_classes}
+                cloud_merge_ops = []
                 for cam in join_cams:
                     color_model = ctx_service.get_color_camera_model(cam)
 
@@ -610,14 +684,14 @@ class App(hs.core.Application):
                     # condition, so later ticks are not gated on it.
                     xylt_op = XYLookupTableSourceOp(
                         self, CountCondition(self, count=1),
-                        allocator=device_memory_pool,
+                        allocator=join_pool,
                         camera_name=cam,
                         name=f"join_xylt_{cam}")
                     xylt_op.set_device_context_service(ctx_service)
 
                     bp_op = TcnDepthImageBackprojectionOp(
                         self, cuda_stream_pool,
-                        allocator=device_memory_pool,
+                        allocator=join_pool,
                         color_image_width=color_model.dimensions.x,
                         color_image_height=color_model.dimensions.y,
                         color_params=color_model,
@@ -625,10 +699,11 @@ class App(hs.core.Application):
                         depth_to_color=ctx_service.get_color_to_depth_inv(cam),
                         in_tensor_name="",
                         out_tensor_name="",
-                        # Texcoords only: the join needs the colour correspondence, not the point
-                        # cloud. This configuration used to emit an untouched texcoord buffer --
-                        # the writes were nested inside the positions branch (fixed in the kernel).
-                        enable_positions=False,
+                        # Positions are the point cloud itself (world space, via
+                        # depth_extrinsics); texcoords carry the colour correspondence. The two are
+                        # independent outputs of one unprojection -- texcoords used to be written
+                        # only inside the positions branch, which is fixed in the kernel.
+                        enable_positions=True,
                         enable_texcoords=True,
                         enable_depth_float=False,
                         cuda_device_ordinal=cuda_device_id,
@@ -637,7 +712,7 @@ class App(hs.core.Application):
 
                     sampler_op = TcnLabelSamplerOp(
                         self,
-                        allocator=device_memory_pool,
+                        allocator=join_pool,
                         cuda_device_ordinal=cuda_device_id,
                         select_classes=select_classes,
                         unlabeled_value=int(join_cfg.get("unlabeled_value", 0)),
@@ -648,7 +723,7 @@ class App(hs.core.Application):
                     # image" contract that a colour-resolution panoptic map never could.
                     apply_op = TcnDepthImageApplyMaskOp(
                         self,
-                        allocator=device_memory_pool,
+                        allocator=join_pool,
                         invert_mask=bool(join_cfg.get("invert_mask", False)),
                         name=f"join_apply_mask_{cam}")
 
@@ -669,8 +744,74 @@ class App(hs.core.Application):
                     self.add_flow(depth_split, check_op,
                                   {(f"{cam}_depthimage", "raw_depth")})
 
+                    # Per-camera labeled point cloud: world-space points carrying their packed
+                    # (class, instance) label, split into one entity per class.
+                    cloud_op = TcnLabeledPointcloudOp(
+                        self,
+                        allocator=join_pool,
+                        classes=cloud_classes,
+                        cuda_device_ordinal=cuda_device_id,
+                        verbose=bool(join_cfg.get("verbose", False)),
+                        name=f"join_cloud_{cam}")
+                    self.add_flow(bp_op, cloud_op, {("positions", "positions")})
+                    self.add_flow(sampler_op, cloud_op, {("labels_out", "labels")})
+                    for cls in cloud_classes:
+                        port = f"class_{cls}"
+                        cloud_merge_connections[cls].append((cloud_op, {(port, f"{cam}_{port}")}))
+
+                # --- fuse each class across cameras and show the result -------------------
+                # tcn_shm_receiver's point fusion is merge -> flatten -> HolovizOp POINTS_3D, and
+                # what Holoviz consumes there is [1, N, 3] -- tcn_flatten_tensor maps
+                # [H, W, ...] to [1, H*W, ...], keeping the leading 1. Our per-class clouds are
+                # already [1, N, 3] and the merger concatenates along dimension 1, so the flatten
+                # would be an exact no-op and is left out rather than run once per class per frame.
+                # One chain per class, because Holoviz colours a spec and not a vertex -- that is
+                # what makes classes distinguishable in the fused view.
+                lut = build_panoptic_lut(max(cloud_classes))
+                cloud_specs = []
+                for cls in cloud_classes:
+                    tensor_name = f"class_{cls}"
+                    merge_inputs = [f"{cam}_{tensor_name}" for cam in join_cams]
+                    merge_op = StreamMergerOp(
+                        self, cuda_stream_pool,
+                        input_port_names=merge_inputs,
+                        input_message_name="positions",
+                        output_message_name=tensor_name,
+                        fuse_buffers=True,
+                        allocator=join_pool,
+                        name=f"join_cloud_fusion_{cls}")
+                    for op, conn in cloud_merge_connections[cls]:
+                        self.add_flow(op, merge_op, conn)
+
+                    spec = HolovizOp.InputSpec(tensor_name, HolovizOp.InputType.POINTS_3D)
+                    # The class's base colour from the same LUT the 2D mask overlay uses, so a
+                    # class is the same colour in the image view and in the point cloud.
+                    rgba = cp.asnumpy(lut[cls << 8]).astype(float) / 255.0
+                    spec.color = [float(rgba[0]), float(rgba[1]), float(rgba[2]), 1.0]
+                    cloud_specs.append(spec)
+                    cloud_merge_ops.append(merge_op)
+
+                cloud_fusion_stats = {}
+                self._cloud_fusion_stats = cloud_fusion_stats
+                fusion_check = CloudFusionCheckOp(self, classes=cloud_classes,
+                                                  stats=cloud_fusion_stats,
+                                                  name="cloud_fusion_check")
+                for cls, merge_op in zip(cloud_classes, cloud_merge_ops):
+                    self.add_flow(merge_op, fusion_check, {("output", f"class_{cls}")})
+
+                cloud_visualizer = HolovizOp(
+                    self,
+                    name="labeled_pointcloud_visualizer",
+                    tensors=cloud_specs,
+                    allocator=join_pool,
+                    cuda_stream_pool=cuda_stream_pool,
+                    **self.kwargs("labeled_pointcloud_holoviz"))
+                for merge_op in cloud_merge_ops:
+                    self.add_flow(merge_op, cloud_visualizer, {("output", "receivers")})
+
                 log.info(f"Mask/depth join ENABLED for {join_cams} "
-                         f"(select_classes={select_classes or 'all non-background'})")
+                         f"(select_classes={select_classes or 'all non-background'}, "
+                         f"pointcloud classes={cloud_classes})")
         else:
             di_sink = DummySinkOp(self, name="depth_image_sink")
             self.add_flow(frame_source_op, di_sink, {("depth_outputs", "input")})
@@ -915,6 +1056,11 @@ def _report_join_stats(app):
     JoinCheckOp rate-limits its per-frame logging, so without this a long run's outcome is invisible
     -- and "the join produced nothing" must not look like "the join was off".
     """
+    fused = getattr(app, "_cloud_fusion_stats", None)
+    if fused:
+        log.info("Fused labeled point cloud, peak points per class: "
+                 + " ".join(f"class_{c}={n}" for c, n in sorted(fused.items())))
+
     stats = getattr(app, "_join_stats", None)
     if not stats:
         return

@@ -94,7 +94,16 @@ void TcnFlattenTensorOp::compute(holoscan::InputContext& op_input,
         strides,
         src_tensor.value()->storage_type(),
         src_tensor.value()->pointer(),
-        nullptr);
+        // Keep the SOURCE entity alive for as long as the reshaped view is reachable. wrapMemory
+        // does not take ownership; with a null release callback the output pointed at memory owned
+        // solely by the input entity, so once compute() returned that allocation could be reused by
+        // a later frame while a consumer was still reading the "flattened" view. Same defect as
+        // tcn_stream_splitter had, and it is on tcn_shm_receiver's point-cloud path too.
+        [keep_alive = std::make_shared<nvidia::gxf::Entity>(in_entity)](
+            void*) mutable -> nvidia::gxf::Expected<void> {
+          keep_alive.reset();
+          return nvidia::gxf::Success;
+        });
     if (!result) {
         throw std::runtime_error("Failed to wrap tensor memory with new shape.");
     }
