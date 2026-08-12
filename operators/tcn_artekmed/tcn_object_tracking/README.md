@@ -34,11 +34,12 @@ per camera:  tcn_instance_stats ─┐
 
 ```
 tcn_object_tracking/
-  association.py   pure: 3D IoU, containment, footprint IoU, box union, weighted centroid, matching
+  association.py   pure: 3D IoU, containment, footprint IoU, box union, oriented boxes, weighted
+                   centroid, matching
   tracker.py       pure: Track, lifecycle, id allocation, class-change reset
   ops.py           InstanceFusionOp, ObjectTrackerOp, ObjectConsoleSinkOp
   render.py        ObjectBoxRendererOp, box_input_specs, box_line_vertices
-  tests/           56 host checks, no holoscan/cupy/numpy needed for the algorithm ones
+  tests/           75 host checks, no holoscan/cupy/numpy needed for the algorithm ones
 ```
 
 `association.py` and `tracker.py` import **nothing** — that is deliberate. Identity bugs (swapped ids,
@@ -108,6 +109,39 @@ Counter-intuitively, **tightening `fusion_max_distance_m` makes the count worse*
 detections at 1.0 → 0.4 → 0.25 m): the residual count is dominated by *under*-merging of one object's
 views, not by over-merging of distinct objects. Measure before turning that knob.
 
+## The oriented box
+
+Each object carries two boxes: the world-axis `bbox_min`/`bbox_max`, and a box rotated about the
+vertical (`yaw`, `oriented_extent`, `oriented_center`). The axis-aligned one is inflated for anything
+standing at an angle to the world axes — see
+[`tcn_instance_stats`](../tcn_instance_stats/README.md#the-yaw-oriented-box) for how a single camera's
+orientation is measured.
+
+Fusing them across cameras needs a decision the AABB does not, because the views disagree about the
+angle. Averaging yaws is wrong (they wrap), and adopting the best-observed view's yaw outright produces
+a box **larger** than the AABB whenever the views are spread out — on live data, 10.7 m² against the
+axis-aligned 6.9 m². So:
+
+- the box is the hull of **every** contributing view's corners, not the best view's box — otherwise a
+  partial view gets reported as a tight fit
+- that hull is evaluated at each view's yaw **and** at the axis-aligned box, and the tightest footprint
+  wins
+
+The axis-aligned box has to be an explicit candidate rather than falling out of `yaw = 0`: a
+circumscribing rectangle at any angle but the minimum-area one pokes out past the AABB at its corners,
+so the hull of those corners can exceed the axis-aligned union. Listing it is what makes **"the oriented
+box is the AABB refined, never inflated"** true by construction, and that invariant is what makes the
+box safe to consume.
+
+Both boxes are smoothed together or not at all. The oriented extents are measured *in* the yaw frame, so
+once the principal axis swings past `max_yaw_smoothing_delta_rad` the previous ones describe a box that
+never existed and the new one is adopted whole — and since the pair is reported side by side, smoothing
+one while adopting the other would make the invariant above appear violated by nothing but lag.
+
+Association still matches on the **axis-aligned** box. That is conservative: it can over-merge two
+objects whose AABBs overlap while their oriented boxes do not, but it never under-merges.
+Rotated-rectangle overlap is the upgrade when that matters.
+
 ## Identity: what an id means
 
 - a new detection starts a **tentative** track, reported only after `min_hits` observations, so a
@@ -131,6 +165,7 @@ filter would be fitting noise. What the tracker does have is an explicit lifecyc
 {"acq_timestamp": 4624253458484510,
  "objects": [{"track_id": 7, "class_id": 1, "class_name": "person",
               "centroid": (x, y, z), "bbox_min": (...), "bbox_max": (...), "extent": (...),
+              "yaw": 0.67, "oriented_extent": (...), "oriented_center": (...),
               "num_points": 51427, "cameras": [0, 2],
               "hits": 12, "misses": 0, "age": 14}]}
 ```
@@ -139,6 +174,8 @@ filter would be fitting noise. What the tracker does have is an explicit lifecyc
 
 `ObjectBoxRendererOp` emits one `LINES_3D` tensor per class (12 edges → 24 vertices per box), coloured
 from the same `build_panoptic_lut` the points use, so a box reads as "the box around *those* points".
+It draws the **oriented** box by default (`oriented=False` for the axis-aligned one), falling back per
+object to the AABB when an object has no usable orientation.
 It emits every configured class every frame; a class with no objects gets a single **NaN** segment,
 which the rasteriser culls — an empty tensor would make HolovizOp special-case the shape.
 
@@ -158,9 +195,9 @@ self.add_flow(box_renderer, cloud_visualizer, {("boxes", "receivers")})
 ## Tests
 
 ```bash
-python3 tests/test_association.py   # 33 -- geometry, fusion, filters, matching (host, no deps)
-python3 tests/test_tracker.py       # 16 -- lifecycle, id stability, class reset (host, no deps)
-python3 tests/test_render.py        #  7 -- box edges, degenerate cases (host, numpy only)
+python3 tests/test_association.py   # 43 -- geometry, fusion, oriented boxes, filters, matching
+python3 tests/test_tracker.py       # 20 -- lifecycle, id stability, class reset, box smoothing
+python3 tests/test_render.py        # 12 -- box edges, oriented boxes, degenerate cases (numpy only)
 ```
 
 The tracker tests are the ones that matter: an object present for N frames keeps one id; an occlusion
@@ -170,8 +207,12 @@ swap; per-frame instance-id churn does not churn the track id.
 ## Known limitations
 
 - **No confidence.** Association is purely geometric.
-- **Mask bleed at occlusion boundaries** puts points on background surfaces; the σ-trim in
-  `tcn_instance_stats` mitigates it and does not eliminate it.
+- **Mask bleed at occlusion boundaries** puts points on background surfaces; the percentile trim in
+  `tcn_instance_stats` mitigates it up to its breakdown point and does not eliminate it.
+- **A fused object's yaw is one of the contributing views' yaws**, chosen by area, not a re-estimate
+  from the fused points — the fusion never sees points, only boxes. For an object whose views disagree
+  strongly the result falls back to the axis-aligned box, which is correct but says nothing about
+  orientation.
 - **Object count needs calibrating per scene.** The defaults bring the 4-camera replay to ~9.5
   objects/frame (from 22), but the right thresholds depend on depth resolution and scene scale. Some
   boxes remain larger than a person, which is either genuinely-merged pairs or mask bleed — the box

@@ -92,6 +92,20 @@ void TcnInstanceStatsOp::setup(holoscan::OperatorSpec& spec) {
              "Floor on the kept range per axis, in metres, so a perfectly flat instance (a wall patch) "
              "keeps its own points instead of rejecting all of them.",
              0.01);
+  spec.param(up_axis_, "up_axis",
+             "Up Axis",
+             "Index of the vertical world axis (0=x, 1=y, 2=z). A property of the calibration, not a "
+             "convention: backprojection applies each camera's depth_extrinsics, so 'up' is whatever "
+             "camera_pose made it. The box stays axis-aligned on this axis and is rotated only about "
+             "it, because objects in a room stand upright.",
+             static_cast<int64_t>(1));
+  spec.param(min_anisotropy_, "min_anisotropy",
+             "Minimum Anisotropy",
+             "Ratio the two ground-plane eigenvalues must differ by before a yaw is trusted. A "
+             "near-circular footprint has no meaningful orientation, and fitting one to noise makes "
+             "the box spin frame to frame; below this the yaw is 0 and the oriented box degenerates "
+             "to the axis-aligned one.",
+             1.5);
   spec.param(min_points_, "min_points",
              "Minimum Points",
              "Instances with fewer surviving points than this are dropped -- that is depth noise or "
@@ -122,6 +136,10 @@ void TcnInstanceStatsOp::start() {
         "TcnInstanceStatsOp: trim_percentile must be in [0, 0.5) (got " +
         std::to_string(trim_percentile_.get()) + "); 0 disables trimming, and 0.5 would discard "
         "every point from both ends at once");
+  }
+  if (up_axis_.get() < 0 || up_axis_.get() > 2) {
+    throw std::runtime_error("TcnInstanceStatsOp: up_axis must be 0, 1 or 2 (got " +
+                             std::to_string(up_axis_.get()) + ")");
   }
   if (max_instances_.get() < 1) {
     throw std::runtime_error("TcnInstanceStatsOp: max_instances must be >= 1");
@@ -154,6 +172,12 @@ void TcnInstanceStatsOp::allocate_scratch() {
   alloc(reinterpret_cast<void**>(&acc_.sum2), slots * 3 * sizeof(float), "sum2");
   alloc(reinterpret_cast<void**>(&acc_.minEnc), slots * 3 * sizeof(int32_t), "minEnc");
   alloc(reinterpret_cast<void**>(&acc_.maxEnc), slots * 3 * sizeof(int32_t), "maxEnc");
+  alloc(reinterpret_cast<void**>(&acc_.sumUU), slots * sizeof(float), "sumUU");
+  alloc(reinterpret_cast<void**>(&acc_.sumVV), slots * sizeof(float), "sumVV");
+  alloc(reinterpret_cast<void**>(&acc_.sumUV), slots * sizeof(float), "sumUV");
+  alloc(reinterpret_cast<void**>(&acc_.yaw), slots * sizeof(float), "yaw");
+  alloc(reinterpret_cast<void**>(&acc_.oMinEnc), slots * 2 * sizeof(int32_t), "oMinEnc");
+  alloc(reinterpret_cast<void**>(&acc_.oMaxEnc), slots * 2 * sizeof(int32_t), "oMaxEnc");
 
   const size_t max_rows = static_cast<size_t>(max_instances_.get());
   alloc(reinterpret_cast<void**>(&rows_d_), max_rows * kInstanceStatColumns * sizeof(float), "rows");
@@ -172,7 +196,10 @@ void TcnInstanceStatsOp::free_scratch() {
                   reinterpret_cast<void*>(acc_.hiBound),
                   reinterpret_cast<void*>(acc_.count2), reinterpret_cast<void*>(acc_.sum2),
                   reinterpret_cast<void*>(acc_.minEnc),
-                  reinterpret_cast<void*>(acc_.maxEnc), reinterpret_cast<void*>(rows_d_),
+                  reinterpret_cast<void*>(acc_.maxEnc), reinterpret_cast<void*>(acc_.sumUU),
+                  reinterpret_cast<void*>(acc_.sumVV), reinterpret_cast<void*>(acc_.sumUV),
+                  reinterpret_cast<void*>(acc_.yaw), reinterpret_cast<void*>(acc_.oMinEnc),
+                  reinterpret_cast<void*>(acc_.oMaxEnc), reinterpret_cast<void*>(rows_d_),
                   reinterpret_cast<void*>(row_labels_d_), reinterpret_cast<void*>(row_count_d_)}) {
     if (p) cudaFree(p);
   }
@@ -264,8 +291,14 @@ void TcnInstanceStatsOp::compute(holoscan::InputContext& op_input,
   launch_instance_bounds(acc_, static_cast<float>(trim_percentile_.get()),
                          static_cast<float>(trim_margin_.get()),
                          static_cast<float>(min_range_m_.get()), cuda_stream);
-  launch_instance_trimmed(positions_d, labels_d, label_count, acc_, cuda_stream);
-  launch_instance_compact(acc_, static_cast<int>(camera_index_.get()),
+  const int up = static_cast<int>(up_axis_.get());
+  launch_instance_trimmed(positions_d, labels_d, label_count, up, acc_, cuda_stream);
+  //   5. yaw from the ground-plane covariance of the SURVIVING points, then
+  //   6. their extents projected onto that yaw frame -- a separate pass, because the projection is
+  //      not knowable until the yaw is.
+  launch_instance_yaw(acc_, up, static_cast<float>(min_anisotropy_.get()), cuda_stream);
+  launch_instance_oriented(positions_d, labels_d, label_count, up, acc_, cuda_stream);
+  launch_instance_compact(acc_, up, static_cast<int>(camera_index_.get()),
                           static_cast<uint32_t>(std::max<int64_t>(min_points_.get(), 0)),
                           rows_d_, row_labels_d_, row_count_d_,
                           static_cast<uint32_t>(max_instances_.get()), cuda_stream);
@@ -347,12 +380,15 @@ void TcnInstanceStatsOp::compute(holoscan::InputContext& op_input,
     for (uint32_t i = 0; i < k; ++i) {
       const float* row = r + static_cast<size_t>(i) * kInstanceStatColumns;
       HOLOSCAN_LOG_INFO("TcnInstanceStatsOp[cam {}] frame {}: label {} (class {} inst {}) "
-                        "n={} centroid=({:.3f},{:.3f},{:.3f}) extent=({:.3f},{:.3f},{:.3f})",
+                        "n={} centroid=({:.3f},{:.3f},{:.3f}) extent=({:.3f},{:.3f},{:.3f}) "
+                        "yaw={:.1f}deg oriented=({:.3f},{:.3f},{:.3f})",
                         camera_index_.get(), emitted_, l[i], l[i] >> kPanopticClassShift,
                         l[i] & 0xFF, static_cast<int>(row[kColCount]),
                         row[kColCentroidX], row[kColCentroidY], row[kColCentroidZ],
                         row[kColMaxX] - row[kColMinX], row[kColMaxY] - row[kColMinY],
-                        row[kColMaxZ] - row[kColMinZ]);
+                        row[kColMaxZ] - row[kColMinZ],
+                        row[kColYaw] * 180.f / 3.14159265f,
+                        row[kColOrientedU], row[kColOrientedV], row[kColOrientedUp]);
     }
   }
 

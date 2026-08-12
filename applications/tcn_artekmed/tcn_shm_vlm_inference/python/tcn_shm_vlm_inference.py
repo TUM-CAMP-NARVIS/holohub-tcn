@@ -75,6 +75,10 @@ from operators.tcn_artekmed.tcn_langsam import (
 
 log = logging.getLogger(__name__)
 
+# The vertical world axis, as an index. Spelled `axis_*` in configuration because yaml-cpp resolves a
+# bare AND a quoted `y` to boolean true -- see the tcn_object_tracking README.
+_UP_AXIS_INDEX = {"axis_x": 0, "axis_y": 1, "axis_z": 2, "x": 0, "y": 1, "z": 2}
+
 
 # Conservative BlockMemoryPool sizing for `source: "dataset"` mode. There is no live shm
 # channel to query a real `frameSize` from (see the `channels_config` synthesis in `compose`),
@@ -717,6 +721,7 @@ class App(hs.core.Application):
                         iou_threshold=float(track_cfg.get("track_iou_threshold", 0.1)),
                         max_centroid_distance_m=float(track_cfg.get("track_max_distance_m", 1.0)),
                         box_smoothing=float(track_cfg.get("box_smoothing", 0.5)),
+                        max_yaw_smoothing_delta_rad=float(track_cfg.get("max_yaw_smoothing_delta_rad", 0.26)),
                         class_names=list((self.kwargs("text_prompts") or {}).get("prompts") or []),
                         verbose=bool(track_cfg.get("verbose", False)),
                         name="object_tracker")
@@ -841,6 +846,8 @@ class App(hs.core.Application):
                             trim_percentile=float(track_cfg.get("trim_percentile", 0.02)),
                             trim_margin=float(track_cfg.get("trim_margin", 0.05)),
                             min_range_m=float(track_cfg.get("min_range_m", 0.01)),
+                            up_axis=_UP_AXIS_INDEX[str(track_cfg.get("up_axis", "axis_y"))],
+                            min_anisotropy=float(track_cfg.get("min_anisotropy", 1.5)),
                             min_points=int(track_cfg.get("min_points", 64)),
                             max_instances=int(track_cfg.get("max_instances", 64)),
                             verbose=bool(track_cfg.get("verbose_instances", False)),
@@ -910,6 +917,8 @@ class App(hs.core.Application):
                 if track_enabled and bool(track_cfg.get("render_boxes", True)):
                     box_renderer = ObjectBoxRendererOp(
                         self, classes=cloud_classes, device=cuda_device_id,
+                        oriented=bool(track_cfg.get("render_oriented_boxes", True)),
+                        up_axis=_UP_AXIS_INDEX[str(track_cfg.get("up_axis", "axis_y"))],
                         name="object_box_renderer")
                     self.add_flow(tracker_op, box_renderer, {("objects", "objects")})
                     cloud_specs.extend(box_input_specs(

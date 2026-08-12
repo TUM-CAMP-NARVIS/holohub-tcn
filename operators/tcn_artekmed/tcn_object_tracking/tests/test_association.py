@@ -12,7 +12,8 @@ from association import (UP_AXIS_Y, UP_AXIS_Z, Observation, box_containment, box
                          filter_detections, filter_observations, suppress_aggregates,
                          box_intersection, box_iou, box_union, box_volume,
                          centroid_distance, footprint_iou, fuse_observations,
-                         merge_observations, match_detections_to_tracks)
+                         merge_observations, match_detections_to_tracks,
+                         box_corners, oriented_corners, oriented_hull)
 
 
 def box(cx, cy, cz, sx, sy, sz):
@@ -303,6 +304,123 @@ def test_two_objects_do_not_swap_when_close():
     for di, ti in pairs:
         assert centroid_distance(dets[di].centroid, tracks[ti].centroid) < 0.3, \
             f"detection {dets[di].centroid} matched the far track {tracks[ti].centroid}"
+
+
+# ── oriented boxes ────────────────────────────────────────────────────────────────────────────────
+
+def test_oriented_hull_of_an_axis_aligned_cloud_at_zero_yaw_is_its_aabb():
+    b = box(1.0, 2.0, 3.0, 0.4, 1.8, 0.6)
+    center, extent = oriented_hull(box_corners(b), 0.0, UP_AXIS_Y)
+    assert max(abs(center[d] - (1.0, 2.0, 3.0)[d]) for d in range(3)) < 1e-9, center
+    # extent is (along u, along v, vertical) = (x, z, y) for up=y
+    assert max(abs(extent[d] - (0.4, 0.6, 1.8)[d]) for d in range(3)) < 1e-9, extent
+
+
+def test_oriented_hull_recovers_the_box_it_was_generated_from():
+    """corners -> hull is the identity at the generating yaw. Catches a sign error in either direction."""
+    center0, extent0, yaw = (0.5, 1.0, -2.0), (1.2, 0.4, 1.7), 0.7
+    center, extent = oriented_hull(oriented_corners(center0, extent0, yaw, UP_AXIS_Y), yaw, UP_AXIS_Y)
+    assert max(abs(center[d] - center0[d]) for d in range(3)) < 1e-9, center
+    assert max(abs(extent[d] - extent0[d]) for d in range(3)) < 1e-9, extent
+
+
+def test_oriented_hull_of_a_rotated_box_at_zero_yaw_is_larger():
+    """A 45-degree box measured on the world axes must be wider than itself -- the AABB inflation that
+    motivates oriented boxes at all."""
+    corners = oriented_corners((0, 0, 0), (2.0, 0.2, 1.0), 3.14159265358979 / 4, UP_AXIS_Y)
+    _, extent = oriented_hull(corners, 0.0, UP_AXIS_Y)
+    assert extent[0] > 1.5, extent      # sqrt(2)*(2+0.2)/2 = 1.556
+    assert extent[2] == 1.0 or abs(extent[2] - 1.0) < 1e-9, extent   # vertical is unaffected by yaw
+
+
+def test_merged_oriented_box_covers_every_view_not_just_the_largest():
+    """The invariant that makes the reported oriented box trustworthy: it must not be smaller than the
+    object. Taking the extent from the best-observed view alone reports a partial view as a tight fit.
+    """
+    a = Observation(1, 1, 0, 50000, (0.0, 0.9, 0.0), box(0.0, 0.9, 0.0, 0.5, 1.8, 0.5),
+                    yaw=0.0, oriented_extent=(0.5, 0.5, 1.8), oriented_center=(0.0, 0.9, 0.0))
+    b = Observation(1, 1, 1, 5000, (1.0, 0.9, 0.0), box(1.0, 0.9, 0.0, 0.5, 1.8, 0.5),
+                    yaw=0.0, oriented_extent=(0.5, 0.5, 1.8), oriented_center=(1.0, 0.9, 0.0))
+    d = merge_observations([a, b], UP_AXIS_Y)
+    # the two views are 1 m apart on x, so the union spans 1.5 m there
+    assert abs(d.oriented_extent[0] - 1.5) < 1e-9, d.oriented_extent
+    assert abs(d.oriented_center[0] - 0.5) < 1e-9, d.oriented_center
+
+
+def test_merged_oriented_volume_never_exceeds_the_aabb_volume():
+    """An oriented box is the AABB refined, so it can only be tighter -- at equal yaw, identical."""
+    a = Observation(1, 1, 0, 9000, (0.0, 0.9, 0.0), box(0.0, 0.9, 0.0, 1.4, 1.8, 1.4),
+                    yaw=0.6, oriented_extent=(1.2, 0.4, 1.8), oriented_center=(0.0, 0.9, 0.0))
+    b = Observation(1, 1, 1, 3000, (0.2, 0.9, 0.1), box(0.2, 0.9, 0.1, 1.4, 1.8, 1.4),
+                    yaw=0.55, oriented_extent=(1.2, 0.4, 1.8), oriented_center=(0.2, 0.9, 0.1))
+    d = merge_observations([a, b], UP_AXIS_Y)
+    oriented_volume = d.oriented_extent[0] * d.oriented_extent[1] * d.oriented_extent[2]
+    assert oriented_volume <= box_volume(d.box) + 1e-9, (oriented_volume, box_volume(d.box))
+
+
+def test_a_view_whose_oriented_box_pokes_outside_its_aabb_cannot_inflate_the_result():
+    """The reason the axis-aligned box is an explicit candidate rather than just `yaw = 0`.
+
+    A circumscribing rectangle at any angle but the minimum-area one sticks out past the AABB at its
+    corners, so the hull of those corners exceeds the axis-aligned union -- here a 0.6 m square
+    footprint claimed at 45 degrees needs 0.85 m of room on each world axis. The search must then fall
+    back to the AABB rather than reporting the inflated rotated box.
+    """
+    a = Observation(1, 1, 0, 50000, (0, 0.9, 0), box(0, 0.9, 0, 0.6, 1.8, 0.6),
+                    yaw=0.785398, oriented_extent=(0.6, 0.6, 1.8), oriented_center=(0, 0.9, 0))
+    d = merge_observations([a], UP_AXIS_Y)
+    assert d.yaw == 0.0, f"yaw {d.yaw} was kept although it inflates the box"
+    assert abs(d.oriented_extent[0] - 0.6) < 1e-6, d.oriented_extent
+    assert abs(d.oriented_extent[1] - 0.6) < 1e-6, d.oriented_extent
+
+
+def test_a_tight_single_view_oriented_box_is_kept():
+    """The other side of that rule: a genuinely tighter rotated box must survive, or the min-area search
+    would have silently degraded every object to its AABB."""
+    a = Observation(1, 1, 0, 50000, (0, 0.9, 0), box(0, 0.9, 0, 1.1, 1.8, 1.1),
+                    yaw=0.785398, oriented_extent=(1.5, 0.2, 1.8), oriented_center=(0, 0.9, 0))
+    d = merge_observations([a], UP_AXIS_Y)
+    assert abs(d.yaw - 0.785398) < 1e-9, d.yaw
+    assert abs(d.oriented_extent[0] - 1.5) < 1e-6, d.oriented_extent
+
+
+def test_merge_picks_the_yaw_that_gives_the_tightest_footprint():
+    """Both views are 40-degree plates, so expressing the hull at 40 degrees is much tighter than at
+    zero -- the candidate search has to find that rather than defaulting to no rotation."""
+    a = Observation(1, 1, 0, 50000, (0, 0.9, 0), box(0, 0.9, 0, 1.2, 1.8, 1.2),
+                    yaw=0.7, oriented_extent=(1.4, 0.2, 1.8), oriented_center=(0, 0.9, 0))
+    b = Observation(1, 1, 1, 20000, (0, 0.9, 0), box(0, 0.9, 0, 1.2, 1.8, 1.2),
+                    yaw=0.7, oriented_extent=(1.4, 0.2, 1.8), oriented_center=(0, 0.9, 0))
+    d = merge_observations([a, b], UP_AXIS_Y)
+    assert abs(d.yaw - 0.7) < 1e-9, d.yaw
+    assert abs(d.oriented_extent[0] - 1.4) < 1e-9, d.oriented_extent
+    assert abs(d.oriented_extent[1] - 0.2) < 1e-9, d.oriented_extent
+
+
+def test_merged_oriented_footprint_never_exceeds_the_axis_aligned_one():
+    """The invariant that makes an oriented box safe to report: it is the AABB REFINED, never inflated.
+
+    Adopting the best-observed view's yaw outright breaks this -- two views 2 m apart hulled at 81
+    degrees came out at 10.7 m2 against the axis-aligned 6.9 m2 on live data.
+    """
+    a = Observation(1, 1, 0, 50000, (0.0, 0.9, 0.0), box(0.0, 0.9, 0.0, 0.6, 1.8, 0.6),
+                    yaw=1.41, oriented_extent=(0.6, 0.4, 1.8), oriented_center=(0.0, 0.9, 0.0))
+    b = Observation(1, 1, 1, 30000, (2.0, 0.9, 0.3), box(2.0, 0.9, 0.3, 0.6, 1.8, 0.6),
+                    yaw=-0.2, oriented_extent=(0.6, 0.4, 1.8), oriented_center=(2.0, 0.9, 0.3))
+    d = merge_observations([a, b], UP_AXIS_Y)
+    footprint = d.oriented_extent[0] * d.oriented_extent[1]
+    aabb_footprint = box_extent(d.box)[0] * box_extent(d.box)[2]
+    assert footprint <= aabb_footprint + 1e-9, (footprint, aabb_footprint)
+
+
+def test_unoriented_view_contributes_its_aabb():
+    """A near-circular footprint has no usable orientation, so its AABB is all it may claim -- and the
+    merge must still cover it rather than dropping it."""
+    a = Observation(1, 1, 0, 50000, (0, 0.9, 0), box(0, 0.9, 0, 0.5, 1.8, 0.5),
+                    yaw=0.0, oriented_extent=(0.5, 0.5, 1.8), oriented_center=(0, 0.9, 0))
+    b = Observation(1, 1, 1, 900, (2.0, 0.9, 0), box(2.0, 0.9, 0, 0.5, 1.8, 0.5))  # no oriented box
+    d = merge_observations([a, b], UP_AXIS_Y)
+    assert abs(d.oriented_extent[0] - 2.5) < 1e-9, d.oriented_extent
 
 
 if __name__ == "__main__":

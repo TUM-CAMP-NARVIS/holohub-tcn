@@ -113,6 +113,21 @@ object_tracking:
   trim_percentile: 0.02   # keep the 2nd..98th percentile per axis
   trim_margin: 0.05       # widen the kept range by 5%, so bin resolution does not shave real extremes
   min_range_m: 0.01       # keeps a perfectly flat instance from rejecting all of its own points
+  # --- yaw-oriented boxes ---
+  # The box stays axis-aligned VERTICALLY and is rotated only about the up axis, because objects in a
+  # room stand upright -- a full 3D orientation would fit noise in the one direction already known.
+  # The yaw comes from the ground-plane covariance of the surviving (trimmed) points.
+  #
+  # min_anisotropy is the ratio the two in-plane eigenvalues must differ by before the yaw is trusted:
+  # a near-circular footprint (a standing person) has no meaningful orientation, and fitting one to
+  # noise makes the box spin frame to frame. Below it the yaw is 0 and the oriented box degenerates to
+  # the axis-aligned one, which is why a person's box looks unrotated while a bed's does not.
+  min_anisotropy: 1.5
+  render_oriented_boxes: true
+  # How far the yaw may swing and still have the oriented box smoothed like the axis-aligned one. Its
+  # extents are measured IN the yaw frame, so past a real re-orientation the old ones mean something
+  # else and blending them would report a box that fits nothing. 0.26 rad = 15 deg.
+  max_yaw_smoothing_delta_rad: 0.26
   min_points: 500         # fewer than this is depth noise or mask fringe, not an object. At
                           # depth-camera resolution 64 admitted 100-point "people"; several hundred
                           # corresponds to a patch of real size.

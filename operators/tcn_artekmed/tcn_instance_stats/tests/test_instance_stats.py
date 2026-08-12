@@ -6,6 +6,7 @@ Every expectation is a hand-computed value or a numpy reduction over the same in
 of the kernel.
 """
 import logging
+import math
 import sys
 
 import cupy as cp
@@ -21,6 +22,8 @@ logging.basicConfig(level=logging.WARNING)
 
 # Row columns, mirroring InstanceStatColumn in cuda/tcn_instance_stats_kernel.cuh.
 CAM, CNT, CX, CY, CZ, MNX, MNY, MNZ, MXX, MXY, MXZ, SGX, SGY, SGZ = range(14)
+YAW, OU, OV, OUP, OCX, OCY, OCZ = range(14, 21)
+N_COLUMNS = 21
 
 H, W = 8, 8
 PACK = lambda cls, inst: np.uint16((cls << 8) | inst)
@@ -65,7 +68,7 @@ class CollectOp(Operator):
     def compute(self, op_input, op_output, context):
         msg = op_input.receive("instances")
         # Host tensors: numpy reads them directly, no device copy.
-        rows = np.asarray(msg.get("rows")).reshape(-1, 14)
+        rows = np.asarray(msg.get("rows")).reshape(-1, N_COLUMNS)
         labels = np.asarray(msg.get("labels")).reshape(-1)
         self.out["rows"], self.out["labels"] = rows.copy(), labels.copy()
 
@@ -272,9 +275,157 @@ def case_camera_index_is_stamped():
 
 def case_empty_frame_emits_a_zero_row():
     rows, labels = run({}, min_points=1)
-    if rows.shape != (1, 14) or int(rows[0][CNT]) != 0:
+    if rows.shape != (1, N_COLUMNS) or int(rows[0][CNT]) != 0:
         return [f"expected one all-zero row, got shape {rows.shape} count "
                 f"{int(rows[0][CNT]) if rows.size else 'n/a'}"]
+    return []
+
+
+# ── yaw-oriented box ──────────────────────────────────────────────────────────────────────────────
+
+def plate(yaw_deg, half_u, half_v, nu=8, nv=3, heights=(0.0, 1.0)):
+    """A rectangular plate lying in the ground plane (up = y), rotated `yaw_deg` about the vertical.
+
+    Sampled as a grid so the extreme samples sit exactly on the rectangle's edges: the oriented extents
+    are then hand-computable as `2*half_u` by `2*half_v`, independent of the kernel.
+    """
+    a = math.radians(yaw_deg)
+    c, s = math.cos(a), math.sin(a)
+    pts = []
+    for i in range(nu):
+        du = -half_u + 2 * half_u * i / (nu - 1)
+        for j in range(nv):
+            dv = -half_v + 2 * half_v * j / (nv - 1)
+            for h in heights:
+                pts.append((c * du - s * dv, h, s * du + c * dv))   # x = u, z = v, y = up
+    return pts
+
+
+def case_yaw_recovers_a_rotated_plate():
+    """The point of oriented boxes: a plate at 30 degrees must report 30 degrees and its TRUE extents,
+    while its axis-aligned box is inflated by the rotation."""
+    half_u, half_v, yaw_deg = 0.6, 0.1, 30.0
+    label = PACK(1, 1)
+    r = row_for(*run({label: plate(yaw_deg, half_u, half_v)},
+                     min_points=1, trim_percentile=0.0, up_axis=1), label)
+    if r is None:
+        return ["no row emitted"]
+    problems = []
+    got = math.degrees(r[YAW])
+    if abs(got - yaw_deg) > 2.0:
+        problems.append(f"yaw {got:.1f} deg != {yaw_deg} deg")
+    if abs(r[OU] - 2 * half_u) > 0.02:
+        problems.append(f"oriented extent along yaw {r[OU]:.3f} != {2 * half_u}")
+    if abs(r[OV] - 2 * half_v) > 0.02:
+        problems.append(f"oriented extent across yaw {r[OV]:.3f} != {2 * half_v}")
+    # The AABB is inflated by the rotation: 1.2*cos30 + 0.2*sin30 = 1.14 m across x, and the oriented
+    # footprint (0.24 m^2) is far tighter than the axis-aligned one (0.88 m^2).
+    aabb_area = (r[MXX] - r[MNX]) * (r[MXZ] - r[MNZ])
+    if r[OU] * r[OV] > 0.5 * aabb_area:
+        problems.append(f"oriented footprint {r[OU] * r[OV]:.3f} m2 is not tighter than the "
+                        f"axis-aligned {aabb_area:.3f} m2 -- the rotation is not being used")
+    if abs(r[OUP] - 1.0) > 1e-4:
+        problems.append(f"vertical extent {r[OUP]:.3f} != 1.0; yaw must not touch the up axis")
+    return problems
+
+
+def case_oriented_centre_sits_at_the_plate_centre():
+    """The oriented centre is a rotated-frame midpoint, so a sign error in the inverse rotation moves it
+    off the object -- invisible in the extents, obvious here."""
+    label = PACK(2, 1)
+    pts = [(x + 2.0, y, z - 1.0) for (x, y, z) in plate(40.0, 0.5, 0.15)]
+    r = row_for(*run({label: pts}, min_points=1, trim_percentile=0.0, up_axis=1), label)
+    if r is None:
+        return ["no row emitted"]
+    want = np.mean(pts, axis=0)          # a symmetric grid: the centroid IS the box centre
+    got = r[[OCX, OCY, OCZ]]
+    if not np.allclose(got, want, atol=2e-3):
+        return [f"oriented centre {got} != plate centre {want}"]
+    return []
+
+
+def case_isotropic_footprint_reports_no_yaw():
+    """A square footprint has no orientation to find. Fitting one to noise makes the box spin frame to
+    frame, so the anisotropy guard must report yaw 0 and fall back to the axis-aligned extents."""
+    label = PACK(3, 1)
+    r = row_for(*run({label: plate(25.0, 0.3, 0.3, nu=5, nv=5, heights=(0.0,))},
+                     min_points=1, trim_percentile=0.0, up_axis=1, min_anisotropy=1.5), label)
+    if r is None:
+        return ["no row emitted"]
+    problems = []
+    if abs(r[YAW]) > 1e-6:
+        problems.append(f"yaw {math.degrees(r[YAW]):.2f} deg on a square footprint; the "
+                        f"min_anisotropy guard is not holding")
+    if abs(r[OU] - (r[MXX] - r[MNX])) > 1e-4 or abs(r[OV] - (r[MXZ] - r[MNZ])) > 1e-4:
+        problems.append(f"with yaw 0 the oriented extents {r[[OU, OV]]} must equal the axis-aligned "
+                        f"{[r[MXX] - r[MNX], r[MXZ] - r[MNZ]]}")
+    return problems
+
+
+def case_min_anisotropy_zero_always_orients():
+    """The guard is a threshold, not a hard-coded rule: at 0 even a square gets an orientation. Proves
+    the previous case tests the guard rather than a kernel that never rotates anything."""
+    label = PACK(4, 1)
+    r = row_for(*run({label: plate(25.0, 0.3, 0.3, nu=5, nv=5, heights=(0.0,))},
+                     min_points=1, trim_percentile=0.0, up_axis=1, min_anisotropy=0.0), label)
+    if r is None:
+        return ["no row emitted"]
+    # A square's principal axis is degenerate, so the ANGLE is arbitrary -- only that one was chosen
+    # is meaningful, and that the box still contains the points.
+    if r[OU] * r[OV] < (0.6 * 0.6) - 1e-3:
+        return [f"oriented footprint {r[OU] * r[OV]:.4f} m2 is smaller than the 0.36 m2 square it "
+                f"must contain"]
+    return []
+
+
+def case_oriented_box_is_never_larger_than_the_aabb():
+    """An oriented box refines the axis-aligned one, so its volume can only be smaller or equal. A
+    violation means the two boxes are describing different point sets."""
+    problems = []
+    for i, yaw_deg in enumerate((0.0, 15.0, 45.0, 70.0, -35.0)):
+        label = PACK(5, i + 1)
+        r = row_for(*run({label: plate(yaw_deg, 0.55, 0.12)},
+                         min_points=1, trim_percentile=0.0, up_axis=1), label)
+        if r is None:
+            problems.append(f"no row emitted at yaw {yaw_deg}")
+            continue
+        aabb = ((r[MXX] - r[MNX]) * (r[MXY] - r[MNY]) * (r[MXZ] - r[MNZ]))
+        oriented = r[OU] * r[OV] * r[OUP]
+        if oriented > aabb + 1e-4:
+            problems.append(f"at yaw {yaw_deg} deg the oriented volume {oriented:.4f} exceeds the "
+                            f"axis-aligned {aabb:.4f}")
+    return problems
+
+
+def case_up_axis_selects_the_vertical():
+    """up_axis is configuration, not a convention: with up = z the same plate must be oriented in the
+    x-y plane instead, and reporting the z extent as vertical."""
+    label = PACK(6, 1)
+    # a plate in the x-y plane at 30 deg, 1.0 m tall along z
+    pts = [(x, z, y) for (x, y, z) in plate(30.0, 0.6, 0.1)]
+    r = row_for(*run({label: pts}, min_points=1, trim_percentile=0.0, up_axis=2), label)
+    if r is None:
+        return ["no row emitted"]
+    problems = []
+    if abs(math.degrees(r[YAW]) - 30.0) > 2.0:
+        problems.append(f"yaw {math.degrees(r[YAW]):.1f} deg != 30 deg with up_axis=2")
+    if abs(r[OUP] - 1.0) > 1e-4:
+        problems.append(f"vertical extent {r[OUP]:.3f} != 1.0; up_axis=2 was not honoured")
+    return problems
+
+
+def case_yaw_is_computed_on_the_trimmed_points():
+    """Orientation must come from the surviving points, not the raw ones: a far outlier blob would
+    otherwise drag the principal axis onto itself and rotate the box away from the object."""
+    label = PACK(7, 1)
+    pts = plate(0.0, 0.6, 0.1, nu=8, nv=3, heights=(0.0,))       # long axis exactly along x
+    blob = [(2.0, 0.0, 2.0)] * 3                                  # 11% of the points, off-diagonal
+    r = row_for(*run({label: pts + blob}, min_points=1, trim_percentile=0.15, up_axis=1), label)
+    if r is None:
+        return ["no row emitted"]
+    if abs(math.degrees(r[YAW])) > 5.0:
+        return [f"yaw {math.degrees(r[YAW]):.1f} deg: the outlier blob is still steering the "
+                f"orientation, so the yaw pass is not reading the trimmed point set"]
     return []
 
 
@@ -290,6 +441,13 @@ CASES = [
     case_multiple_instances_and_classes_are_separate,
     case_camera_index_is_stamped,
     case_empty_frame_emits_a_zero_row,
+    case_yaw_recovers_a_rotated_plate,
+    case_oriented_centre_sits_at_the_plate_centre,
+    case_isotropic_footprint_reports_no_yaw,
+    case_min_anisotropy_zero_always_orients,
+    case_oriented_box_is_never_larger_than_the_aabb,
+    case_up_axis_selects_the_vertical,
+    case_yaw_is_computed_on_the_trimmed_points,
 ]
 
 if __name__ == "__main__":

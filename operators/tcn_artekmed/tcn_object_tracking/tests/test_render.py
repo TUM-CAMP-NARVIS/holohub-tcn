@@ -14,10 +14,14 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Import the pure function without pulling cupy/holoscan: exec just the parts we need.
+from association import UP_AXIS_Y, oriented_corners
+
+# Import the pure function without pulling cupy/holoscan: exec just the parts we need. The names
+# render.py takes from `association` are injected, because the exec'd slice skips its import block.
 _src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                          "render.py")).read()
-_ns = {"np": np}
+_ns = {"np": np, "math": __import__("math"),
+       "UP_AXIS_Y": UP_AXIS_Y, "oriented_corners": oriented_corners}
 _start = _src.index("_BOX_EDGES = (")
 _end = _src.index("def box_input_specs(")
 exec(_src[_start:_end], _ns)                      # noqa: S102 - deliberate, see the docstring
@@ -78,6 +82,61 @@ def test_flat_box_still_produces_segments():
 def test_output_is_float32_for_holoviz():
     v = box_line_vertices([((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))])
     assert v.dtype == np.float32, v.dtype
+
+
+# ── oriented boxes ────────────────────────────────────────────────────────────────────────────────
+
+oriented_line_vertices = _ns["oriented_line_vertices"]
+
+
+def test_zero_yaw_oriented_box_matches_an_aabb():
+    """With yaw 0 the oriented box must be exactly the axis-aligned one -- the degenerate case."""
+    corners = oriented_corners((1.0, 2.0, 3.0), (0.4, 0.6, 1.8), 0.0, up_axis=1)
+    xs = sorted({round(c[0], 6) for c in corners})
+    ys = sorted({round(c[1], 6) for c in corners})
+    zs = sorted({round(c[2], 6) for c in corners})
+    assert xs == [0.8, 1.2], xs          # 0.4 along u=x
+    assert ys == [1.1, 2.9], ys          # 1.8 vertical (up_axis=1)
+    assert zs == [2.7, 3.3], zs          # 0.6 along v=z
+
+
+def test_yaw_rotates_only_the_horizontal_plane():
+    """A 90 degree yaw swaps the two horizontal extents and leaves the vertical one alone."""
+    corners = oriented_corners((0.0, 0.0, 0.0), (2.0, 1.0, 1.6), np.pi / 2, up_axis=1)
+    xs = max(c[0] for c in corners) - min(c[0] for c in corners)
+    ys = max(c[1] for c in corners) - min(c[1] for c in corners)
+    zs = max(c[2] for c in corners) - min(c[2] for c in corners)
+    assert abs(xs - 1.0) < 1e-6, xs      # the 2.0 extent now lies along z
+    assert abs(zs - 2.0) < 1e-6, zs
+    assert abs(ys - 1.6) < 1e-6, ys      # vertical untouched
+
+
+def test_oriented_box_has_twelve_edges_and_degree_three_corners():
+    objs = [{"bbox_min": (0, 0, 0), "bbox_max": (1, 1, 1), "centroid": (0.5, 0.5, 0.5),
+             "yaw": 0.3, "oriented_extent": (1.0, 0.5, 1.8), "oriented_center": (0.5, 0.9, 0.5)}]
+    v = oriented_line_vertices(objs)[0]
+    assert v.shape[0] == 24
+    degree = {}
+    for i in range(0, 24, 2):
+        a, b = tuple(np.round(v[i], 6)), tuple(np.round(v[i + 1], 6))
+        assert a != b, "degenerate edge"
+        degree[a] = degree.get(a, 0) + 1
+        degree[b] = degree.get(b, 0) + 1
+    assert sorted(degree.values()) == [3] * 8, degree
+
+
+def test_falls_back_to_the_aabb_without_a_usable_orientation():
+    """A near-circular footprint yields zero oriented extents; drawing that would be worse."""
+    objs = [{"bbox_min": (0, 0, 0), "bbox_max": (1, 2, 3), "centroid": (0.5, 1, 1.5),
+             "yaw": 0.0, "oriented_extent": (0.0, 0.0, 0.0), "oriented_center": (0, 0, 0)}]
+    v = oriented_line_vertices(objs)[0]
+    assert np.isfinite(v).all()
+    assert abs(v[:, 1].max() - 2.0) < 1e-6, "did not fall back to the AABB extents"
+
+
+def test_no_objects_still_gives_one_nan_segment():
+    v = oriented_line_vertices([])
+    assert v.shape == (1, 2, 3) and np.all(np.isnan(v))
 
 
 if __name__ == "__main__":

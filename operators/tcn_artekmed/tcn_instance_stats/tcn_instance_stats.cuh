@@ -56,6 +56,8 @@ class TcnInstanceStatsOp : public holoscan::Operator {
   holoscan::Parameter<double> trim_percentile_;
   holoscan::Parameter<double> trim_margin_;
   holoscan::Parameter<double> min_range_m_;
+  holoscan::Parameter<int64_t> up_axis_;
+  holoscan::Parameter<double> min_anisotropy_;
   holoscan::Parameter<int64_t> min_points_;
   holoscan::Parameter<int64_t> max_instances_;
   holoscan::Parameter<bool> verbose_;

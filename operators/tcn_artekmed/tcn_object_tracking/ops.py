@@ -4,6 +4,7 @@ Thin on purpose: everything with a decision in it lives in `association.py` and 
 host-testable. These operators only move data across ports.
 """
 import logging
+import math
 
 import numpy as np
 from holoscan.core import ConditionType, IOSpec, Operator, OperatorSpec
@@ -22,7 +23,10 @@ COL_CENTROID = slice(2, 5)
 COL_MIN = slice(5, 8)
 COL_MAX = slice(8, 11)
 COL_SIGMA = slice(11, 14)
-N_COLUMNS = 14
+COL_YAW = 14
+COL_ORIENTED = slice(15, 18)        # extents along (yaw, in-plane perpendicular, vertical)
+COL_ORIENTED_CENTER = slice(18, 21)
+N_COLUMNS = 21
 
 PANOPTIC_CLASS_SHIFT = 8
 PANOPTIC_INSTANCE_MASK = 0xFF
@@ -55,6 +59,9 @@ def observations_from_message(msg, rows_name="rows", labels_name="labels"):
             box=(tuple(float(v) for v in rows[i, COL_MIN]),
                  tuple(float(v) for v in rows[i, COL_MAX])),
             sigma=tuple(float(v) for v in rows[i, COL_SIGMA]),
+            yaw=float(rows[i, COL_YAW]),
+            oriented_extent=tuple(float(v) for v in rows[i, COL_ORIENTED]),
+            oriented_center=tuple(float(v) for v in rows[i, COL_ORIENTED_CENTER]),
         ))
     return out
 
@@ -158,12 +165,14 @@ class ObjectTrackerOp(Operator):
     """
 
     def __init__(self, fragment, *args, min_hits=3, max_age=8, iou_threshold=0.1,
-                 max_centroid_distance_m=1.0, box_smoothing=0.5, class_names=None,
+                 max_centroid_distance_m=1.0, box_smoothing=0.5,
+                 max_yaw_smoothing_delta_rad=0.26, class_names=None,
                  verbose=False, **kwargs):
         self.tracker = ObjectTracker(min_hits=min_hits, max_age=max_age,
                                      iou_threshold=iou_threshold,
                                      max_centroid_distance_m=max_centroid_distance_m,
-                                     box_smoothing=box_smoothing)
+                                     box_smoothing=box_smoothing,
+                                     max_yaw_smoothing_delta_rad=max_yaw_smoothing_delta_rad)
         # class id -> name, for readable output. Class ids are 1-based prompt positions.
         self.class_names = {i + 1: str(n) for i, n in enumerate(class_names or [])}
         self.verbose = bool(verbose)
@@ -241,11 +250,14 @@ class ObjectConsoleSinkOp(Operator):
                  f"(acq={msg.get('acq_timestamp')}): {len(objects)} object(s)")
         for o in objects:
             c, e = o["centroid"], o["extent"]
+            oe = o.get("oriented_extent") or (0.0, 0.0, 0.0)
+            yaw_deg = math.degrees(o.get("yaw") or 0.0)
+            oriented = (f" oriented=({oe[0]:.2f}x{oe[1]:.2f}x{oe[2]:.2f})@{yaw_deg:+.0f}deg"
+                        if min(oe) > 0.0 else " oriented=n/a")
             log.info(f"    #{o['track_id']:<3d} {o['class_name']:<12s} "
                      f"centre=({c[0]:+.2f},{c[1]:+.2f},{c[2]:+.2f}) m  "
-                     f"size=({e[0]:.2f}x{e[1]:.2f}x{e[2]:.2f}) m  "
-                     f"pts={o['num_points']:<7d} cams={o['cameras']} "
-                     f"hits={o['hits']}")
+                     f"aabb=({e[0]:.2f}x{e[1]:.2f}x{e[2]:.2f}) m{oriented}  "
+                     f"pts={o['num_points']:<7d} cams={o['cameras']} hits={o['hits']}")
 
     def stop(self):
         if not self.frames:

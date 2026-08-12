@@ -44,6 +44,10 @@ __global__ void reset_kernel(InstanceAccumulators acc) {
   if (s >= kInstanceSlots) return;
   acc.count1[s] = 0u;
   acc.count2[s] = 0u;
+  acc.sumUU[s] = 0.f;
+  acc.sumVV[s] = 0.f;
+  acc.sumUV[s] = 0.f;
+  acc.yaw[s] = 0.f;
   for (int d = 0; d < 3; ++d) {
     const int k = 3 * s + d;
     acc.sum1[k] = 0.f;
@@ -56,6 +60,10 @@ __global__ void reset_kernel(InstanceAccumulators acc) {
     acc.sum2[k] = 0.f;
     acc.minEnc[k] = 0x7FFFFFFF;
     acc.maxEnc[k] = static_cast<int32_t>(0x80000000);
+    if (d < 2) {
+      acc.oMinEnc[2 * s + d] = 0x7FFFFFFF;
+      acc.oMaxEnc[2 * s + d] = static_cast<int32_t>(0x80000000);
+    }
     for (int b = 0; b < kInstanceHistBins; ++b) {
       acc.hist[(3 * s + d) * kInstanceHistBins + b] = 0u;
     }
@@ -175,9 +183,16 @@ __global__ void bounds_kernel(InstanceAccumulators acc, float trim_percentile, f
   }
 }
 
+/// The two horizontal axes, given the vertical one.
+__device__ __forceinline__ void plane_axes(int up_axis, int* u, int* v) {
+  *u = (up_axis == 0) ? 1 : 0;
+  *v = (up_axis == 2) ? 1 : 2;
+}
+
 __global__ void trimmed_kernel(const float* __restrict__ positions,
                                const uint16_t* __restrict__ labels,
                                int64_t count,
+                               int up_axis,
                                InstanceAccumulators acc) {
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= count) return;
@@ -199,9 +214,74 @@ __global__ void trimmed_kernel(const float* __restrict__ positions,
     atomicMin(&acc.minEnc[3 * label + d], float_to_ordered(p[d]));
     atomicMax(&acc.maxEnc[3 * label + d], float_to_ordered(p[d]));
   }
+  // Raw second moments in the ground plane; the mean is subtracted later, from sum2.
+  int ua, va;
+  plane_axes(up_axis, &ua, &va);
+  atomicAdd(&acc.sumUU[label], p[ua] * p[ua]);
+  atomicAdd(&acc.sumVV[label], p[va] * p[va]);
+  atomicAdd(&acc.sumUV[label], p[ua] * p[va]);
+}
+
+__global__ void yaw_kernel(InstanceAccumulators acc, int up_axis, float min_anisotropy) {
+  const int s = blockIdx.x * blockDim.x + threadIdx.x;
+  if (s >= kInstanceSlots) return;
+  const uint32_t n = acc.count2[s];
+  acc.yaw[s] = 0.f;
+  if (n < 3u) return;                       // fewer than three points has no orientation
+
+  int ua, va;
+  plane_axes(up_axis, &ua, &va);
+  const float inv = 1.f / static_cast<float>(n);
+  const float mu = acc.sum2[3 * s + ua] * inv;
+  const float mv = acc.sum2[3 * s + va] * inv;
+  const float cuu = fmaxf(acc.sumUU[s] * inv - mu * mu, 0.f);
+  const float cvv = fmaxf(acc.sumVV[s] * inv - mv * mv, 0.f);
+  const float cuv = acc.sumUV[s] * inv - mu * mv;
+
+  // Eigenvalues of the symmetric 2x2 [[cuu, cuv], [cuv, cvv]].
+  const float tr = cuu + cvv;
+  const float diff = sqrtf(fmaxf((cuu - cvv) * (cuu - cvv) + 4.f * cuv * cuv, 0.f));
+  const float l1 = 0.5f * (tr + diff);      // major
+  const float l2 = 0.5f * (tr - diff);      // minor
+  // A near-circular footprint has no meaningful orientation. Fitting one to noise makes the box spin
+  // frame to frame, which is worse than reporting no rotation, so below the threshold yaw stays 0 and
+  // the oriented box degenerates to the axis-aligned one.
+  if (l1 <= 0.f || l2 < 0.f || l1 < min_anisotropy * fmaxf(l2, 1e-9f)) return;
+
+  acc.yaw[s] = 0.5f * atan2f(2.f * cuv, cuu - cvv);
+}
+
+__global__ void oriented_kernel(const float* __restrict__ positions,
+                                const uint16_t* __restrict__ labels,
+                                int64_t count,
+                                int up_axis,
+                                InstanceAccumulators acc) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const uint16_t label = labels[i];
+  if (label == 0) return;
+  const float p[3] = {positions[3 * i + 0], positions[3 * i + 1], positions[3 * i + 2]};
+  if (!isfinite(p[0]) || !isfinite(p[1]) || !isfinite(p[2])) return;
+  // Same membership test as the trimmed pass: the oriented extents must describe the SAME point set
+  // the axis-aligned box and the yaw describe, or the two boxes would not be of one object.
+  for (int d = 0; d < 3; ++d) {
+    const int k = 3 * label + d;
+    if (p[d] < acc.loBound[k] || p[d] > acc.hiBound[k]) return;
+  }
+
+  int ua, va;
+  plane_axes(up_axis, &ua, &va);
+  const float c = cosf(acc.yaw[label]), sn = sinf(acc.yaw[label]);
+  const float proj_u =  c * p[ua] + sn * p[va];
+  const float proj_v = -sn * p[ua] + c * p[va];
+  atomicMin(&acc.oMinEnc[2 * label + 0], float_to_ordered(proj_u));
+  atomicMax(&acc.oMaxEnc[2 * label + 0], float_to_ordered(proj_u));
+  atomicMin(&acc.oMinEnc[2 * label + 1], float_to_ordered(proj_v));
+  atomicMax(&acc.oMaxEnc[2 * label + 1], float_to_ordered(proj_v));
 }
 
 __global__ void compact_kernel(InstanceAccumulators acc,
+                               int up_axis,
                                int camera_index,
                                uint32_t min_points,
                                float* __restrict__ rows,
@@ -226,6 +306,33 @@ __global__ void compact_kernel(InstanceAccumulators acc,
     r[kColMaxX + d] = ordered_to_float(acc.maxEnc[3 * s + d]);
     r[kColSigmaX + d] = acc.sigmaRaw[3 * s + d];   // spread BEFORE trimming: the bleed indicator
   }
+
+  int ua, va;
+  plane_axes(up_axis, &ua, &va);
+  const float yaw = acc.yaw[s];
+  const float lo_u = ordered_to_float(acc.oMinEnc[2 * s + 0]);
+  const float hi_u = ordered_to_float(acc.oMaxEnc[2 * s + 0]);
+  const float lo_v = ordered_to_float(acc.oMinEnc[2 * s + 1]);
+  const float hi_v = ordered_to_float(acc.oMaxEnc[2 * s + 1]);
+  r[kColYaw] = yaw;
+  r[kColOrientedU] = fmaxf(hi_u - lo_u, 0.f);
+  r[kColOrientedV] = fmaxf(hi_v - lo_v, 0.f);
+  r[kColOrientedUp] = r[kColMinX + up_axis] <= r[kColMaxX + up_axis]
+                          ? (r[kColMaxX + up_axis] - r[kColMinX + up_axis]) : 0.f;
+  // Centre of the oriented box, rotated back into world coordinates. Note this is the box CENTRE, not
+  // the centroid: the centroid is where the mass is, the centre is the middle of the extents, and for
+  // a partially observed object they differ.
+  const float mid_u = 0.5f * (lo_u + hi_u);
+  const float mid_v = 0.5f * (lo_v + hi_v);
+  const float c = cosf(yaw), sn = sinf(yaw);
+  float centre[3];
+  centre[ua] = c * mid_u - sn * mid_v;
+  centre[va] = sn * mid_u + c * mid_v;
+  centre[up_axis] = 0.5f * (r[kColMinX + up_axis] + r[kColMaxX + up_axis]);
+  r[kColOrientedCenterX + 0] = centre[0];
+  r[kColOrientedCenterX + 1] = centre[1];
+  r[kColOrientedCenterX + 2] = centre[2];
+
   row_labels[slot] = static_cast<uint16_t>(s);
 }
 
@@ -258,14 +365,25 @@ void launch_instance_bounds(const InstanceAccumulators& acc, float trim_percenti
 }
 
 void launch_instance_trimmed(const float* positions, const uint16_t* labels, int64_t count,
-                             const InstanceAccumulators& acc, cudaStream_t stream) {
+                             int up_axis, const InstanceAccumulators& acc, cudaStream_t stream) {
   if (count <= 0) return;
-  trimmed_kernel<<<grid_for(count), kBlock, 0, stream>>>(positions, labels, count, acc);
+  trimmed_kernel<<<grid_for(count), kBlock, 0, stream>>>(positions, labels, count, up_axis, acc);
 }
 
-void launch_instance_compact(const InstanceAccumulators& acc, int camera_index, uint32_t min_points,
-                             float* rows, uint16_t* row_labels, uint32_t* row_count,
-                             uint32_t max_rows, cudaStream_t stream) {
+void launch_instance_yaw(const InstanceAccumulators& acc, int up_axis, float min_anisotropy,
+                         cudaStream_t stream) {
+  yaw_kernel<<<grid_for(kInstanceSlots), kBlock, 0, stream>>>(acc, up_axis, min_anisotropy);
+}
+
+void launch_instance_oriented(const float* positions, const uint16_t* labels, int64_t count,
+                              int up_axis, const InstanceAccumulators& acc, cudaStream_t stream) {
+  if (count <= 0) return;
+  oriented_kernel<<<grid_for(count), kBlock, 0, stream>>>(positions, labels, count, up_axis, acc);
+}
+
+void launch_instance_compact(const InstanceAccumulators& acc, int up_axis, int camera_index,
+                             uint32_t min_points, float* rows, uint16_t* row_labels,
+                             uint32_t* row_count, uint32_t max_rows, cudaStream_t stream) {
   compact_kernel<<<grid_for(kInstanceSlots), kBlock, 0, stream>>>(
-      acc, camera_index, min_points, rows, row_labels, row_count, max_rows);
+      acc, up_axis, camera_index, min_points, rows, row_labels, row_count, max_rows);
 }

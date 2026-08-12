@@ -9,6 +9,7 @@ Host-testable in milliseconds, which is the point: identity bugs (swapped ids, c
 are invisible in a rendered scene and obvious in a unit test.
 """
 import logging
+import math
 from typing import Dict, List, Optional, Sequence
 
 from .association import Detection, box_union, match_detections_to_tracks
@@ -16,11 +17,23 @@ from .association import Detection, box_union, match_detections_to_tracks
 log = logging.getLogger(__name__)
 
 
+def _yaw_delta(a: float, b: float) -> float:
+    """Signed shortest rotation from `a` to `b`, treating a box and its 180-degree turn as identical.
+
+    A yaw-oriented box has no front: `yaw` and `yaw + pi` describe the same box, and the PCA that
+    produces it is free to return either. Comparing the raw angles would read that ambiguity as a
+    180-degree swing and refuse to smooth a perfectly stable object.
+    """
+    d = (b - a) % math.pi
+    return d - math.pi if d > math.pi / 2 else d
+
+
 class Track:
     """One tracked object. `track_id` is stable for the object's whole life and never reused."""
 
     __slots__ = ("track_id", "class_id", "centroid", "box", "num_points", "cameras",
-                 "hits", "misses", "age", "first_frame", "last_frame")
+                 "hits", "misses", "age", "first_frame", "last_frame",
+                 "yaw", "oriented_extent", "oriented_center")
 
     def __init__(self, track_id: int, detection: Detection, frame: int):
         self.track_id = track_id
@@ -29,6 +42,9 @@ class Track:
         self.box = detection.box
         self.num_points = detection.num_points
         self.cameras = detection.cameras
+        self.yaw = detection.yaw
+        self.oriented_extent = detection.oriented_extent
+        self.oriented_center = detection.oriented_center
         self.hits = 1
         self.misses = 0
         self.age = 1
@@ -39,11 +55,28 @@ class Track:
     def extent(self):
         return tuple(self.box[1][d] - self.box[0][d] for d in range(3))
 
-    def update(self, detection: Detection, frame: int, box_smoothing: float) -> None:
+    def update(self, detection: Detection, frame: int, box_smoothing: float,
+               max_yaw_smoothing_delta: float = 0.26) -> None:
         self.class_id = detection.class_id
         self.centroid = detection.centroid
-        if box_smoothing <= 0.0:
+        # Both boxes are smoothed together, or neither is. Two reasons they cannot be treated
+        # separately: the oriented extents are measured IN the yaw frame, so once the principal axis
+        # swings (an over-merged blob, or an object whose two footprint axes are nearly equal and swap
+        # ranks) the old ones describe a box that never existed; and the pair is reported side by side,
+        # so mixing a smoothed AABB with a freshly adopted oriented box makes the "oriented is the AABB
+        # refined" invariant appear violated by nothing but lag.
+        # A degenerate extent on either side means there is no oriented box to blend -- an isotropic
+        # footprint, or a Detection from a producer that does not compute one. The AABB is then smoothed
+        # as it always was, and the oriented fields are simply carried over.
+        oriented_available = (min(self.oriented_extent) > 0.0
+                              and min(detection.oriented_extent) > 0.0)
+        reorienting = (oriented_available
+                       and abs(_yaw_delta(self.yaw, detection.yaw)) > max_yaw_smoothing_delta)
+        if box_smoothing <= 0.0 or reorienting:
             self.box = detection.box
+            self.yaw = detection.yaw
+            self.oriented_extent = detection.oriented_extent
+            self.oriented_center = detection.oriented_center
         else:
             # Exponential smoothing per corner. Depth noise makes a raw box jitter by centimetres
             # frame to frame; smoothing makes the reported extent stable enough to be worth printing.
@@ -52,6 +85,18 @@ class Track:
                 tuple(a * self.box[0][d] + (1.0 - a) * detection.box[0][d] for d in range(3)),
                 tuple(a * self.box[1][d] + (1.0 - a) * detection.box[1][d] for d in range(3)),
             )
+            if oriented_available:
+                self.yaw += (1.0 - a) * _yaw_delta(self.yaw, detection.yaw)
+                self.oriented_extent = tuple(a * self.oriented_extent[d]
+                                             + (1.0 - a) * detection.oriented_extent[d]
+                                             for d in range(3))
+                self.oriented_center = tuple(a * self.oriented_center[d]
+                                             + (1.0 - a) * detection.oriented_center[d]
+                                             for d in range(3))
+            else:
+                self.yaw = detection.yaw
+                self.oriented_extent = detection.oriented_extent
+                self.oriented_center = detection.oriented_center
         self.num_points = detection.num_points
         self.cameras = detection.cameras
         self.hits += 1
@@ -71,6 +116,9 @@ class Track:
             "bbox_min": self.box[0],
             "bbox_max": self.box[1],
             "extent": self.extent,
+            "yaw": self.yaw,
+            "oriented_extent": self.oriented_extent,
+            "oriented_center": self.oriented_center,
             "num_points": self.num_points,
             "cameras": list(self.cameras),
             "hits": self.hits,
@@ -102,12 +150,14 @@ class ObjectTracker:
     """
 
     def __init__(self, min_hits: int = 3, max_age: int = 8, iou_threshold: float = 0.1,
-                 max_centroid_distance_m: float = 1.0, box_smoothing: float = 0.5):
+                 max_centroid_distance_m: float = 1.0, box_smoothing: float = 0.5,
+                 max_yaw_smoothing_delta_rad: float = 0.26):
         self.min_hits = int(min_hits)
         self.max_age = int(max_age)
         self.iou_threshold = float(iou_threshold)
         self.max_centroid_distance_m = float(max_centroid_distance_m)
         self.box_smoothing = float(box_smoothing)
+        self.max_yaw_smoothing_delta_rad = float(max_yaw_smoothing_delta_rad)
         self._tracks: List[Track] = []
         self._next_id = 1
         self._frame = 0
@@ -158,7 +208,8 @@ class ObjectTracker:
             max_centroid_distance_m=self.max_centroid_distance_m)
 
         for di, ti in pairs:
-            self._tracks[ti].update(detections[di], self._frame, self.box_smoothing)
+            self._tracks[ti].update(detections[di], self._frame, self.box_smoothing,
+                                    self.max_yaw_smoothing_delta_rad)
         for ti in unmatched_t:
             self._tracks[ti].mark_missed()
         for di in unmatched_d:

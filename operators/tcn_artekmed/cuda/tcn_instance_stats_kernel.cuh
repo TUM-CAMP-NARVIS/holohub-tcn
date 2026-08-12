@@ -23,6 +23,11 @@ enum InstanceStatColumn {
   kColMinX, kColMinY, kColMinZ,
   kColMaxX, kColMaxY, kColMaxZ,
   kColSigmaX, kColSigmaY, kColSigmaZ,
+  kColYaw,               ///< rotation about the vertical axis, radians, from ground-plane PCA
+  kColOrientedU,         ///< extent along the yaw direction
+  kColOrientedV,         ///< extent along the in-plane perpendicular
+  kColOrientedUp,        ///< extent along the vertical axis (same as the AABB's)
+  kColOrientedCenterX, kColOrientedCenterY, kColOrientedCenterZ,   ///< centre of the oriented box
   kInstanceStatColumns
 };
 
@@ -51,6 +56,15 @@ struct InstanceAccumulators {
   float*    sum2;        ///< [slots*3]
   int32_t*  minEnc;      ///< [slots*3]    trimmed min
   int32_t*  maxEnc;      ///< [slots*3]    trimmed max
+  // Ground-plane second moments of the surviving points, for the yaw. Only the two horizontal axes
+  // participate: the box stays axis-aligned vertically (objects in a room stand upright), so a full
+  // 3D PCA would fit noise in the one direction we already know.
+  float*    sumUU;       ///< [slots]      sum of u*u, u = first horizontal axis, mean-free at use
+  float*    sumVV;       ///< [slots]      sum of v*v
+  float*    sumUV;       ///< [slots]      sum of u*v -- the cross term that carries the orientation
+  float*    yaw;         ///< [slots]      derived
+  int32_t*  oMinEnc;     ///< [slots*2]    min along (yaw, perpendicular), ordered-int encoded
+  int32_t*  oMaxEnc;     ///< [slots*2]    max along the same
 };
 
 /// Zero the accumulators (min/max are set to the encoding's extremes, not to 0).
@@ -87,17 +101,38 @@ void launch_instance_bounds(const InstanceAccumulators& acc,
                             float min_range,         ///< floor, so a flat axis keeps its own points
                             cudaStream_t stream);
 
-/// Pass 3: count, sum, min and max over only the points inside the robust bounds on every axis.
+/// Pass 3: count, sum, axis-aligned min/max and ground-plane second moments over only the points
+/// inside the robust bounds on every axis. `up_axis` selects the vertical world axis.
 void launch_instance_trimmed(const float* positions,
                              const uint16_t* labels,
                              int64_t count,
+                             int up_axis,
                              const InstanceAccumulators& acc,
                              cudaStream_t stream);
+
+/// Derive the yaw per slot from the ground-plane covariance of the surviving points.
+///
+/// `min_anisotropy` is the ratio the two in-plane eigenvalues must differ by before a yaw is trusted.
+/// A near-circular footprint has no meaningful orientation, and fitting one to noise makes the box
+/// rotate randomly frame to frame -- worse than reporting no rotation at all. Below the threshold the
+/// yaw is set to 0, i.e. the oriented box degenerates to the axis-aligned one.
+void launch_instance_yaw(const InstanceAccumulators& acc, int up_axis,
+                         float min_anisotropy, cudaStream_t stream);
+
+/// Pass 4: min/max of the surviving points PROJECTED onto the yaw frame, giving the oriented extents.
+/// A separate pass because the projection is not knowable until the yaw is.
+void launch_instance_oriented(const float* positions,
+                              const uint16_t* labels,
+                              int64_t count,
+                              int up_axis,
+                              const InstanceAccumulators& acc,
+                              cudaStream_t stream);
 
 /// Compact the non-empty slots into `rows` / `row_labels`, appending via `row_count`. Slots with
 /// fewer than `min_points` trimmed points are dropped -- a handful of points is depth noise or mask
 /// fringe, not an object.
 void launch_instance_compact(const InstanceAccumulators& acc,
+                             int up_axis,
                              int camera_index,
                              uint32_t min_points,
                              float* rows,             ///< [max_rows * kInstanceStatColumns]

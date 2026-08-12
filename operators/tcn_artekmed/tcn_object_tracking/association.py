@@ -7,6 +7,7 @@ objects that are quietly wrong.
 Boxes are axis-aligned in the world frame, represented as `(min_xyz, max_xyz)` with each a 3-tuple.
 World units are metres, so every threshold in this module is a real distance.
 """
+import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
 Vec3 = Tuple[float, float, float]
@@ -102,13 +103,73 @@ def centroid_distance(a: Vec3, b: Vec3) -> float:
     return sum((a[d] - b[d]) ** 2 for d in range(3)) ** 0.5
 
 
+def box_corners(box: Box) -> List[Vec3]:
+    """The eight corners of an axis-aligned box, in no particular order."""
+    lo, hi = box
+    return [(lo[0] if not i & 1 else hi[0],
+             lo[1] if not i & 2 else hi[1],
+             lo[2] if not i & 4 else hi[2]) for i in range(8)]
+
+
+def oriented_corners(center: Vec3, extent: Vec3, yaw: float, up_axis: int = UP_AXIS_Y) -> List[Vec3]:
+    """The eight corners of a yaw-rotated box, in world coordinates.
+
+    The box is axis-aligned on `up_axis` and rotated only about it: objects in a room stand upright, so
+    a full 3D orientation would fit noise in the one direction already known. `extent` is
+    `(along yaw, along the in-plane perpendicular, vertical)`, matching what tcn_instance_stats emits.
+
+    Corner order is `(u, v, up)` in the bits of the index, which `_ORIENTED_EDGES` in `render.py`
+    depends on -- change one and the boxes come out as a tangle of diagonals.
+    """
+    u, v = _plane_axes(up_axis)
+    hu, hv, hup = extent[0] / 2.0, extent[1] / 2.0, extent[2] / 2.0
+    c, s = math.cos(yaw), math.sin(yaw)
+    corners = []
+    for su in (-1, 1):
+        for sv in (-1, 1):
+            for sup in (-1, 1):
+                du, dv = su * hu, sv * hv
+                p = [0.0, 0.0, 0.0]
+                p[u] = center[u] + c * du - s * dv
+                p[v] = center[v] + s * du + c * dv
+                p[up_axis] = center[up_axis] + sup * hup
+                corners.append(tuple(p))
+    return corners
+
+
+def oriented_hull(points: Sequence[Vec3], yaw: float, up_axis: int = UP_AXIS_Y):
+    """Smallest box in the `yaw` frame containing `points`. Returns `(center, extent)` in world space.
+
+    The inverse of `oriented_corners`: rotate into the yaw frame, take the range on each of its axes,
+    rotate the result's centre back out.
+    """
+    u, v = _plane_axes(up_axis)
+    c, s = math.cos(yaw), math.sin(yaw)
+    lo = [float("inf")] * 3
+    hi = [float("-inf")] * 3
+    for p in points:
+        local = (c * p[u] + s * p[v], -s * p[u] + c * p[v], p[up_axis])
+        for d in range(3):
+            lo[d] = min(lo[d], local[d])
+            hi[d] = max(hi[d], local[d])
+    mid = [(lo[d] + hi[d]) / 2.0 for d in range(3)]
+    center = [0.0, 0.0, 0.0]
+    center[u] = c * mid[0] - s * mid[1]
+    center[v] = s * mid[0] + c * mid[1]
+    center[up_axis] = mid[2]
+    return tuple(center), tuple(hi[d] - lo[d] for d in range(3))
+
+
 class Observation:
     """One instance as seen by one camera in one frame."""
 
-    __slots__ = ("class_id", "instance_id", "camera_index", "num_points", "centroid", "box", "sigma")
+    __slots__ = ("class_id", "instance_id", "camera_index", "num_points", "centroid", "box", "sigma",
+                 "yaw", "oriented_extent", "oriented_center")
 
     def __init__(self, class_id: int, instance_id: int, camera_index: int, num_points: int,
-                 centroid: Vec3, box: Box, sigma: Vec3 = (0.0, 0.0, 0.0)):
+                 centroid: Vec3, box: Box, sigma: Vec3 = (0.0, 0.0, 0.0),
+                 yaw: float = 0.0, oriented_extent: Vec3 = (0.0, 0.0, 0.0),
+                 oriented_center: Vec3 = (0.0, 0.0, 0.0)):
         self.class_id = int(class_id)
         self.instance_id = int(instance_id)
         self.camera_index = int(camera_index)
@@ -116,6 +177,13 @@ class Observation:
         self.centroid = tuple(float(v) for v in centroid)
         self.box = (tuple(float(v) for v in box[0]), tuple(float(v) for v in box[1]))
         self.sigma = tuple(float(v) for v in sigma)
+        # Yaw-oriented box: rotation about the vertical axis with the extents measured in that frame.
+        # Reported and rendered; association still uses the axis-aligned box, which is conservative --
+        # it can over-merge two objects whose AABBs overlap while their oriented boxes do not, but it
+        # never under-merges. Rotated-rectangle overlap is the upgrade when that matters.
+        self.yaw = float(yaw)
+        self.oriented_extent = tuple(float(v) for v in oriented_extent)
+        self.oriented_center = tuple(float(v) for v in oriented_center)
 
     def __repr__(self):
         return (f"Observation(class={self.class_id} inst={self.instance_id} cam={self.camera_index} "
@@ -125,16 +193,22 @@ class Observation:
 class Detection:
     """One physical object at one timestamp, after merging every camera's view of it."""
 
-    __slots__ = ("class_id", "num_points", "centroid", "box", "cameras", "observations")
+    __slots__ = ("class_id", "num_points", "centroid", "box", "cameras", "observations",
+                 "yaw", "oriented_extent", "oriented_center")
 
     def __init__(self, class_id: int, num_points: int, centroid: Vec3, box: Box,
-                 cameras: Sequence[int], observations: int = 1):
+                 cameras: Sequence[int], observations: int = 1,
+                 yaw: float = 0.0, oriented_extent: Vec3 = (0.0, 0.0, 0.0),
+                 oriented_center: Vec3 = (0.0, 0.0, 0.0)):
         self.class_id = int(class_id)
         self.num_points = int(num_points)
         self.centroid = tuple(float(v) for v in centroid)
         self.box = box
         self.cameras = tuple(sorted(set(int(c) for c in cameras)))
         self.observations = int(observations)
+        self.yaw = float(yaw)
+        self.oriented_extent = tuple(float(v) for v in oriented_extent)
+        self.oriented_center = tuple(float(v) for v in oriented_center)
 
     @property
     def extent(self) -> Vec3:
@@ -225,7 +299,7 @@ def suppress_aggregates(observations: Sequence[Observation],
     return [o for o, k in zip(observations, keep) if k]
 
 
-def merge_observations(group: Sequence[Observation]) -> Detection:
+def merge_observations(group: Sequence[Observation], up_axis: int = UP_AXIS_Y) -> Detection:
     """Combine several views of one object: box union, point-weighted centroid.
 
     The centroid is weighted by point count rather than averaged over cameras, because a camera
@@ -239,8 +313,33 @@ def merge_observations(group: Sequence[Observation]) -> Detection:
     box = group[0].box
     for o in group[1:]:
         box = box_union(box, o.box)
+    # The fused oriented box must cover EVERY contributing view, so it is the hull of all their corners
+    # -- taking the best view's box alone would report a partial view as a tight fit.
+    points: List[Vec3] = []
+    for o in group:
+        if min(o.oriented_extent) > 0.0:
+            points.extend(oriented_corners(o.oriented_center, o.oriented_extent, o.yaw, up_axis))
+        else:
+            points.extend(box_corners(o.box))     # no usable orientation: its AABB is all it claims
+    # Which yaw to express that hull in is genuinely ill-defined once the views disagree: averaging
+    # angles is wrong near the wrap-around, and simply adopting the best-observed view's yaw produces a
+    # hull LARGER than the axis-aligned box whenever the views are spread out -- the opposite of the
+    # point. So every view's yaw is a candidate and the tightest footprint wins.
+    #
+    # The axis-aligned box is a candidate in its own right, and it has to be listed explicitly rather
+    # than left to fall out of `yaw = 0`: a view's oriented box is NOT contained in that view's AABB. At
+    # any angle other than the minimum-area one a circumscribing rectangle pokes out at the corners, so
+    # the hull of those corners can exceed the axis-aligned union. Listing the AABB is what makes
+    # "an oriented box is the AABB refined, never inflated" true by construction.
+    candidates = [oriented_hull(box_corners(box), 0.0, up_axis) + (0.0,)]
+    candidates += [oriented_hull(points, y, up_axis) + (y,)
+                   for y in sorted({o.yaw for o in group}, key=abs)]
+    oriented_center, oriented_extent, yaw = min(
+        candidates,
+        key=lambda cec: cec[1][0] * cec[1][1])    # ground-plane area; the vertical extent is invariant
     return Detection(class_id=group[0].class_id, num_points=total, centroid=centroid, box=box,
-                     cameras=[o.camera_index for o in group], observations=len(group))
+                     cameras=[o.camera_index for o in group], observations=len(group),
+                     yaw=yaw, oriented_extent=oriented_extent, oriented_center=oriented_center)
 
 
 def fuse_observations(observations: Sequence[Observation],
@@ -334,7 +433,7 @@ def fuse_observations(observations: Sequence[Observation],
             groups.setdefault(find(i), []).append(o)
         # Deterministic order: largest object first, then by centroid, so the output does not depend
         # on dict iteration order or on which camera happened to report first.
-        merged = [merge_observations(g) for g in groups.values()]
+        merged = [merge_observations(g, up_axis) for g in groups.values()]
         merged.sort(key=lambda d: (-d.num_points, d.centroid))
         detections.extend(merged)
     # Corroboration and size gates apply to the FUSED object, so several small partial views that

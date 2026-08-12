@@ -5,6 +5,7 @@ Run directly: `python3 operators/tcn_artekmed/tcn_object_tracking/tests/test_tra
 These are the tests that matter most: identity bugs -- swapped ids, churn, resurrection -- are
 invisible in a rendered scene and obvious here.
 """
+import math
 import os
 import sys
 
@@ -13,7 +14,7 @@ import sys
 # pulls in no holoscan.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from tcn_object_tracking.association import Detection, fuse_observations, Observation
-from tcn_object_tracking.tracker import ObjectTracker
+from tcn_object_tracking.tracker import ObjectTracker, _yaw_delta
 
 
 def box(cx, cy, cz, sx=0.5, sy=0.5, sz=1.8):
@@ -22,6 +23,11 @@ def box(cx, cy, cz, sx=0.5, sy=0.5, sz=1.8):
 
 def det(class_id, cx, cy=0.0, cz=0.9, n=10000):
     return Detection(class_id, n, (cx, cy, cz), box(cx, cy, cz), cameras=[0])
+
+
+def oriented_det(yaw, extent, cx=0.0, cy=0.0, cz=0.9, n=10000, sx=0.5):
+    return Detection(1, n, (cx, cy, cz), box(cx, cy, cz, sx=sx), cameras=[0],
+                     yaw=yaw, oriented_extent=extent, oriented_center=(cx, cy, cz))
 
 
 def ids(tracks):
@@ -189,6 +195,55 @@ def test_instance_id_churn_does_not_churn_the_track_id():
         out = t.update(fuse_observations(o))
     assert ids(out) == [1], f"track id followed the instance id: {ids(out)}"
     assert out[0].hits == 5
+
+
+# ── oriented-box smoothing ────────────────────────────────────────────────────────────────────────
+
+def test_stable_yaw_is_smoothed_towards_the_observation():
+    """A stable object's oriented box must be smoothed like its AABB, or the two would describe
+    different instants and the printed pair would look self-contradictory."""
+    t = ObjectTracker(min_hits=1, box_smoothing=0.5)
+    t.update([oriented_det(yaw=0.40, extent=(1.0, 0.4, 1.8))])
+    t.update([oriented_det(yaw=0.44, extent=(1.2, 0.4, 1.8))])
+    tr = t.confirmed()[0]
+    assert abs(tr.yaw - 0.42) < 1e-9, tr.yaw                    # halfway, as with the box corners
+    assert abs(tr.oriented_extent[0] - 1.1) < 1e-9, tr.oriented_extent
+
+
+def test_a_large_reorientation_is_adopted_not_blended():
+    """Past a real swing the previous extents are measured in a different frame: 1.0 m along the old
+    yaw is not 1.0 m along the new one, so averaging them describes no box that ever existed.
+
+    The axis-aligned box is adopted with it. Smoothing one box while adopting the other would report a
+    pair from two different instants, which is how a lagging AABB came to look narrower than the
+    oriented box it is supposed to contain.
+    """
+    t = ObjectTracker(min_hits=1, box_smoothing=0.5, max_yaw_smoothing_delta_rad=0.26)
+    t.update([oriented_det(yaw=0.0, extent=(1.0, 0.4, 1.8))])
+    d = oriented_det(yaw=0.9, extent=(0.4, 1.0, 1.8), sx=1.4)   # a differently sized AABB too
+    t.update([d])
+    tr = t.confirmed()[0]
+    assert tr.yaw == 0.9, tr.yaw
+    assert tr.oriented_extent == (0.4, 1.0, 1.8), tr.oriented_extent
+    assert tr.box == d.box, "the AABB was smoothed while the oriented box was adopted"
+
+
+def test_the_180_degree_ambiguity_is_not_read_as_a_swing():
+    """A yaw-oriented box has no front, so PCA may return either end of the principal axis. Treating
+    that flip as a rotation would refuse to smooth a completely stationary object."""
+    t = ObjectTracker(min_hits=1, box_smoothing=0.5)
+    t.update([oriented_det(yaw=0.05, extent=(1.0, 0.4, 1.8))])
+    t.update([oriented_det(yaw=0.05 - math.pi, extent=(1.2, 0.4, 1.8))])
+    tr = t.confirmed()[0]
+    assert abs(tr.oriented_extent[0] - 1.1) < 1e-9, \
+        f"extents {tr.oriented_extent} were not smoothed: the pi ambiguity was read as a swing"
+
+
+def test_yaw_delta_is_the_shortest_rotation_modulo_pi():
+    assert abs(_yaw_delta(0.1, 0.2) - 0.1) < 1e-12
+    assert abs(_yaw_delta(0.2, 0.1) + 0.1) < 1e-12
+    assert abs(_yaw_delta(1.5, -1.5)) < 0.15, _yaw_delta(1.5, -1.5)   # across the +-pi/2 seam
+    assert abs(_yaw_delta(0.3, 0.3 + math.pi)) < 1e-9                 # the same box
 
 
 if __name__ == "__main__":

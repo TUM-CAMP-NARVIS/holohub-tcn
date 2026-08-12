@@ -11,6 +11,8 @@ import numpy as np
 from holoscan.core import Operator, OperatorSpec
 from holoscan.operators import HolovizOp
 
+from .association import UP_AXIS_Y, oriented_corners
+
 log = logging.getLogger(__name__)
 
 #: The 12 edges of an axis-aligned box, as pairs of corner indices. A corner index is a bitmask over
@@ -28,6 +30,51 @@ VERTICES_PER_BOX = 2 * len(_BOX_EDGES)     # 24: LINES_3D consumes consecutive v
 def box_tensor_name(class_id: int) -> str:
     """Tensor (and Holoviz spec) name for one class's boxes. One place, so the app cannot drift."""
     return f"boxes_class_{class_id}"
+
+
+#: Edges of the corner ordering `association.oriented_corners` produces (index bits: u, v, up).
+_ORIENTED_EDGES = (
+    (0, 1), (2, 3), (4, 5), (6, 7),        # vertical edges
+    (0, 2), (1, 3), (4, 6), (5, 7),        # along v
+    (0, 4), (1, 5), (2, 6), (3, 7),        # along u
+)
+
+
+def oriented_line_vertices(objects, up_axis=UP_AXIS_Y) -> np.ndarray:
+    """Tracked objects -> `[1, N*24, 3]` line-segment vertices for their ORIENTED boxes.
+
+    Falls back to the object's axis-aligned box when it has no usable orientation -- a near-circular
+    footprint yields yaw 0 and zero oriented extents, and drawing a degenerate box would be worse than
+    drawing the conservative one.
+    """
+    boxes = []
+    for o in objects:
+        ext = o.get("oriented_extent") or (0.0, 0.0, 0.0)
+        if min(ext) <= 0.0:
+            boxes.append(("aabb", (o["bbox_min"], o["bbox_max"])))
+        else:
+            boxes.append(("obb", (o.get("oriented_center") or o["centroid"], ext,
+                                  float(o.get("yaw") or 0.0))))
+    if not boxes:
+        return np.full((1, 2, 3), np.nan, dtype=np.float32)
+    out = np.empty((1, len(boxes) * VERTICES_PER_BOX, 3), dtype=np.float32)
+    w = 0
+    for kind, data in boxes:
+        if kind == "aabb":
+            lo, hi = data
+            corner = [(lo[0] if not (i & 0b100) else hi[0],
+                       lo[1] if not (i & 0b001) else hi[1],
+                       lo[2] if not (i & 0b010) else hi[2]) for i in range(8)]
+            edges = _BOX_EDGES
+        else:
+            center, extent, yaw = data
+            corner = oriented_corners(center, extent, yaw, up_axis)
+            edges = _ORIENTED_EDGES
+        for a, b in edges:
+            out[0, w] = corner[a]
+            out[0, w + 1] = corner[b]
+            w += 2
+    return out
 
 
 def box_line_vertices(boxes) -> np.ndarray:
@@ -82,9 +129,13 @@ class ObjectBoxRendererOp(Operator):
     frame and vanishing is worse than a slightly late box.
     """
 
-    def __init__(self, fragment, *args, classes, device=0, **kwargs):
+    def __init__(self, fragment, *args, classes, device=0, oriented=True, up_axis=UP_AXIS_Y, **kwargs):
         self.classes = [int(c) for c in classes]
         self.device = int(device)
+        # Draw the yaw-oriented box, which represents an object at an angle to the world axes far
+        # better than its AABB. Falls back per object when the footprint has no usable orientation.
+        self.oriented = bool(oriented)
+        self.up_axis = int(up_axis)
         self.frames = 0
         self.drawn = 0
         super().__init__(fragment, *args, **kwargs)
@@ -101,13 +152,16 @@ class ObjectBoxRendererOp(Operator):
         by_class = {cls: [] for cls in self.classes}
         for o in objects:
             if o["class_id"] in by_class:
-                by_class[o["class_id"]].append((o["bbox_min"], o["bbox_max"]))
+                by_class[o["class_id"]].append(o)
 
         out = {}
         with cp.cuda.Device(self.device):
-            for cls, boxes in by_class.items():
-                out[box_tensor_name(cls)] = hs.as_tensor(
-                    cp.asarray(box_line_vertices(boxes)))
+            for cls, objs in by_class.items():
+                if self.oriented:
+                    verts = oriented_line_vertices(objs, self.up_axis)
+                else:
+                    verts = box_line_vertices([(o["bbox_min"], o["bbox_max"]) for o in objs])
+                out[box_tensor_name(cls)] = hs.as_tensor(cp.asarray(verts))
         self.frames += 1
         self.drawn += sum(len(b) for b in by_class.values())
         op_output.emit(out, "boxes", acq_timestamp=acq)
