@@ -2,7 +2,7 @@
 
 `TcnLabeledPointcloudOp` — turns a labeled depth grid into one compacted point cloud per class.
 
-Design: [`applications/tcn_artekmed/tcn_shm_vlm_inference/docs/specs/2026-08-12-mask-depth-join-design.md`](../../applications/tcn_artekmed/tcn_shm_vlm_inference/docs/specs/2026-08-12-mask-depth-join-design.md)
+Design: [`applications/tcn_artekmed/tcn_shm_vlm_inference/docs/specs/2026-08-12-mask-depth-join-design.md`](../../../applications/tcn_artekmed/tcn_shm_vlm_inference/docs/specs/2026-08-12-mask-depth-join-design.md)
 
 ## Ports
 

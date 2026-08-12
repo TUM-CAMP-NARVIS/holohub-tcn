@@ -135,6 +135,163 @@ from operators.tcn_artekmed.tcn_langsam import GdinoOp, SamOp, PanopticOp
 The packed encoding is shared with `tcn_label_sampler`; see the collection README for where the two
 halves of that convention live.
 
+## Models, engines and the container
+
+**This package cannot run out of the box.** Both variants need model weights, and every configuration
+except pure PyTorch needs TensorRT engines that must be built **for your TensorRT version, your GPU
+architecture and your camera split**. There is no fallback that silently downgrades: a missing or
+mismatched engine is a hard failure at `start()`, by design.
+
+Everything below is driven by `langsam_inference` in the application's YAML. The reference
+configuration and the export tooling live in the example application
+[`applications/tcn_artekmed/tcn_shm_vlm_inference`](../../../applications/tcn_artekmed/tcn_shm_vlm_inference):
+
+| what | where |
+|---|---|
+| reference config | `python/tcn_shm_vlm_inference.yaml` → `langsam_inference`, `gpu_workers`, `text_prompts` |
+| GDINO export tool | `docs/gdino_trt_export.py` + [`docs/gdino_trt_export.md`](../../../applications/tcn_artekmed/tcn_shm_vlm_inference/docs/gdino_trt_export.md) |
+| SAM export tool | `docs/sam_trt_export.py` + [`docs/sam_trt_export.md`](../../../applications/tcn_artekmed/tcn_shm_vlm_inference/docs/sam_trt_export.md) |
+| container rebuild | [`docs/trt11-upgrade-runbook.md`](../../../applications/tcn_artekmed/tcn_shm_vlm_inference/docs/trt11-upgrade-runbook.md), `docs/trt11_build_test.sh` |
+| mask correctness gate | `docs/compare_mask_dumps.py` (fed by `MaskDumpOp`) |
+
+### What each backend needs
+
+| configuration | needs | fails how |
+|---|---|---|
+| `gdino_backend: pytorch` | HF weights (`gdino_model_id`, downloaded on first use) | slow, but runs anywhere |
+| `gdino_backend: trt` | `gdino_trt_engine` **and** `gdino_trt_text` (the baked prompt tensors), matching `gdino_trt_hw` | `RuntimeError` at `start()`: engine or npz missing |
+| `sam_backend: pytorch` | SAM 2 checkpoint (`sam_type`, `sam_ckpt_path`) | runs anywhere |
+| `sam_backend: trt` | `sam_trt_engine` for **each distinct worker batch** | `RuntimeError` at `start()` |
+| `panoptic_backend: cuda` | the `tcn_panoptic_map` pybind module **built** | falls back to cupy with a warning |
+
+`panoptic_backend` is the one soft failure, and it is a trap: the module is only built if an
+application lists `tcn_panoptic_map` under `DEPENDS OPERATORS` (see the collection README). Without it
+you get the slow path and a single warning line, which is easy to miss in a long log.
+
+### Engines are triply locked
+
+An engine file is only valid for the combination of:
+
+1. **TensorRT version.** A TRT 10.9 engine will not load in TRT 11.2 — the failure is
+   `Serialization assertion stdVersionRead == kSERIALIZATION_VERSION failed`. Engines must therefore
+   be built **inside the container that will run them**, which is why the GDINO tool is split into
+   two stages.
+2. **GPU architecture.** An engine built for `sm_86` (A40/A6000) does not run on `sm_120` (Blackwell).
+   Moving to different hardware means rebuilding every engine.
+3. **Batch size = a worker's camera count.** Engines are fixed-batch. `gpu_workers.workers` defines
+   the split, and `worker_engine_path()` substitutes `{batch}` into the configured template:
+
+   ```yaml
+   sam_trt_engine: /srv/models/active/sam2/sam2.1_hiera_tiny_encoder_b{batch}_fp16.engine
+   gdino_trt_engine: /srv/models/active/groundingdino/gdino_swint_512x672_b{batch}_tf32.engine
+   ```
+
+   A 2/3 camera split needs engines for batch **2 and 3**; changing to 4/1 needs batch **4 and 1**.
+   A template without `{batch}` formats to itself, so a single-engine setup keeps working — but then
+   every worker must have the same camera count.
+
+Both export tools accept `--from-config <the app yaml>` and derive the distinct batch sizes from
+`gpu_workers` themselves, which is the only way to keep engines and the running split in step. Use it
+in preference to passing `--batch` by hand.
+
+### GDINO: two stages, two environments
+
+The export cannot happen in the container (no checkpoint, no GroundingDINO source) and the engine
+build cannot happen on the host (the engine must match the container's TRT). Hence:
+
+| stage | where | produces |
+|---|---|---|
+| `--stage export` | host, inside a **wingdzero GroundingDINO fork** checkout | `gdino_swint_prompts.npz`, `…_b<N>.onnx`, `…_parity_ref.npz` |
+| `--stage build` | **inside the runtime container** | `…_b<N>_tf32.engine` + gates |
+
+```bash
+# host, in the fork checkout
+python3 gdino_trt_export.py --stage export --prompts person bed device hololens pipes \
+        --hw 512 672 --from-config <app>/python/tcn_shm_vlm_inference.yaml
+# container
+python3 gdino_trt_export.py --stage build --hw 512 672 --out /srv/models/active/groundingdino
+```
+
+Three prerequisites that are not optional, each of which cost real time to discover:
+
+- **The wingdzero fork, not stock IDEA-Research GroundingDINO.** The tool needs a 6-tensor forward
+  signature; stock raises `takes 5 positional arguments but 7 were given`.
+- **Do NOT `pip install -e .`** in that checkout. It compiles GroundingDINO's `_C` CUDA op, which
+  fails on any nvcc/torch mismatch, and the op is *not needed* — export runs on CPU with the
+  pure-PyTorch deformable-attention fallback. Make the package importable with `PYTHONPATH` instead.
+- **Run from the checkout as working directory**, and use a dedicated venv (not the Depth-Anything
+  one).
+
+**The prompts are baked into the engine at this point.** `--prompts` fixes the tokens in the engine's
+`input_ids`; the class mapping lives in `token_class_ids` inside the npz. Consequences:
+
+- `RealtimeLangSamSubgraph` can never use a term that was not exported.
+- `PromptedLangSamSubgraph` with `prompted_gdino_backend: trt` can use any **subset or reordering** of
+  the baked terms at runtime — `build_prompt_remap` renumbers, no re-export.
+- A genuinely new term needs a re-export **and** a rebuild. The error message says so and prints both
+  commands.
+- The parity image must actually contain the prompted classes, or the export's faithfulness gate is
+  meaningless (`--min-detect`, default 0.30).
+
+### SAM: one stage, three gates
+
+SAM's encoder exports from the same environment the container already has, so it is a single stage
+that can run entirely inside the container:
+
+```bash
+python3 sam_trt_export.py --sam-type sam2.1_hiera_tiny \
+        --from-config <app>/python/tcn_shm_vlm_inference.yaml --out /srv/models/active/sam2
+```
+
+All three gates always run, and the artifact is moved into place **only if every one passes** — so a
+present engine file is a passed engine file:
+
+1. **Feature fidelity** — the engine's three output tensors against the PyTorch reference.
+2. **Slice consistency** — at `--batch N ≥ 2`, identical images must produce identical slices.
+3. **Mask IoU** — the unchanged PyTorch decoder run on both sets of features; masks must agree to
+   IoU ≥ 0.99. This is the gate that proves the swap is safe end to end.
+
+Precision: FP16 by default (`--tf32` to compare). On TensorRT 11 this required a **strongly-typed**
+export, because TRT 11 removed `BuilderFlag::kFP16`; a build that silently skipped the flag produced a
+file named `_fp16` that ran at TF32 speed. If you rebuild, check the reported timing, not the filename.
+
+Note SAM's encoder takes **only the image** — no prompts, no classes — which is why it stays a fixed
+TensorRT engine even in the promptable variant.
+
+### The container
+
+The reference deployment runs **TensorRT 11.2 on a locally rebuilt Holoscan SDK image**, because the
+stock image ships TRT 10.x and SAM's FP16 encoder measured ~2.2× faster on TRT 11. That rebuild is a
+deliberate, documented deviation, not a supported configuration:
+
+- It patches the SDK's `holoinfer` for TRT 11 (`kFP16` and `kPREFER_PRECISION_CONSTRAINTS` were
+  removed from `nvinfer1::BuilderFlag`) — see `docs/patches/`.
+- **Every engine must be rebuilt** after the switch, and engines for the old TRT are kept in a
+  separate tree so the previous setup remains a rollback.
+- `docs/trt11_build_test.sh` exists so the multi-stage rebuild is approved and run **once** rather
+  than as a series of prompts. It asserts the resulting TensorRT version, because a build that
+  silently ignored `--build-arg` produced a working-looking image with the wrong TRT.
+
+The full procedure — SDK image, app containers, engines, mount switch, verification, rollback — is
+[`docs/trt11-upgrade-runbook.md`](../../../applications/tcn_artekmed/tcn_shm_vlm_inference/docs/trt11-upgrade-runbook.md).
+
+If you do **not** want a modified container: set `gdino_backend: pytorch` and `sam_backend: pytorch`.
+Everything still runs, at a substantially lower frame rate, with no engines and no rebuild. That is
+also the fastest way to check that a problem is not engine-related.
+
+### Verifying a rebuild changed nothing it should not
+
+Engines are the one dependency whose replacement can silently change output. The application supports
+a byte-comparison gate for exactly this: set `mask_dump_dir` to write one `.npy` panoptic map per
+camera per frame from a deterministic replay run, do it before and after, then
+
+```bash
+python3 docs/compare_mask_dumps.py <before_dir> <after_dir>
+```
+
+A structural problem (missing directory, differing frame counts) exits with a distinct code from an
+ordinary mask difference, so "the gate could not run" cannot be mistaken for "the masks differ".
+
 ## Prompts and class ids
 
 Class ids are **1-based positions in the prompt list** (`class_id_map`), so prompt order is part of

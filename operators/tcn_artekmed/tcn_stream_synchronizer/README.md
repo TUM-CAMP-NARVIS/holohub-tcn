@@ -3,7 +3,7 @@
 `TcnStreamSynchronizerOp` — groups entities arriving on several ports at different rates into
 frame-groups that share an acquisition timestamp.
 
-Design: [`applications/tcn_artekmed/tcn_shm_vlm_inference/docs/specs/2026-08-11-temporal-sync-design.md`](../../applications/tcn_artekmed/tcn_shm_vlm_inference/docs/specs/2026-08-11-temporal-sync-design.md)
+Design: [`applications/tcn_artekmed/tcn_shm_vlm_inference/docs/specs/2026-08-11-temporal-sync-design.md`](../../../applications/tcn_artekmed/tcn_shm_vlm_inference/docs/specs/2026-08-11-temporal-sync-design.md)
 
 ## Why
 

@@ -26,6 +26,38 @@ It emits through the exact same two ports as `TcnShmSubscriberOp`
 (`operators/tcn_artekmed/tcn_shm_subscriber/shm_subscriber_op.cpp`), with the same tensor names,
 dtypes, and shapes, so it is a drop-in replacement at a `compose()` call site.
 
+## Container requirement
+
+The operator needs **`artekmed_dataset_reader`** importable, which pulls in `pyarrow`, `tifffile` and
+`PIL`. None of those are in the stock Holoscan image, so the runtime container must be built with the
+reader present — that is the one prerequisite for using this operator at all.
+
+The import is deliberately **lazy**, inside `start()` rather than at module scope, so that:
+
+- the module can be imported on a plain host (which is what lets `_planning.py` and
+  `_calibration.py` be host-tested without holoscan, cupy or the reader), and
+- an application that never selects `source: dataset` does not pay for it or fail on it.
+
+The failure is therefore an `ImportError` at graph start, not at import, and it names the reader.
+
+Also required: a dataset **export on disk**, reachable from inside the container. In the reference
+setup the exports are mounted at `/workspace/volumes/artekmed_test_data/data/<capture>`, e.g.
+
+```yaml
+dataset_source:
+  path: "/workspace/volumes/artekmed_test_data/data/k4a_capture"
+  cameras: ["camera01", "camera02", "camera03", "camera04"]
+```
+
+An export directory must contain `color/`, `depth/`, the `tables_*.arrow` index files, and — for the
+geometric path — `calibration/<camera>.json`. See `_calibration.py` for what is read from the
+calibration files and [`tcn_langsam`](../tcn_langsam/README.md) for the models the rest of the
+pipeline needs.
+
+Reference application: `applications/tcn_artekmed/tcn_shm_vlm_inference` with `source: "dataset"`,
+which is also where the deterministic correctness gates are documented
+([`docs/development-loop.md`](../../../applications/tcn_artekmed/tcn_shm_vlm_inference/docs/development-loop.md)).
+
 ## The BGR note (read this before changing channel_order)
 
 `artekmed_dataset_reader`'s `color_image()` decodes JPEGs and returns **RGB**. The live SHM

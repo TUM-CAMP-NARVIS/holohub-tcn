@@ -2,7 +2,7 @@
 
 `TcnLabelSamplerOp` — gives every depth pixel the panoptic label of the scene point it observes.
 
-Design: [`applications/tcn_artekmed/tcn_shm_vlm_inference/docs/specs/2026-08-12-mask-depth-join-design.md`](../../applications/tcn_artekmed/tcn_shm_vlm_inference/docs/specs/2026-08-12-mask-depth-join-design.md)
+Design: [`applications/tcn_artekmed/tcn_shm_vlm_inference/docs/specs/2026-08-12-mask-depth-join-design.md`](../../../applications/tcn_artekmed/tcn_shm_vlm_inference/docs/specs/2026-08-12-mask-depth-join-design.md)
 
 ## Why
 
