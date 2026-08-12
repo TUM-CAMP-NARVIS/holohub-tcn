@@ -66,9 +66,18 @@ class TcnLabeledPointcloudOp : public holoscan::Operator {
   CUcontext cu_context_ = nullptr;
   CUdevice cu_device_{};
 
+  // Scratch for the single-synchronisation compaction. Every class is selected and compacted with
+  // the stream still running, its count landing in device memory; one copy brings all K counts back
+  // and one synchronise waits for them. The earlier shape -- thrust::copy_if per class, whose
+  // returned iterator forces a host round-trip -- cost K synchronises per camera per frame and was
+  // 32% of this operator's time in the 2026-08-12 live trace.
   int64_t scratch_count_ = 0;
-  uint8_t* selected_d_ = nullptr;     ///< [count] 0/1 per source point
-  int32_t* indices_d_ = nullptr;      ///< [count] compacted source indices
+  uint8_t* selected_d_ = nullptr;     ///< [count] 0/1 per source point; reused per class (stream-ordered)
+  int32_t* indices_d_ = nullptr;      ///< [K][count] compacted source indices, one segment per class
+  int32_t* counts_d_ = nullptr;       ///< [K] per-class selected count, written by the device
+  int32_t* counts_h_ = nullptr;       ///< [K] pinned host mirror of counts_d_
+  void* cub_temp_d_ = nullptr;        ///< CUB DeviceSelect temp storage
+  std::size_t cub_temp_bytes_ = 0;
   std::size_t emitted_ = 0;
 };
 

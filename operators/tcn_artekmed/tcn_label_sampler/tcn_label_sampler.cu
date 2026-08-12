@@ -36,6 +36,34 @@ int bytes_per_element(const std::shared_ptr<holoscan::Tensor>& t) {
 
 }  // namespace
 
+namespace {
+
+/// Makes a device current for the duration of a scope and restores the previous one.
+///
+/// `start()` retains the primary context for `cuda_device_ordinal` but that does not make the device
+/// current, and the current device is per-THREAD -- the scheduler runs compute() on whatever worker
+/// thread is free. Without this, every cudaMalloc here landed on whichever device that thread had
+/// current (device 0 by default) while the stream and the input tensors lived on the configured one,
+/// which CUB reports as "invalid device ordinal" and the runtime as an illegal access. Invisible
+/// while cuda_device_ordinal is 0, which is why it survived the first round of testing.
+struct ScopedDevice {
+  int previous = 0;
+  explicit ScopedDevice(int device) {
+    HOLOSCAN_CUDA_CALL_THROW_ERROR(cudaGetDevice(&previous), "failed to read the current device");
+    if (previous != device) {
+      HOLOSCAN_CUDA_CALL_THROW_ERROR(cudaSetDevice(device), "failed to select the CUDA device");
+    }
+  }
+  ~ScopedDevice() {
+    if (previous != current()) { cudaSetDevice(previous); }   // best effort in a destructor
+  }
+  static int current() { int d = 0; cudaGetDevice(&d); return d; }
+  ScopedDevice(const ScopedDevice&) = delete;
+  ScopedDevice& operator=(const ScopedDevice&) = delete;
+};
+
+}  // namespace
+
 void TcnLabelSamplerOp::setup(holoscan::OperatorSpec& spec) {
   using namespace std::string_literals;
   HOLOSCAN_LOG_DEBUG("TcnLabelSamplerOp::setup");
@@ -107,6 +135,7 @@ void TcnLabelSamplerOp::start() {
 }
 
 void TcnLabelSamplerOp::stop() {
+  ScopedDevice device_guard(cuda_device_ordinal_.get());
   if (class_select_d_ != nullptr) {
     cudaFree(class_select_d_);
     class_select_d_ = nullptr;
@@ -118,6 +147,7 @@ void TcnLabelSamplerOp::stop() {
 }
 
 const uint8_t* TcnLabelSamplerOp::class_select_device() {
+  ScopedDevice device_guard(cuda_device_ordinal_.get());
   const auto& selected = select_classes_.get();
   if (selected.empty()) {
     return nullptr;   // kernel contract: nullptr means "every non-background class"

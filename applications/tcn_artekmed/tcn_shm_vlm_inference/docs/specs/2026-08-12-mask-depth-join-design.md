@@ -206,14 +206,42 @@ Cost: the period went from 197.2 ms to **209.8 ms (4.77 fps)**, so the entire ge
 apply_mask 0.6–1.7 ms, `labeled_pointcloud` **24.4–24.8 ms**; per frame: 5 class mergers ~25 ms
 total, and the point-cloud Holoviz 68.8 ms/tick asynchronously (0% of it inside a sync).
 
-**Known hotspot, not yet addressed.** `tcn_labeled_pointcloud` is 87% of the per-camera join cost,
-and 32% of its time is measured inside `cudaStreamSynchronize`. The cause is structural: one
-`thrust::copy_if` per class, each ending with a host-side count (`end - indices_d_`) that forces a
-stream synchronise, so K classes cost K syncs per camera per frame — 25 syncs/frame at 5 cameras ×
-5 classes. Computing every class's count in a single pass (one kernel producing K counts, one
-device-to-host copy, then per-class scatter from precomputed offsets) reduces that to one sync per
-camera. The host round-trip cannot be removed entirely, because the output tensor must be sized to
-the point count before it is allocated.
+**Hotspot, addressed.** `tcn_labeled_pointcloud` was 87% of the per-camera join cost with 32% of its
+time inside `cudaStreamSynchronize`, because it ran one `thrust::copy_if` per class and each returned
+a host-side iterator whose read forces a synchronise — K classes cost K syncs per camera per frame,
+25 per frame at 5 cameras × 5 classes.
+
+It now synchronises once. `cub::DeviceSelect::Flagged` writes its count to *device* memory, so all K
+classes are selected and compacted with the stream still running; one `cudaMemcpyAsync` brings the K
+counts back and one `cudaStreamSynchronize` waits for them, after which the outputs can be sized and
+gathered. The host round-trip itself cannot be removed — each output tensor is sized to its point
+count before allocation — only paid once instead of K times. CUB's Flagged is stable, so the point
+order and hence the output are unchanged (verified: the replay's fused counts are identical).
+
+One selection buffer serves all classes, since the per-class select and its compaction are issued on
+the same stream and stream ordering already prevents the next class from overwriting flags the
+previous compaction has not read. Indices are per class, because all K must remain readable after
+the single synchronisation when the gathers are issued.
+
+Measured in isolation on an idle GPU at the live grid size (576×640, 5 classes, 16.5% labeled,
+3 × 1000 ticks): median **0.703 → 0.600 ms/tick (−15%)**, mean −19%, p90 −22%, ranges
+non-overlapping.
+
+**What that measurement does not show.** In isolation the operator costs under 1 ms against 24.7 ms
+in the live trace, so the live figure is overwhelmingly the synchronisation absorbing queued GPU work
+from the rest of the pipeline rather than this operator's own arithmetic. The earlier estimate of
+"~6 ms/camera recoverable", extrapolated from the 32%-in-sync figure, was wrong for that reason.
+Going from five blocking points to one removes four chances per camera per frame to stall on
+unrelated queued work, which is the real mechanism, but the live gain needs a new trace to state.
+
+**Also found while benchmarking:** allocations were made on whatever device the calling worker thread
+had current. `start()` retains the primary context for `cuda_device_ordinal` but that does not make
+the device current, and the current device is per-thread while the scheduler runs `compute()` on any
+free worker. Both this operator and `tcn_label_sampler` now scope their allocations and launches to
+the configured device. Invisible while `cuda_device_ordinal` is 0, which is every configuration the
+app builds today. Note separately that a non-zero ordinal also needs a `CudaStreamPool` on that
+device — Holoscan otherwise supplies a device-0 stream, and launching on it reports
+"invalid device ordinal".
 
 ## Explicitly out of scope
 

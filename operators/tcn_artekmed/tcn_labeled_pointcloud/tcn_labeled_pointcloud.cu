@@ -5,8 +5,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-#include <thrust/copy.h>
-#include <thrust/execution_policy.h>
+#include <cub/cub.cuh>
 #include <thrust/iterator/counting_iterator.h>
 
 #include <algorithm>
@@ -37,6 +36,34 @@ int64_t element_count(const std::shared_ptr<holoscan::Tensor>& t) {
 int bytes_per_element(const std::shared_ptr<holoscan::Tensor>& t) {
   return (t->dtype().bits + 7) / 8;
 }
+
+}  // namespace
+
+namespace {
+
+/// Makes a device current for the duration of a scope and restores the previous one.
+///
+/// `start()` retains the primary context for `cuda_device_ordinal` but that does not make the device
+/// current, and the current device is per-THREAD -- the scheduler runs compute() on whatever worker
+/// thread is free. Without this, every cudaMalloc here landed on whichever device that thread had
+/// current (device 0 by default) while the stream and the input tensors lived on the configured one,
+/// which CUB reports as "invalid device ordinal" and the runtime as an illegal access. Invisible
+/// while cuda_device_ordinal is 0, which is why it survived the first round of testing.
+struct ScopedDevice {
+  int previous = 0;
+  explicit ScopedDevice(int device) {
+    HOLOSCAN_CUDA_CALL_THROW_ERROR(cudaGetDevice(&previous), "failed to read the current device");
+    if (previous != device) {
+      HOLOSCAN_CUDA_CALL_THROW_ERROR(cudaSetDevice(device), "failed to select the CUDA device");
+    }
+  }
+  ~ScopedDevice() {
+    if (previous != current()) { cudaSetDevice(previous); }   // best effort in a destructor
+  }
+  static int current() { int d = 0; cudaGetDevice(&d); return d; }
+  ScopedDevice(const ScopedDevice&) = delete;
+  ScopedDevice& operator=(const ScopedDevice&) = delete;
+};
 
 }  // namespace
 
@@ -110,8 +137,13 @@ void TcnLabeledPointcloudOp::start() {
 }
 
 void TcnLabeledPointcloudOp::stop() {
+  ScopedDevice device_guard(cuda_device_ordinal_.get());
   if (selected_d_) { cudaFree(selected_d_); selected_d_ = nullptr; }
   if (indices_d_) { cudaFree(indices_d_); indices_d_ = nullptr; }
+  if (counts_d_) { cudaFree(counts_d_); counts_d_ = nullptr; }
+  if (counts_h_) { cudaFreeHost(counts_h_); counts_h_ = nullptr; }
+  if (cub_temp_d_) { cudaFree(cub_temp_d_); cub_temp_d_ = nullptr; }
+  cub_temp_bytes_ = 0;
   scratch_count_ = 0;
   if (cu_context_ != nullptr) {
     cuDevicePrimaryCtxRelease(cu_device_);
@@ -121,20 +153,59 @@ void TcnLabeledPointcloudOp::stop() {
 
 void TcnLabeledPointcloudOp::ensure_scratch(int64_t count) {
   if (count <= scratch_count_) return;
+  ScopedDevice device_guard(cuda_device_ordinal_.get());
+  const int64_t k = static_cast<int64_t>(configured_classes_.size());
+
   if (selected_d_) { cudaFree(selected_d_); selected_d_ = nullptr; }
   if (indices_d_) { cudaFree(indices_d_); indices_d_ = nullptr; }
+  if (cub_temp_d_) { cudaFree(cub_temp_d_); cub_temp_d_ = nullptr; }
+
+  // One selection buffer for all classes: the per-class select and its compaction are issued on the
+  // same stream, so stream ordering already prevents the next class from overwriting flags the
+  // previous compaction has not read yet.
   HOLOSCAN_CUDA_CALL_THROW_ERROR(
       cudaMalloc(reinterpret_cast<void**>(&selected_d_), count * sizeof(uint8_t)),
       "TcnLabeledPointcloudOp: failed to allocate the selection buffer");
+  // Indices are per class, unlike the flags: they must all still be readable after the single
+  // synchronisation, when the gathers are issued.
   HOLOSCAN_CUDA_CALL_THROW_ERROR(
-      cudaMalloc(reinterpret_cast<void**>(&indices_d_), count * sizeof(int32_t)),
+      cudaMalloc(reinterpret_cast<void**>(&indices_d_), k * count * sizeof(int32_t)),
       "TcnLabeledPointcloudOp: failed to allocate the index buffer");
+
+  if (counts_d_ == nullptr) {
+    HOLOSCAN_CUDA_CALL_THROW_ERROR(
+        cudaMalloc(reinterpret_cast<void**>(&counts_d_), k * sizeof(int32_t)),
+        "TcnLabeledPointcloudOp: failed to allocate the count buffer");
+    // Pinned, so the one count copy is a real DMA rather than a staged pageable transfer.
+    HOLOSCAN_CUDA_CALL_THROW_ERROR(
+        cudaHostAlloc(reinterpret_cast<void**>(&counts_h_), k * sizeof(int32_t),
+                      cudaHostAllocDefault),
+        "TcnLabeledPointcloudOp: failed to allocate the pinned count buffer");
+  }
+
+  // Temp-storage size depends on the item count, so it is queried whenever the count grows. The
+  // query itself launches nothing.
+  std::size_t bytes = 0;
+  auto status = cub::DeviceSelect::Flagged(
+      nullptr, bytes, thrust::counting_iterator<int32_t>(0), selected_d_, indices_d_, counts_d_,
+      static_cast<int>(count));
+  if (status != cudaSuccess) {
+    throw std::runtime_error(std::string("TcnLabeledPointcloudOp: cub::DeviceSelect::Flagged size "
+                                         "query failed: ") + cudaGetErrorString(status));
+  }
+  HOLOSCAN_CUDA_CALL_THROW_ERROR(cudaMalloc(&cub_temp_d_, bytes),
+                                 "TcnLabeledPointcloudOp: failed to allocate CUB temp storage");
+  cub_temp_bytes_ = bytes;
   scratch_count_ = count;
 }
 
 void TcnLabeledPointcloudOp::compute(holoscan::InputContext& op_input,
                                      holoscan::OutputContext& op_output,
                                      holoscan::ExecutionContext& context) {
+  // Everything below -- the scratch allocations, the CUB calls and the kernels -- must run against
+  // the configured device, not whatever this worker thread happened to have current.
+  ScopedDevice device_guard(cuda_device_ordinal_.get());
+
   auto maybe_positions = op_input.receive<holoscan::gxf::Entity>("positions");
   if (!maybe_positions) {
     throw std::runtime_error("TcnLabeledPointcloudOp: failed to read the 'positions' input");
@@ -189,22 +260,44 @@ void TcnLabeledPointcloudOp::compute(holoscan::InputContext& op_input,
       nvidia::gxf::Handle<nvidia::gxf::Allocator>::Create(context.context(), allocator_->gxf_cid());
   auto gxf_context = context.context();
 
-  std::string counts;
-  for (const auto& cls : configured_classes_) {
-    launch_select_class(labels_d, label_count, static_cast<int>(cls), selected_d_, cuda_stream);
+  const int64_t k_classes = static_cast<int64_t>(configured_classes_.size());
 
-    // Stable stream compaction: copy_if over ascending indices preserves source order, so the point
-    // order is a function of the input alone. An atomic append would be faster and would reorder
-    // points run to run, which would make any byte-comparison gate useless.
-    auto policy = thrust::cuda::par.on(cuda_stream);
-    auto end = thrust::copy_if(policy,
-                               thrust::counting_iterator<int32_t>(0),
-                               thrust::counting_iterator<int32_t>(
-                                   static_cast<int32_t>(label_count)),
-                               selected_d_,
-                               indices_d_,
-                               [] __device__(uint8_t flag) { return flag != 0; });
-    const int64_t n = static_cast<int64_t>(end - indices_d_);   // synchronises on `cuda_stream`
+  // --- issue phase: select and compact every class with the stream still running ----------------
+  // cub::DeviceSelect::Flagged writes its result count to DEVICE memory, which is the whole point:
+  // thrust::copy_if returns a host-side iterator, and reading it forces a synchronise per class.
+  // It is also stable, so the compacted order is the source order and the output stays reproducible.
+  for (int64_t k = 0; k < k_classes; ++k) {
+    const auto cls = configured_classes_[static_cast<std::size_t>(k)];
+    launch_select_class(labels_d, label_count, static_cast<int>(cls), selected_d_, cuda_stream);
+    auto status = cub::DeviceSelect::Flagged(
+        cub_temp_d_, cub_temp_bytes_, thrust::counting_iterator<int32_t>(0), selected_d_,
+        indices_d_ + k * label_count, counts_d_ + k, static_cast<int>(label_count), cuda_stream);
+    if (status != cudaSuccess) {
+      int current = -1;
+      cudaGetDevice(&current);
+      throw std::runtime_error(
+          std::string("TcnLabeledPointcloudOp: cub::DeviceSelect::Flagged failed: ") +
+          cudaGetErrorString(status) + " (configured device " +
+          std::to_string(cuda_device_ordinal_.get()) + ", current device " +
+          std::to_string(current) + ", " + std::to_string(label_count) + " items)");
+    }
+  }
+
+  // The ONE synchronisation. The counts have to reach the host because each output tensor is sized
+  // to its point count before it can be allocated; what this avoids is paying for that round trip
+  // once per class.
+  HOLOSCAN_CUDA_CALL_THROW_ERROR(
+      cudaMemcpyAsync(counts_h_, counts_d_, k_classes * sizeof(int32_t), cudaMemcpyDeviceToHost,
+                      cuda_stream),
+      "TcnLabeledPointcloudOp: failed to copy the per-class counts back");
+  HOLOSCAN_CUDA_CALL_THROW_ERROR(cudaStreamSynchronize(cuda_stream),
+                                 "TcnLabeledPointcloudOp: failed to wait for the per-class counts");
+
+  // --- emit phase: allocate to the now-known sizes and gather ------------------------------------
+  std::string counts;
+  for (int64_t k = 0; k < k_classes; ++k) {
+    const auto cls = configured_classes_[static_cast<std::size_t>(k)];
+    const int64_t n = static_cast<int64_t>(counts_h_[k]);
 
     // An empty class still emits, because a downstream merger needs every input every frame; the
     // single point it emits is NaN, which the rasteriser culls (see the kernel).
@@ -233,7 +326,7 @@ void TcnLabeledPointcloudOp::compute(holoscan::InputContext& op_input,
     }
 
     if (n > 0) {
-      launch_gather_points(positions_d, labels_d, indices_d_, n,
+      launch_gather_points(positions_d, labels_d, indices_d_ + k * label_count, n,
                            out_positions->data<float>().value(),
                            out_labels->data<uint16_t>().value(), cuda_stream);
     } else {

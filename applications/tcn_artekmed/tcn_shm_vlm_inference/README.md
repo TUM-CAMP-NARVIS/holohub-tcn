@@ -146,11 +146,25 @@ about 6%. Per camera per frame:
 | fusion (5 mergers, once per frame) | ~25 ms total |
 | point-cloud Holoviz | 68.8 ms/tick, asynchronous |
 
-`tcn_labeled_pointcloud` is 87% of the per-camera cost, and 32% of its time is measured inside
-`cudaStreamSynchronize`: it runs one `thrust::copy_if` per class and each one ends with a host-side
-count, so a 5-class configuration synchronises five times per camera per frame. Computing all class
-counts in one pass — one kernel, one device-to-host copy of K counts, then per-class scatter — would
-cut that to one sync. Not done yet.
+`tcn_labeled_pointcloud` is 87% of the per-camera cost, and 32% of its time was measured inside
+`cudaStreamSynchronize`.
+
+That has since been reduced from K synchronisations per camera per frame to exactly one:
+`cub::DeviceSelect::Flagged` writes its result count to *device* memory, so every class can be
+selected and compacted with the stream still running, and a single copy brings all K counts back.
+(The previous `thrust::copy_if` returns a host-side iterator, and reading it forces a synchronise per
+class.) CUB's variant is also stable, so the point order — and therefore the output — is unchanged.
+
+Measured in isolation on an idle GPU at the live grid size (576×640, 5 classes, 16.5% labeled,
+3 × 1000 ticks, `tests/bench_labeled_pointcloud.py`): median **0.703 → 0.600 ms/tick (−15%)**, mean
+−19%, p90 −22%, with non-overlapping run-to-run ranges.
+
+Note what that comparison does *not* say. In isolation this operator costs well under 1 ms, against
+24.7 ms in the live trace — so the live figure is overwhelmingly the synchronisation absorbing
+queued GPU work from the rest of the pipeline, not this operator's own arithmetic. Cutting five
+blocking points to one removes four opportunities per camera per frame to stall on unrelated work,
+which is why it should help live, but the live gain has not been re-traced and is not the 15%
+measured here.
 
 ## Development
 
