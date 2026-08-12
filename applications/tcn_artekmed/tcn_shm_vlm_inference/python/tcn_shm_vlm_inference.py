@@ -19,6 +19,7 @@ from holohub.tcn_device_context._tcn_device_context import DeviceContextService
 from holohub.tcn_shm_subscriber._tcn_shm_subscriber import discover_shm
 from holohub.tcn_stream_splitter import TcnStreamSplitterOp as StreamSplitterOp
 from holohub.tcn_convert_bgra_to_rgba import TcnConvertBgraToRgbaOp as ConvertBgraToRgbaOp
+from holohub.tcn_stream_synchronizer import TcnStreamSynchronizerOp
 
 from operators.tcn_artekmed.tcn_util import RotateImage180Op
 from operators.tcn_artekmed.tcn_dataset_replayer import TcnDatasetReplayerOp
@@ -166,6 +167,50 @@ class DepthColormapOp(Operator):
         a = cp.where(valid, 255, 0).astype(cp.uint8)[..., None]
         rgba = cp.concatenate([rgb, a], axis=-1)         # [H,W,4] uint8, RGBA
         op_output.emit({"image": rgba, "display_text": msg.get("display_text")}, "out")
+
+
+class GroupCheckOp(Operator):
+    """Verifies that a synchronised group really shares one acquisition timestamp.
+
+    Stands in for the eventual mask/depth consumer. `tcn_depthimage_apply_mask` cannot be wired
+    here yet -- it wants a single UNNAMED uint8 mask with the SAME element count as the depth image,
+    while the panoptic map is a per-camera NAMED uint16 tensor at colour resolution (2048x1536 vs
+    the depth stream's 640x576). Resizing across that gap is not registration: the colour and depth
+    sensors have different intrinsics, so a naive resize would run and look plausible while being
+    spatially wrong. The correct join is backprojection's `texcoords` fed to a texture sampler,
+    which is what registers depth pixels into colour space -- tracked as the next step.
+    """
+
+    def __init__(self, fragment, *args, streams, **kwargs):
+        self.streams = list(streams)
+        self.groups = 0
+        self.inconsistent = 0
+        super().__init__(fragment, *args, **kwargs)
+
+    def setup(self, spec: OperatorSpec):
+        for name in self.streams:
+            spec.input(name)
+
+    def compute(self, op_input, op_output, context):
+        stamps = {}
+        for name in self.streams:
+            op_input.receive(name)
+            stamps[name] = op_input.get_acquisition_timestamp(name)
+        self.groups += 1
+        distinct = {t for t in stamps.values() if t is not None}
+        if len(distinct) > 1:
+            self.inconsistent += 1
+            log.error(f"GroupCheckOp: group {self.groups} is NOT timestamp-consistent: {stamps}")
+        elif self.groups <= 3 or self.groups % 50 == 0:
+            log.info(f"GroupCheckOp: group {self.groups} consistent at "
+                     f"acq={next(iter(distinct)) if distinct else None} ({len(stamps)} streams)")
+
+    def stop(self):
+        # Per-group logging is rate-limited, so without this the verdict of a long run is invisible:
+        # "no error lines" and "the operator never ticked" look identical in the console.
+        verdict = "FAIL" if self.inconsistent else ("PASS" if self.groups else "NO GROUPS")
+        log.info(f"GroupCheckOp: {verdict} -- {self.groups} groups, "
+                 f"{self.inconsistent} timestamp-inconsistent")
 
 
 class DummySinkOp(Operator):
@@ -394,8 +439,46 @@ class App(hs.core.Application):
                                     name="stream_splitter")
         self.add_flow(frame_source_op, split_op, {("color_outputs", "receivers")})
 
-        di_sink = DummySinkOp(self, name="depth_image_sink")
-        self.add_flow(frame_source_op, di_sink, {("depth_outputs", "input")})
+        # Temporal synchronisation of the mask and depth streams
+        # (docs/specs/2026-08-11-temporal-sync-design.md). Off by default: `temporal_sync.enabled`.
+        #
+        # The mask path runs ~5 fps and about two frames behind the source while depth is
+        # independent and faster, so pairing "whatever depth is current" with a mask mis-registers
+        # it by a varying amount. The synchroniser buffers both and emits only groups that share an
+        # acquisition timestamp.
+        #
+        # NOTE the streams are wired but the CONSUMER is GroupCheckOp, not
+        # tcn_depthimage_apply_mask -- see GroupCheckOp's docstring for why that operator cannot
+        # consume a colour-resolution packed panoptic map, and what the correct join is.
+        sync_cfg = self.kwargs("temporal_sync") or {}
+        sync_enabled = bool(sync_cfg.get("enabled", False)) and \
+            camera_streams_config.get("enable_langsam_multicam", False)
+        temporal_sync = None
+        if sync_enabled:
+            # `streams` MUST be a constructor argument: the operator creates its ports in setup(),
+            # which Holoscan runs before parameter values are applied, so this cannot come from
+            # from_config() like the other settings.
+            sync_streams = ["masks", "depth"]
+            temporal_sync = TcnStreamSynchronizerOp(
+                self,
+                streams=sync_streams,
+                capacities=[int(sync_cfg.get("masks_capacity", 4)),
+                            int(sync_cfg.get("depth_capacity", 16))],
+                reference_stream="masks",      # the laggiest stream must drive the search
+                match_policy=str(sync_cfg.get("match_policy", "exact")),
+                window_ns=int(sync_cfg.get("window_ns", 0)),
+                verbose=bool(sync_cfg.get("verbose", False)),
+                name="temporal_sync",
+            )
+            group_check = GroupCheckOp(self, streams=sync_streams, name="group_check")
+            self.add_flow(frame_source_op, temporal_sync, {("depth_outputs", "depth")})
+            for name in sync_streams:
+                self.add_flow(temporal_sync, group_check, {(name, name)})
+            log.info(f"Temporal sync ENABLED: streams={sync_streams} "
+                     f"policy={sync_cfg.get('match_policy', 'exact')}")
+        else:
+            di_sink = DummySinkOp(self, name="depth_image_sink")
+            self.add_flow(frame_source_op, di_sink, {("depth_outputs", "input")})
 
 
         config_rotate_image = False
@@ -538,6 +621,13 @@ class App(hs.core.Application):
                 )
                 self.add_flow(langsam_mc, mask_dump_op, {("output_masks", "masks")})
                 log.info(f"Mask dump enabled: writing to {mask_dump_dir!r}")
+
+            # The mask half of the temporal-sync join. The depth half and the operator itself were
+            # created earlier (the depth branch), because the source exists by then; langsam_mc only
+            # exists here. Both halves must be wired or the synchroniser starves on a required
+            # stream -- which it reports, but the fix is this edge.
+            if temporal_sync is not None:
+                self.add_flow(langsam_mc, temporal_sync, {("output_masks", "masks")})
 
         if not have_camera_consumer:
             cs_sink = DummySinkOp(self, name="camera_stream_sink")

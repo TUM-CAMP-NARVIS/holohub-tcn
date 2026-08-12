@@ -34,6 +34,13 @@ namespace tcn::ops {
  * `emit(..., acq_timestamp=...)`. A stream whose messages carry no timestamp cannot be grouped, and
  * this operator says so loudly rather than guessing.
  *
+ * Replay caveat: timestamps must advance for a buffer to accept them. A looping replay source
+ * restarts at its first frame, whose timestamp is older than what has already been seen, so the
+ * second and later passes are rejected as non-monotonic and reported in the `non-monotonic` counter.
+ * A looping harness run therefore synchronises exactly one pass -- which is correct behaviour, not a
+ * bug: two frames with the same timestamp cannot both be the same frame. To sync a longer run,
+ * either replay without looping or have the source offset each loop's timestamps.
+ *
  * Rule: of all complete groups currently buffered, publish the OLDEST, then discard everything
  * strictly older than it in every buffer. Discarding relative to the published group -- rather than
  * to each stream's own head -- is what stops the lagging mask stream from having its future partners

@@ -21,7 +21,7 @@ from holoscan.operators import HolovizOp
 from langsam_common import (
     SAM, GDINO, GDinoTrtDetector, resolve_workers, worker_batch, worker_engine_path,
     class_id_map, build_panoptic_map, build_panoptic_map_auto, build_panoptic_lut,
-    acq_timestamp, acq_timestamp_consensus,
+    acq_timestamp, acq_timestamp_consensus, tensor_names,
 )
 # Shared with langsam_pipelined.py so the output-key convention can't drift between the
 # monolithic and split ops; imported directly (not via langsam_common's re-export list).
@@ -219,7 +219,7 @@ class MaskCollectorOp(Operator):
             for msg in messages:
                 if msg is None:
                     continue
-                for name in list(msg.keys()):
+                for name in tensor_names(msg):
                     arr = cp.asarray(msg.get(name))
                     if arr.device.id != 0:            # cross-GPU -> consolidate on GPU 0
                         t = torch.from_dlpack(arr).to("cuda:0")
@@ -245,7 +245,7 @@ class LabelMapColorizeOp(Operator):
     def compute(self, op_input, op_output, context):
         msg = op_input.receive("masks")
         acq = acq_timestamp(op_input, "masks")
-        names = sorted(msg.keys())
+        names = tensor_names(msg)
         out = {}
         with cp.cuda.Device(0):
             for name in names:

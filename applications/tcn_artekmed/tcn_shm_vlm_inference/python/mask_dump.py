@@ -24,6 +24,8 @@ import cupy as cp
 import numpy as np
 from holoscan.core import Operator, OperatorSpec
 
+from langsam_common import tensor_names
+
 log = logging.getLogger("MaskDumpOp")
 
 _MASK_SUFFIX = "_mask"
@@ -101,7 +103,7 @@ class MaskDumpOp(Operator):
                 mf.write(f"{frame_number}\t{src}\t"
                          f"{getattr(self.frame_source, 'loop_count', '')}\n")
 
-        for name in sorted(msg.keys()):
+        for name in tensor_names(msg):
             camera_id = name[: -len(_MASK_SUFFIX)] if name.endswith(_MASK_SUFFIX) else name
             tensor = msg.get(name)
             arr = cp.asnumpy(cp.asarray(tensor))  # preserve dtype exactly: packed uint16 ids

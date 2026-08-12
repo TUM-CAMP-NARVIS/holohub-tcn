@@ -34,6 +34,29 @@ dataset_source:
 mask_dump_dir: ""
 #mask_dump_dir: "/srv/tmp/harness/bd_on"
 
+# ---------------------------------------------------------------------------
+# Temporal synchronisation of the mask and depth streams
+# (docs/specs/2026-08-11-temporal-sync-design.md). Requires
+# camera_stream_processing.enable_langsam_multicam: true.
+#
+# The mask path runs ~5 fps and about two frames behind the source while depth is independent and
+# faster, so pairing a mask with "whatever depth is current" mis-registers it by a varying amount.
+# When enabled, only groups sharing one acquisition timestamp are emitted.
+#
+# Capacities are PER STREAM on purpose: each must exceed that stream's worst-case skew relative to
+# the slowest stream, so the fast stream (depth) needs several times more slots than the slow one.
+# Size depth_capacity from the real depth cadence once DA2/DA3 are enabled -- 16 is a placeholder.
+#
+# `match_policy: exact` is correct while every camera arrives through ONE shared-memory segment:
+# the subscriber stamps one acquisition time per composite buffer and all cameras share it.
+temporal_sync:
+  enabled: false
+  masks_capacity: 4
+  depth_capacity: 16
+  match_policy: "exact"     # exact | window
+  window_ns: 0              # only used by 'window'
+  verbose: false
+
 shared_memory:
   stream_name: "camera_streams"
   parameter_rpc_name: "tcn_shm_receiver"

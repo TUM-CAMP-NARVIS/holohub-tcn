@@ -225,6 +225,27 @@ def acq_timestamp_consensus(op_input, port, log=None):
     return min(vals)
 
 
+#: Entity components that a received tensor-map exposes as keys but which are NOT tensors.
+#: Attaching an acquisition timestamp adds a `nvidia::gxf::Timestamp` component named "timestamp"
+#: to the entity, and Holoscan's entity -> dict conversion enumerates ALL components, not just the
+#: tensors. The extra key's value is None, so any consumer looping over `msg.keys()` and converting
+#: blindly dies with a bewildering `ValueError: Unsupported dtype object`. Filter with
+#: `tensor_names()` instead of iterating keys directly.
+NON_TENSOR_COMPONENTS = frozenset({"timestamp"})
+
+
+def tensor_names(msg):
+    """Sorted tensor names in a received message, excluding non-tensor entity components.
+
+    Use this anywhere the set of tensors is discovered from the message rather than known up front
+    (a fixed `msg.get(camera_name)` needs no filtering).
+    """
+    if not msg:
+        return []
+    return sorted(k for k in msg.keys()
+                  if k not in NON_TENSOR_COMPONENTS and msg.get(k) is not None)
+
+
 class SAM:
 
     def __init__(self, sam_type: str, ckpt_path: str | None = None, device: torch.device | None = None, compile_model: bool = False,
