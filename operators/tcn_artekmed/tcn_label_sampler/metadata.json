@@ -1,0 +1,39 @@
+{
+  "operator": {
+    "name": "TcnLabelSamplerOp",
+    "description": "Samples a packed panoptic label map through per-depth-pixel texcoords (nearest neighbour), producing per-depth-pixel labels and a binary class mask on the depth grid.",
+    "authors": [
+      {
+        "name": "Ulrich Eck",
+        "affiliation": "TUM-CAMP-NARVIS"
+      }
+    ],
+    "language": [
+      "C++",
+      "Python"
+    ],
+    "version": "1.0.0",
+    "changelog": {
+      "1.0": "Initial Release"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "3.3.0",
+      "tested_versions": [
+        "3.3.0"
+      ]
+    },
+    "platforms": [
+      "x86_64",
+      "aarch64"
+    ],
+    "tags": [
+      "Streaming",
+      "Pointcloud Processing",
+      "Segmentation"
+    ],
+    "ranking": 2,
+    "requirements": {
+      "packages": []
+    }
+  }
+}

@@ -35,4 +35,8 @@ target_link_libraries(tcn_shm_vlm_inference INTERFACE
     # falls back to cupy with a warning if it is absent, so a missing entry here degrades
     # silently to the slow path rather than failing.
     holoscan::ops::tcn_panoptic_map
+    holoscan::ops::tcn_stream_synchronizer
+    holoscan::ops::tcn_depthimage_backprojection
+    holoscan::ops::tcn_label_sampler
+    holoscan::ops::tcn_depthimage_apply_mask
 )

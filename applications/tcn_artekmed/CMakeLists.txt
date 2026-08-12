@@ -78,6 +78,16 @@ add_holohub_application(tcn_shm_vlm_inference DEPENDS OPERATORS
         # NOT sufficient -- that is a link-time relationship resolved after configure, so the
         # subdirectory is never added and the module silently is not built.
         tcn_panoptic_map
+        # Temporal frame grouping (docs/specs/2026-08-11-temporal-sync-design.md). Was missing:
+        # the app imported it and worked only because OP_tcn_stream_synchronizer happened to be ON
+        # in an existing build cache, which a fresh configure would not reproduce.
+        tcn_stream_synchronizer
+        # Mask/depth join (docs/specs/2026-08-12-mask-depth-join-design.md): backprojection
+        # supplies the per-depth-pixel texcoords, the label sampler reads the panoptic map through
+        # them, and apply_mask consumes the depth-grid mask that falls out.
+        tcn_depthimage_backprojection
+        tcn_label_sampler
+        tcn_depthimage_apply_mask
 )
 
 add_holohub_application(tcn_operator_tests DEPENDS OPERATORS
