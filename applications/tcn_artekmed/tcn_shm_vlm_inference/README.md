@@ -159,12 +159,27 @@ Measured in isolation on an idle GPU at the live grid size (576×640, 5 classes,
 3 × 1000 ticks, `tests/bench_labeled_pointcloud.py`): median **0.703 → 0.600 ms/tick (−15%)**, mean
 −19%, p90 −22%, with non-overlapping run-to-run ranges.
 
-Note what that comparison does *not* say. In isolation this operator costs well under 1 ms, against
-24.7 ms in the live trace — so the live figure is overwhelmingly the synchronisation absorbing
-queued GPU work from the rest of the pipeline, not this operator's own arithmetic. Cutting five
-blocking points to one removes four opportunities per camera per frame to stall on unrelated work,
-which is why it should help live, but the live gain has not been re-traced and is not the 15%
-measured here.
+Re-traced live (5 cameras, 522 frames, 2026-08-12): the operator's median went **12.29 → 5.24 ms**
+(trimmed mean 24.70 → 9.75, p90 36.14 → 11.89), consistently across all five cameras, and its
+`Synchronize` calls per tick went **10.00 → 1.00** — `thrust::copy_if` was costing two blocking calls
+per class, not one.
+
+**It bought no throughput.** The period went 209.8 → 211.8 ms (4.77 → 4.72 fps) and dev1 utilisation
+75.1% → 74.9% — flat, marginally worse, inside run-to-run variation. The freed time reappeared
+elsewhere in the same run (`shm_subscriber` median 14.94 → 21.37 ms, the mask collector 15.01 →
+20.12 ms) while gdino/sam each got slightly faster.
+
+The reason is structural: these five operators run concurrently on 24 worker threads and were never
+on the critical path. Their 25 ms was spent blocked on the GPU queue *in parallel with* the real
+bottleneck, GDINO/SAM on dev1. Freeing it releases worker threads that then contend with everything
+else, so latency redistributes instead of disappearing — and the one remaining sync still absorbs 61%
+of the operator's now-much-shorter wall time, i.e. it is still waiting on queued work rather than its
+own.
+
+Worth keeping anyway, for what it does buy: 45 fewer blocking sync points per frame, ~75 ms/frame of
+worker-thread occupancy freed, and a 3× tighter tail on this operator — headroom for more cameras or
+classes. Not fps. **A duration measured inside a blocking call is queue depth, not the callee's
+cost**, and an operator off the critical path can be made nearly free without moving the period.
 
 ## Development
 

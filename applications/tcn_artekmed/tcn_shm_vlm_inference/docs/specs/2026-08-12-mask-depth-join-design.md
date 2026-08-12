@@ -227,12 +227,27 @@ Measured in isolation on an idle GPU at the live grid size (576×640, 5 classes,
 3 × 1000 ticks): median **0.703 → 0.600 ms/tick (−15%)**, mean −19%, p90 −22%, ranges
 non-overlapping.
 
-**What that measurement does not show.** In isolation the operator costs under 1 ms against 24.7 ms
-in the live trace, so the live figure is overwhelmingly the synchronisation absorbing queued GPU work
-from the rest of the pipeline rather than this operator's own arithmetic. The earlier estimate of
-"~6 ms/camera recoverable", extrapolated from the 32%-in-sync figure, was wrong for that reason.
-Going from five blocking points to one removes four chances per camera per frame to stall on
-unrelated queued work, which is the real mechanism, but the live gain needs a new trace to state.
+**Re-traced live, and it bought no throughput.** 5 cameras, 522 frames: the operator's median went
+12.29 → 5.24 ms (trimmed mean 24.70 → 9.75, p90 36.14 → 11.89) across all five cameras, and its
+`Synchronize` calls per tick went 10.00 → 1.00 (`thrust::copy_if` cost two blocking calls per class,
+not one). The period, however, went 209.8 → 211.8 ms (4.77 → 4.72 fps) with dev1 utilisation
+75.1 → 74.9% — flat within run-to-run variation, and the freed time reappeared in other operators
+(`shm_subscriber` median 14.94 → 21.37 ms, the mask collector 15.01 → 20.12 ms).
+
+The five cloud operators run concurrently on 24 worker threads and were never on the critical path:
+their 25 ms was spent blocked on the GPU queue *in parallel with* the real bottleneck, GDINO/SAM on
+dev1. Freeing it releases worker threads that then contend with everything else, so latency
+redistributes rather than disappears — and the single remaining sync still absorbs 61% of the
+operator's now-much-shorter wall time, so it is still waiting on queued work.
+
+Kept regardless: 45 fewer blocking sync points per frame, ~75 ms/frame of worker-thread occupancy
+freed, and a 3× tighter tail on this operator. That is headroom for more cameras or classes, not fps.
+
+**The transferable lesson**, and the second time it has bitten this pipeline (see the pipelining
+retraction and the CUDA-graph re-gate): a duration measured *inside a blocking call* is queue depth,
+not the callee's cost, and an operator off the critical path can be optimised to nearly free without
+moving the period. Gate such work on whether the operator is on the critical path, not on how much
+time it appears to spend.
 
 **Also found while benchmarking:** allocations were made on whatever device the calling worker thread
 had current. `start()` retains the primary context for `cuda_device_ordinal` but that does not make
