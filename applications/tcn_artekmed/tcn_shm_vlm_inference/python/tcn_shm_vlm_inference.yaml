@@ -123,7 +123,7 @@ object_tracking:
   # noise makes the box spin frame to frame. Below it the yaw is 0 and the oriented box degenerates to
   # the axis-aligned one, which is why a person's box looks unrotated while a bed's does not.
   min_anisotropy: 1.5
-  render_oriented_boxes: true
+  render_oriented_boxes: false
   # How far the yaw may swing and still have the oriented box smoothed like the axis-aligned one. Its
   # extents are measured IN the yaw frame, so past a real re-orientation the old ones mean something
   # else and blending them would report a box that fits nothing. 0.26 rad = 15 deg.
@@ -137,7 +137,7 @@ object_tracking:
   fusion_containment: 0.6         # one view is a subset of the other (torso vs whole person)
   fusion_footprint_iou: 0.4       # same ground footprint...
   fusion_max_vertical_gap_m: 0.5  # ...and vertically adjacent: a mask split by an occluder
-  fusion_max_distance_m: 1.0      # stops single-linkage chaining across a room
+  fusion_max_distance_m: 0.5      # stops single-linkage chaining across a room
   # --- rejecting non-objects and aggregates (this is what controls object COUNT) ---
   # A box must be at least this large on EVERY axis. Removes the flat slivers a mask fringe produces
   # (extents like 0.27 x 0.33 x 0.03 m), which no volume or overlap rule catches.
@@ -155,7 +155,7 @@ object_tracking:
   # An object only ONE camera ever saw is usually mask fringe or a partial detection nothing else
   # confirms. 2 removes those outright; the cost is that an object at the edge of the room, genuinely
   # visible to one camera only, disappears. Keep 1 where coverage does not overlap.
-  min_cameras: 1
+  min_cameras: 2
   # Applied to the FUSED object, so several small partial views that together make a plausible object
   # survive where each alone would not. THIS is the effective lever on object count for this data:
   # measured on the 4-camera replay (8 frames), everything else at these defaults --
