@@ -24,7 +24,7 @@ TCN_ALL_MOUNT_TEST_DATA="${TCN_ALL_MOUNT_TEST_DATA:-1}"
 TCN_ALL_TEST_DATA_HOST="${TCN_ALL_TEST_DATA_HOST:-/home/ecku/develop/artekmed/artekmed_test_data}"
 TCN_ALL_MOUNT_ZENOH_CONFIG="${TCN_ALL_MOUNT_ZENOH_CONFIG:-1}"
 TCN_ALL_ZENOH_CONFIG_HOST="${TCN_ALL_ZENOH_CONFIG_HOST:-/home/ecku/develop/holoscan/zenoh_config}"
-TCN_ALL_BASE_IMAGE="${TCN_ALL_BASE_IMAGE:-holoscan-trt11:4.4.0-cu12}"
+TCN_ALL_BASE_IMAGE="${TCN_ALL_BASE_IMAGE:-holoscan-trt11:4.4.0-cu13}"
 
 is_enabled() {
     case "${1,,}" in
@@ -83,4 +83,4 @@ fi
     --docker-opts="${DOCKER_OPTS}" \
     "${ADD_VOLUME_ARGS[@]}" \
     --base-img "${TCN_ALL_BASE_IMAGE}" \
-    tcn_shm_receiver
+    tcn_all

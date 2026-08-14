@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.4
+
 # Holoscan 4.4.0 rebuilt against TensorRT 11, packaged as a base image for HoloHub.
 #
 # WHY THIS EXISTS: the SDK's own `./run build_run_image` is broken at v4.4.0 -- it invokes
@@ -29,7 +31,8 @@ USER root
 
 ARG TRT_VERSION=11.2.1.2
 ARG TRT_CUDA_TAG=cuda13.3
-ARG HOST_INSTALL_DIR=install-cu12-x86_64
+ARG HOST_INSTALL_DIR=install-cu13-x86_64
+ARG TRT_PIP_PKG=tensorrt-cu13
 
 # TensorRT 11 runtime + dev. dev headers are kept because engines are built INSIDE this
 # container (gdino_trt_export.py --stage build), not just executed.
@@ -43,8 +46,13 @@ ARG HOST_INSTALL_DIR=install-cu12-x86_64
 # coexist; and holoinfer -- the only library in the image that links TensorRT -- is replaced
 # below by a build that needs .so.11. Removing 10 would risk breaking transitive dependencies
 # for no benefit.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+# Keep the package install, SDK overlay, and validation in one RUN layer. The bind mount is
+# BuildKit-only by design: it makes the SDK install tree available without creating a standalone
+# COPY layer in the resulting image.
+RUN --mount=type=bind,source=${HOST_INSTALL_DIR},target=/tmp/holoscan-install,readonly \
+    set -e; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
         libnvinfer11="${TRT_VERSION}-1+${TRT_CUDA_TAG}" \
         libnvinfer-plugin11="${TRT_VERSION}-1+${TRT_CUDA_TAG}" \
         libnvonnxparsers11="${TRT_VERSION}-1+${TRT_CUDA_TAG}" \
@@ -53,31 +61,13 @@ RUN apt-get update \
         libnvinfer-plugin-dev="${TRT_VERSION}-1+${TRT_CUDA_TAG}" \
         libnvinfer-headers-plugin-dev="${TRT_VERSION}-1+${TRT_CUDA_TAG}" \
         libnvonnxparsers-dev="${TRT_VERSION}-1+${TRT_CUDA_TAG}" \
-        libnvinfer-safe-headers-dev="${TRT_VERSION}-1+${TRT_CUDA_TAG}" \
-    && rm -rf /var/lib/apt/lists/*
-
-# The Python bindings are used DIRECTLY by our GDINO and SAM paths (they call `import tensorrt`
-# rather than going through holoinfer), so they must move in lockstep with the C++ libraries --
-# otherwise engines would be built by one major and loaded by another, which fails with
-# "Serialization assertion stdVersionRead == kSERIALIZATION_VERSION".
-#
-# Install tensorrt-cu12, NOT the bare `tensorrt` meta-package. `pip install tensorrt==11.2.1.2`
-# resolves to tensorrt_cu13 -- the CUDA 13 variant -- inside this CUDA 12 image. Observed
-# 2026-08-10: it uninstalled tensorrt 10.9, spent minutes building a 3.8 GB tensorrt_cu13_libs
-# wheel, and left NO importable `tensorrt` module at all (only dist-info), so the image was
-# broken in a way that a laxer verification step would have shipped.
-ARG TRT_PIP_PKG=tensorrt-cu12
-RUN python3 -m pip install --no-cache-dir --break-system-packages \
+        libnvinfer-safe-headers-dev="${TRT_VERSION}-1+${TRT_CUDA_TAG}"; \
+    rm -rf /var/lib/apt/lists/*; \
+    python3 -m pip install --no-cache-dir --break-system-packages \
         "${TRT_PIP_PKG}==${TRT_VERSION}" \
-    || python3 -m pip install --no-cache-dir "${TRT_PIP_PKG}==${TRT_VERSION}"
-
-# Holoscan itself, rebuilt against TRT 11 (this is what makes libholoscan_infer need .so.11).
-COPY ${HOST_INSTALL_DIR}/ /opt/nvidia/holoscan/
-
-# Fail the BUILD, not a later run, if the overlay did not actually take effect. A stale layer
-# or a wrong HOST_INSTALL_DIR would otherwise produce an image that looks fine and silently
-# still uses TensorRT 10.
-RUN set -e; \
+    || python3 -m pip install --no-cache-dir "${TRT_PIP_PKG}==${TRT_VERSION}"; \
+    cp -a /tmp/holoscan-install/. /opt/nvidia/holoscan/; \
+    set -e; \
     echo "python tensorrt: $(python3 -c 'import tensorrt as t; print(t.__version__)')"; \
     need=$(objdump -p /opt/nvidia/holoscan/lib/libholoscan_infer.so.4.4.0 \
            | grep -oE 'libnvinfer[a-z_]*\.so\.[0-9]+' | sort -u | tr '\n' ' '); \
