@@ -32,23 +32,22 @@ ARG DEBIAN_FRONTEND=noninteractive
 #
 RUN mkdir -p /tmp/scripts
 COPY holohub /tmp/scripts/
-RUN mkdir -p /tmp/scripts/utilities
 COPY utilities /tmp/scripts/utilities/
-RUN chmod +x /tmp/scripts/holohub
-RUN /tmp/scripts/holohub setup && rm -rf /var/lib/apt/lists/*
-
-# Enable autocomplete
-RUN echo ". /etc/bash_completion.d/holohub_autocomplete" >> /etc/bash.bashrc
+# Copy over app-specific requirements
+COPY applications/tcn_artekmed/requirements.txt /tmp/requirements.txt
+COPY applications/tcn_artekmed/install_dependencies.sh /tmp/install.sh
 
 # - This variable is consumed by all dependencies below as an environment variable (CMake 3.22+)
 # - We use ARG to only set it at docker build time, so it does not affect cmake builds
 #   performed at docker run time in case users want to use a different BUILD_TYPE
 ARG CMAKE_BUILD_TYPE=Release
 
-# Copy over app-specific requirements
-COPY applications/tcn_artekmed/requirements.txt /tmp/requirements.txt
-COPY applications/tcn_artekmed/install_dependencies.sh /tmp/install.sh
-RUN mkdir -p /tmp/dependencies && \
+
+RUN mkdir -p /tmp/scripts/utilities && \
+    chmod +x /tmp/scripts/holohub && \
+    /tmp/scripts/holohub setup && rm -rf /var/lib/apt/lists/* && \
+    echo ". /etc/bash_completion.d/holohub_autocomplete" >> /etc/bash.bashrc && \
+    mkdir -p /tmp/dependencies && \
     chmod +x /tmp/install.sh && \
     /tmp/install.sh
 

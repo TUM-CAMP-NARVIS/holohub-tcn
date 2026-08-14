@@ -83,7 +83,7 @@ RUN --mount=type=bind,source=${HOST_INSTALL_DIR},target=/tmp/holoscan-install,re
     python3 -c "import importlib.metadata as m; \
       d=[x for x in m.distributions() if (x.metadata['Name'] or '').startswith('tensorrt')]; \
       names=sorted((x.metadata['Name'] or '') for x in d); print('tensorrt dists:', names); \
-      assert not any('cu13' in n for n in names), f'CUDA 13 TensorRT in a CUDA 12 image: {names}'"
+      assert not any('cu12' in n for n in names), f'CUDA 12 TensorRT in a CUDA 13 image: {names}'"
 
 # Stay root. This image is consumed as BASE_IMAGE by HoloHub's own Dockerfile, which runs
 # `chmod +x`, apt and its setup script during build and only drops to a non-root user at the very
