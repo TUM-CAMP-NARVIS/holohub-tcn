@@ -56,7 +56,7 @@ Reference config and the export tooling live in the example application
 | what | where |
 |---|---|
 | reference config | `python/tcn_shm_vlm_inference.yaml` → `da2_inference_config`, `da3_inference_config`, `da2_preprocessor`, `da3_inference` |
-| DA3 export tool | `docs/da3_export.py` + [`docs/da3_onnx_export.md`](../../../applications/tcn_artekmed/tcn_shm_vlm_inference/docs/da3_onnx_export.md) |
+| DA3 export tool | `docs/da3_export.py` + [`docs/da3_onnx_export.md`](../../../applications/tcn_artekmed/tcn_all/docs/da3_onnx_export.md) |
 | enabling the paths | `camera_stream_processing.enable_da2` / `enable_da3` (both **off** by default) |
 
 ### The layout requirement, and why a wrong export looks right

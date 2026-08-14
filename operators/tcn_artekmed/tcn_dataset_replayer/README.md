@@ -56,7 +56,7 @@ pipeline needs.
 
 Reference application: `applications/tcn_artekmed/tcn_shm_vlm_inference` with `source: "dataset"`,
 which is also where the deterministic correctness gates are documented
-([`docs/development-loop.md`](../../../applications/tcn_artekmed/tcn_shm_vlm_inference/docs/development-loop.md)).
+([`docs/development-loop.md`](../../../applications/tcn_artekmed/tcn_all/docs/development-loop.md)).
 
 ## The BGR note (read this before changing channel_order)
 

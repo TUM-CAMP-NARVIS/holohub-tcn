@@ -14,7 +14,7 @@
 
 - **No pytest.** Tests in `python/tests/` are plain scripts with a `__main__` runner that prints `PASS`/`FAIL` and exits non-zero. Run them with `python3 tests/test_<name>.py` from `applications/tcn_artekmed/tcn_shm_vlm_inference/python`.
 - **Host tests must be numpy-only** — no torch, cupy, holoscan, or tensorrt imports — so they run on the host without the container. `langsam_helpers.py` is the numpy-only module that exists for exactly this reason; put pure logic there.
-- **Container work** runs inside the holohub `tcn_shm_receiver` container: repo at `/workspace/holohub`, models at `/srv/models/active/groundingdino` (host `/data/models/active/groundingdino`). Start it with `./run_tcn_shm_receiver.sh`.
+- **Container work** runs inside the configured container: repo at `/workspace/holohub`, models at `/srv/models/active/groundingdino` (host `/data/models/active/groundingdino`). From inside the container, run `./holohub run --local --cuda 13 tcn_all`.
 - **No host re-export.** The ONNX already declares `batch_size` dynamic on all six inputs and both outputs (`docs/gdino_trt_export.py:90-99`). Only `--stage build` re-runs.
 - **YAML keys unchanged:** `gdino_trt_engine`, `gdino_trt_text`, `gdino_trt_hw` keep their current names and values; one engine file serves both workers.
 - **Boxes must never leave the GPU.** SAM's `_prep_prompts` receives GPU tensors; a D2H+H2D round-trip there was removed deliberately in earlier work. Only class ids and scores may be transferred.
@@ -394,8 +394,8 @@ EOF
 Container-side build change. The gate is the detector for this plan's primary risk: the ONNX was traced at batch 1, so a reshape may have baked a literal batch dimension despite the dynamic axes.
 
 **Files:**
-- Modify: `applications/tcn_artekmed/tcn_shm_vlm_inference/docs/gdino_trt_export.py` (`build_engine`, `stage_build`, argparse)
-- Modify: `applications/tcn_artekmed/tcn_shm_vlm_inference/docs/gdino_trt_export.md`
+- Modify: `../../../tcn_all/docs/gdino_trt_export.py` (`build_engine`, `stage_build`, argparse)
+- Modify: `../../../tcn_all/docs/gdino_trt_export.md`
 
 **Interfaces:**
 - Consumes: existing `_run_engine(ser, feed_cpu)`, `_top_box(logits, boxes)`, `_iou(a, b)`, `load_text_npz`, `load_parity_ref`.
@@ -533,7 +533,8 @@ In `docs/gdino_trt_export.md`, in the "Stage 2 — build (inside the runtime con
 
 ````markdown
 ```bash
-./run_tcn_shm_receiver.sh          # drops into the tcn_shm_receiver container
+# Inside the already-running container:
+./holohub run --local --cuda 13 tcn_all
 python3 /workspace/holohub/applications/tcn_artekmed/tcn_shm_vlm_inference/docs/gdino_trt_export.py \
   --stage build --hw 512 672 --out /srv/models/active/groundingdino \
   --batch 1 3 5
@@ -900,8 +901,8 @@ Verification only — no code changes unless a gate fails.
 - [ ] **Step 1: Rebuild the engine with the batch profile**
 
 ```bash
-./run_tcn_shm_receiver.sh
-# inside the container:
+# inside the already-running container:
+./holohub run --local --cuda 13 tcn_all
 python3 /workspace/holohub/applications/tcn_artekmed/tcn_shm_vlm_inference/docs/gdino_trt_export.py \
   --stage build --hw 512 672 --out /srv/models/active/groundingdino --batch 1 3 5
 ```

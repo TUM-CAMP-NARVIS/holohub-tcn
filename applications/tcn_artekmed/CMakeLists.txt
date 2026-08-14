@@ -102,3 +102,33 @@ add_holohub_application(tcn_operator_tests DEPENDS OPERATORS
         tcn_stream_splitter
         tcn_stream_merger
 )
+
+
+
+add_holohub_application(tcn_all DEPENDS OPERATORS
+        tcn_cdr_decoder
+        tcn_cdr_serde
+        tcn_convert_bgra_to_rgba
+        tcn_depthimage_apply_mask
+        tcn_depthimage_backprojection
+        tcn_depthimage_fgbg_mask
+        tcn_depthimage_max_distance
+        tcn_depthimage_temporal_filter
+        tcn_depthimage_weights
+        tcn_device_context
+        tcn_flatten_tensor
+        tcn_instance_stats
+        tcn_label_sampler
+        tcn_labeled_pointcloud
+        tcn_panoptic_map
+        tcn_shm_serde
+        tcn_shm_subscriber
+        tcn_shm_zenoh_sender
+        tcn_stream_merger
+        tcn_stream_splitter
+        tcn_stream_synchronizer
+        tcn_texture_sampler
+        tcn_zenoh_publisher
+        tcn_zenoh_receiver
+        tcn_zenoh_subscriber
+)

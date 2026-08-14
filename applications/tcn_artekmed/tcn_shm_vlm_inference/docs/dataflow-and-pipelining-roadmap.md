@@ -316,7 +316,7 @@ GdinoPostprocOp  gdino_postprocess_batch → threshold → per-camera (xyxy, cla
 - **Use `is_engine_path: true` with our prebuilt engines.** Letting HoloInfer build from ONNX
   would bypass all three of our gates (image-independence, slice-consistency, PyTorch fidelity)
   and our fixed-batch discipline. That is not a trade worth making — see
-  [`gdino_trt_export.md`](./gdino_trt_export.md).
+  [`../../tcn_all/docs/gdino_trt_export.md`](../../tcn_all/docs/gdino_trt_export.md).
 - **Fixed batch:** the engine runs at exactly `engine_batch`. Padding currently lives in
   `detect_batch`; it would move into the preproc operator, and the postproc operator must slice
   back to `n` (this exact mistake — padded rows reaching the post-process — was a Critical review
@@ -375,7 +375,7 @@ encoder half is already a TRT engine; this is the other half.
    `point_coords`, `point_labels`, `mask_input`, `has_mask_input` → `masks`, `iou_predictions`).
    **Do not reuse tier4's ctypes runtime** — it is CPU-in/CPU-out and would undo the GPU-resident
    path. Reuse only the ONNX exporter, as was done for the encoder
-   ([`sam_trt_export.md`](./sam_trt_export.md)).
+   ([`../../tcn_all/docs/sam_trt_export.md`](../../tcn_all/docs/sam_trt_export.md)).
 3. **Trim its syncs and Python overhead** without restructuring — the cheapest probe, and step 1's
    Recipe A will say whether this stage is CPU-bound enough to be worth it.
 
@@ -493,7 +493,7 @@ collapses. If cameras of differing resolution are ever mixed, fix this first. Al
 - [`optimization-playbook.md`](./optimization-playbook.md) — methodology, the measurement layers,
   the trap list, and the full optimisation arc with numbers
 - [`deferred-findings.md`](./deferred-findings.md) — known issues consciously not fixed
-- [`gdino_trt_export.md`](./gdino_trt_export.md) — the two-stage GDINO export and its three gates
-- [`sam_trt_export.md`](./sam_trt_export.md) — the single-stage SAM encoder export
+- [`../../tcn_all/docs/gdino_trt_export.md`](../../tcn_all/docs/gdino_trt_export.md) — the two-stage GDINO export and its three gates
+- [`../../tcn_all/docs/sam_trt_export.md`](../../tcn_all/docs/sam_trt_export.md) — the single-stage SAM encoder export
 - [`specs/2026-08-05-per-worker-engines-design.md`](./specs/2026-08-05-per-worker-engines-design.md)
   — per-worker batches, the `gpu_workers` topology node, and the measured results

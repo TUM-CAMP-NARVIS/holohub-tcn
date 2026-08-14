@@ -21,7 +21,7 @@ targets the encoder half only.
 (period 194.5 -> 186.2 ms) because it accelerates the encoder but not the decode loop, and it
 costs **146 s of startup compilation** during which both workers trace *concurrently* — exactly
 the condition that has deadlocked this app before. See the `sam_compile` comment in
-`tcn_shm_vlm_inference.yaml` for the full measurement.
+`tcn_all.yaml` for the full measurement.
 
 A TensorRT engine removes Dynamo from the picture entirely: no runtime compilation, no tracer,
 no deadlock class, deterministic startup.

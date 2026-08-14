@@ -314,7 +314,7 @@ filenames carrying `_b2_` and `_b3_`; both suites pass.
 
 ```bash
 git add applications/tcn_artekmed/tcn_shm_vlm_inference/python/langsam_multicam_fragment.py \
-        applications/tcn_artekmed/tcn_shm_vlm_inference/python/tcn_shm_vlm_inference.yaml
+        applications/tcn_artekmed/tcn_shm_vlm_inference/python/tcn_all.yaml
 git commit -m "$(cat <<'EOF'
 feat(tcn_artekmed): per-worker engine paths from a global gpu_workers node
 
@@ -375,7 +375,7 @@ Add the argument next to `--batch`:
 
 ```python
     ap.add_argument("--from-config", default=None,
-                    help="path to tcn_shm_vlm_inference.yaml; builds one engine per distinct "
+                    help="path to tcn_all.yaml; builds one engine per distinct "
                          "worker camera count in its gpu_workers node (mutually exclusive "
                          "with --batch)")
 ```
@@ -460,7 +460,7 @@ Verification only. Needs the host GroundingDINO venv and the running container.
 
 ```bash
 python3 /workspace/holohub/applications/tcn_artekmed/tcn_shm_vlm_inference/docs/sam_trt_export.py \
-  --from-config /workspace/holohub/applications/tcn_artekmed/tcn_shm_vlm_inference/python/tcn_shm_vlm_inference.yaml \
+  --from-config /workspace/holohub/applications/tcn_artekmed/tcn_shm_vlm_inference/python/tcn_all.yaml \
   --out /srv/models/active/sam2
 ```
 Expected: `building batches [2, 3]`, then for each batch all three gates pass and the engine
@@ -472,11 +472,11 @@ installs. The b3 engine is rebuilt; that is fine and idempotent.
 # host, in the wingdzero checkout
 PYTHONPATH=$PWD ~/develop/vision/GroundingDINO/.venv-gdino-export/bin/python gdino_trt_export.py \
   --stage export --prompts floor person --hw 512 672 \
-  --from-config /home/ecku/develop/holoscan/holohub-tcn/applications/tcn_artekmed/tcn_shm_vlm_inference/python/tcn_shm_vlm_inference.yaml \
+  --from-config /home/ecku/develop/holoscan/holohub-tcn/applications/tcn_artekmed/tcn_shm_vlm_inference/python/tcn_all.yaml \
   --out /data/models/active/groundingdino --parity-image images/in/person.jpg
 # container
 python3 /workspace/holohub/.../docs/gdino_trt_export.py --stage build --hw 512 672 \
-  --from-config /workspace/holohub/.../python/tcn_shm_vlm_inference.yaml \
+  --from-config /workspace/holohub/.../python/tcn_all.yaml \
   --out /srv/models/active/groundingdino
 ```
 Expected: `_b2_` and `_b3_` ONNX and engines, each passing its slice-consistency gate.

@@ -1273,7 +1273,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.config == "none":
-        config_file = config_file = os.path.join(os.path.dirname(__file__), "tcn_shm_vlm_inference.yaml")
+        config_file = config_file = os.path.join(os.path.dirname(__file__), "tcn_all.yaml")
     else:
         config_file = args.config
 

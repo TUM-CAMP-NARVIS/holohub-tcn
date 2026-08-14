@@ -149,9 +149,9 @@ configuration and the export tooling live in the example application
 | what | where |
 |---|---|
 | reference config | `python/tcn_shm_vlm_inference.yaml` → `langsam_inference`, `gpu_workers`, `text_prompts` |
-| GDINO export tool | `docs/gdino_trt_export.py` + [`docs/gdino_trt_export.md`](../../../applications/tcn_artekmed/tcn_shm_vlm_inference/docs/gdino_trt_export.md) |
-| SAM export tool | `docs/sam_trt_export.py` + [`docs/sam_trt_export.md`](../../../applications/tcn_artekmed/tcn_shm_vlm_inference/docs/sam_trt_export.md) |
-| container rebuild | [`docs/trt11-upgrade-runbook.md`](../../../applications/tcn_artekmed/tcn_shm_vlm_inference/docs/trt11-upgrade-runbook.md), `docs/trt11_build_test.sh` |
+| GDINO export tool | `docs/gdino_trt_export.py` + [`docs/gdino_trt_export.md`](../../../applications/tcn_artekmed/tcn_all/docs/gdino_trt_export.md) |
+| SAM export tool | `docs/sam_trt_export.py` + [`docs/sam_trt_export.md`](../../../applications/tcn_artekmed/tcn_all/docs/sam_trt_export.md) |
+| container rebuild | [`docs/trt11-upgrade-runbook.md`](../../../applications/tcn_artekmed/tcn_all/docs/trt11-upgrade-runbook.md), `docs/trt11_build_test.sh` |
 | mask correctness gate | `docs/compare_mask_dumps.py` (fed by `MaskDumpOp`) |
 
 ### What each backend needs
@@ -207,7 +207,7 @@ build cannot happen on the host (the engine must match the container's TRT). Hen
 ```bash
 # host, in the fork checkout
 python3 gdino_trt_export.py --stage export --prompts person bed device hololens pipes \
-        --hw 512 672 --from-config <app>/python/tcn_shm_vlm_inference.yaml
+        --hw 512 672 --from-config <app>/python/tcn_all.yaml
 # container
 python3 gdino_trt_export.py --stage build --hw 512 672 --out /srv/models/active/groundingdino
 ```
@@ -240,7 +240,7 @@ that can run entirely inside the container:
 
 ```bash
 python3 sam_trt_export.py --sam-type sam2.1_hiera_tiny \
-        --from-config <app>/python/tcn_shm_vlm_inference.yaml --out /srv/models/active/sam2
+        --from-config <app>/python/tcn_all.yaml --out /srv/models/active/sam2
 ```
 
 All three gates always run, and the artifact is moved into place **only if every one passes** — so a
@@ -273,7 +273,7 @@ deliberate, documented deviation, not a supported configuration:
   silently ignored `--build-arg` produced a working-looking image with the wrong TRT.
 
 The full procedure — SDK image, app containers, engines, mount switch, verification, rollback — is
-[`docs/trt11-upgrade-runbook.md`](../../../applications/tcn_artekmed/tcn_shm_vlm_inference/docs/trt11-upgrade-runbook.md).
+[`docs/trt11-upgrade-runbook.md`](../../../applications/tcn_artekmed/tcn_all/docs/trt11-upgrade-runbook.md).
 
 If you do **not** want a modified container: set `gdino_backend: pytorch` and `sam_backend: pytorch`.
 Everything still runs, at a substantially lower frame rate, with no engines and no rebuild. That is

@@ -32,13 +32,28 @@
 set -uo pipefail
 
 # ---------------------------------------------------------------- configuration
-SDK_DIR="${SDK_DIR:-/home/ecku/develop/holoscan/holoscan-sdk}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../../../.." && pwd)"
+ENV_FILE="${TCN_ALL_ENV_FILE:-${PROJECT_ROOT}/.tcn_all_env}"
+
+# Load the project-local configuration before applying defaults. The file uses normal shell
+# assignments, so values can be shared with other TCN scripts and can contain spaces when quoted.
+if [[ -f "${ENV_FILE}" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${ENV_FILE}"
+  set +a
+fi
+
+# These defaults follow the repository layout. Override them in .tcn_all_env for a different
+# checkout layout or machine.
+SDK_DIR="${SDK_DIR:-${PROJECT_ROOT}/../../holoscan-sdk}"
 SDK_EXPECTED_SHA="${SDK_EXPECTED_SHA:-e64af8f270896599ec4c7e53a25acef12dbb3934}"   # v4.4.0
-HOLOHUB_DIR="${HOLOHUB_DIR:-/home/ecku/develop/holoscan/holohub-tcn}"
+HOLOHUB_DIR="${HOLOHUB_DIR:-${PROJECT_ROOT}}"
 TRT_VERSION="${TRT_VERSION:-11.2}"      # apt-cache madison is grepped for this prefix
-CUDA_MAJOR="${CUDA_MAJOR:-12}"          # 11.2.1.2 ships +cuda12.9 AND +cuda13.3; 12 is the smaller delta
+CUDA_MAJOR="${CUDA_MAJOR:-13}"          # 11.2.1.2 ships +cuda12.9 AND +cuda13.3; 12 is the smaller delta
 TRT_FULL="${TRT_FULL:-11.2.1.2}"        # exact apt/pip version for the packaging overlay
-TRT_CUDA_MINOR="${TRT_CUDA_MINOR:-12.9}"  # the +cudaX.Y suffix the TRT packages carry
+TRT_CUDA_MINOR="${TRT_CUDA_MINOR:-13.3}"  # the +cudaX.Y suffix the TRT packages carry
 TRT11_BASE_IMG="${TRT11_BASE_IMG:-holoscan-trt11:4.4.0-cu${CUDA_MAJOR}}"
 
 # Which engine batches to build. Empty = derive from the ACTIVE gpu_workers profile via
@@ -48,7 +63,7 @@ TRT11_BASE_IMG="${TRT11_BASE_IMG:-holoscan-trt11:4.4.0-cu${CUDA_MAJOR}}"
 # build every batch any topology needs, regardless of which profile happens to be active:
 #   ENGINE_BATCHES="2 3" ./trt11_build_test.sh --stage engines
 ENGINE_BATCHES="${ENGINE_BATCHES:-}"
-APP_REL="applications/tcn_artekmed/tcn_shm_vlm_inference"
+APP_REL="applications/tcn_artekmed/tcn_all"
 
 # Engines built here go to a SEPARATE tree. The live TRT 10.9 engines must stay loadable by the
 # current container until the new one is proven -- engines are TRT-version-locked, so installing
@@ -56,23 +71,38 @@ APP_REL="applications/tcn_artekmed/tcn_shm_vlm_inference"
 ENGINE_SRC_HOST="${ENGINE_SRC_HOST:-/data/models}"
 ENGINE_OUT_HOST="${ENGINE_OUT_HOST:-/data/models_trt11}"
 
-DATASET_HOST="${DATASET_HOST:-/home/ecku/develop/artekmed/artekmed_test_data}"
+DATASET_HOST="${DATASET_HOST:-${PROJECT_ROOT}/../../artekmed/artekmed_test_data}"
 TMP_HOST="${TMP_HOST:-/tmp/tcn}"
+
+# Resolve relative values from .tcn_all_env against the repository root, rather than against the
+# caller's current working directory. This makes the script safe to invoke from any directory.
+project_path() {
+  if [[ "$1" == /* ]]; then
+    printf '%s\n' "$1"
+  else
+    printf '%s/%s\n' "$PROJECT_ROOT" "$1"
+  fi
+}
+
+SDK_DIR="$(project_path "$SDK_DIR")"
+HOLOHUB_DIR="$(project_path "$HOLOHUB_DIR")"
+ENGINE_SRC_HOST="$(project_path "$ENGINE_SRC_HOST")"
+ENGINE_OUT_HOST="$(project_path "$ENGINE_OUT_HOST")"
+DATASET_HOST="$(project_path "$DATASET_HOST")"
+TMP_HOST="$(project_path "$TMP_HOST")"
+LOG_DIR="$(project_path "${LOG_DIR:-${TMP_HOST}/trt11}")"
 
 # HolovizOp needs a real display -- the app dies with "Failed to initialize glfw" otherwise, and
 # the harness app builds Holoviz operators even in dataset mode. These mirror what `./holohub run`
 # passes (read off the working container): DISPLAY, the X socket, and an xauth file.
 DISPLAY_VAL="${DISPLAY:-:1}"
 XAUTH_FILE="${XAUTH_FILE:-$(ls -t /tmp/.docker.xauth-* 2>/dev/null | head -1)}"
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCH="${SCRIPT_DIR}/patches/holoscan-sdk-4.4.0-trt-major-param.patch"
 # holoinfer does not compile against TRT 11 unmodified: BuilderFlag::kFP16 and
 # kPREFER_PRECISION_CONSTRAINTS were REMOVED (they were deprecated in 10.12). Found by the
 # 2026-08-10 build; two enum constants in one file, guarded the same way the file already guards
 # another TRT deprecation. This is the "does holoinfer survive TRT 11" answer.
 PATCH_HOLOINFER="${SCRIPT_DIR}/patches/holoscan-sdk-4.4.0-holoinfer-trt11.patch"
-LOG_DIR="${LOG_DIR:-${TMP_HOST}/trt11}"
 LOG="${LOG_DIR}/build-$(date +%Y%m%d-%H%M%S).log"
 
 STAGE="all"
@@ -207,7 +237,7 @@ stage_sdk() {
   run docker images --filter "reference=${TRT11_BASE_IMG%%:*}" \
       --format '  {{.Repository}}:{{.Tag}}  {{.Size}}  {{.CreatedSince}}'
   info "Use it as the HoloHub base image, e.g.:"
-  info "  ./holohub run --base-img ${TRT11_BASE_IMG} ... tcn_shm_receiver"
+  info "  ./holohub run --base-img ${TRT11_BASE_IMG} ... tcn_all"
   info "or continue here: ./trt11_build_test.sh --stage verify   (TEST_IMG defaults to it)"
 
   revert_patch
@@ -217,7 +247,7 @@ stage_holohub() {
   say "Building the holohub image on the new base"
   BASE_IMG="${BASE_IMG:-$TRT11_BASE_IMG}"
   info "base image: $BASE_IMG"
-  run "$HOLOHUB_DIR/holohub" build --base-img "$BASE_IMG" --cuda "$CUDA_MAJOR" tcn_shm_vlm_inference \
+  run "$HOLOHUB_DIR/holohub" build --base-img "$BASE_IMG" --cuda "$CUDA_MAJOR" tcn_all \
     || fail "holohub image build failed against base $BASE_IMG"
 }
 
@@ -270,7 +300,7 @@ stage_engines() {
     for b in $ENGINE_BATCHES; do _batch_args+="--batch=$b "; done
     info "building explicit batches: $ENGINE_BATCHES"
   else
-    _batch_args="--from-config=../python/tcn_shm_vlm_inference.yaml"
+    _batch_args="--from-config=../python/tcn_all.yaml"
     info "building batches from the ACTIVE gpu_workers profile (set ENGINE_BATCHES to override)"
   fi
   run docker run --rm --gpus all \
@@ -307,7 +337,7 @@ stage_gate() {
   info "test image: $TEST_IMG"
   local cfg="${TMP_HOST}/gates/trt11.yaml"
   mkdir -p "${TMP_HOST}/gates" "${TMP_HOST}/harness"
-  python3 - "$HOLOHUB_DIR/${APP_REL}/python/tcn_shm_vlm_inference.yaml" "$cfg" <<'PY'
+  python3 - "$HOLOHUB_DIR/${APP_REL}/python/tcn_all.yaml" "$cfg" <<'PY'
 import re, sys, pathlib
 s = pathlib.Path(sys.argv[1]).read_text()
 s = re.sub(r'^(mask_dump_dir:).*$', r'\1 "/srv/tmp/harness/trt11"', s, flags=re.M)
@@ -341,10 +371,10 @@ PY
       -v "$HOLOHUB_DIR:/workspace/holohub" \
       -v "$DATASET_HOST:/workspace/volumes/artekmed_test_data" \
       "$TEST_IMG" bash -lc "
-        BIN=/workspace/holohub/build/tcn_shm_vlm_inference
+        BIN=/workspace/holohub/build/tcn_all
         SRC=/workspace/holohub/${APP_REL}/python
         cd \$BIN && PYTHONPATH=\$BIN/python/lib:/workspace/holohub:\$SRC:\$PYTHONPATH \
-        python3 \$SRC/tcn_shm_vlm_inference.py -c /srv/tmp/gates/trt11.yaml
+        python3 \$SRC/tcn_all.py -c /srv/tmp/gates/trt11.yaml
       " || fail "harness run failed under TRT ${TRT_VERSION}"
   say "Comparing against the TRT 10.9 baseline"
   info "READ THIS AS A CHANGE, NOT A REGRESSION: TRT 10.9 -> 11.2 is the FIX landing, so masks are"

@@ -27,8 +27,8 @@
 ### Task 1: Offline export + build + parity tool
 
 **Files:**
-- Create: `applications/tcn_artekmed/tcn_shm_vlm_inference/docs/gdino_trt_export.py`
-- Create: `applications/tcn_artekmed/tcn_shm_vlm_inference/docs/gdino_trt_export.md`
+- Create: `../../../tcn_all/docs/gdino_trt_export.py`
+- Create: `../../../tcn_all/docs/gdino_trt_export.md`
 
 **Interfaces:**
 - Produces (on disk): `<out>/gdino_swint_<H>x<W>_tf32.engine`, and `<out>/gdino_swint_prompts.npz`

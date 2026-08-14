@@ -68,8 +68,8 @@ For custom Docker builds:
 The DA3 fragment needs an ONNX model exported with a **channels-last (NHWC)** input to match
 the Holoscan `FormatConverterOp` / DepthAnything-V2 contract — the stock Depth-Anything-3
 exporter produces an NCHW graph that TensorRT silently misreads. See
-[`docs/da3_onnx_export.md`](docs/da3_onnx_export.md) for the how-to and
-[`docs/da3_export.py`](docs/da3_export.py) for the ready-to-run patched exporter.
+[`../tcn_all/docs/da3_onnx_export.md`](../tcn_all/docs/da3_onnx_export.md) for the how-to and
+[`../tcn_all/docs/da3_export.py`](../tcn_all/docs/da3_export.py) for the ready-to-run patched exporter.
 
 ## Segmented point clouds (mask/depth join)
 
@@ -183,7 +183,7 @@ cost**, and an operator off the critical path can be made nearly free without mo
 
 ## Development
 
-**[docs/development-loop.md](docs/development-loop.md)** — the edit → test-in-container → verify loop
+**[docs/development-loop.md](../tcn_all/docs/development-loop.md)** — the edit → test-in-container → verify loop
 used to build this application: how to run checks inside the already-running container, how to build a
 gate whose output distinguishes *passed* from *did not run*, why a deterministic replay source is a
 prerequisite for any correctness claim, and how to tier gates so the fast ones run on every edit. Worth

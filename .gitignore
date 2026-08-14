@@ -34,6 +34,7 @@ ci/
 *.pth
 
 # Development environment
+.tcn_all_env
 .venv/
 .venv_lint/
 .vscode-server/

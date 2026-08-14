@@ -20,7 +20,7 @@
 # Verified safe: none of the built HoloHub operators link libnvinfer, so replacing TensorRT
 # underneath them changes nothing they depend on. Holoscan itself is replaced with the SAME
 # version (4.4.0) rebuilt, so its ABI is unchanged.
-ARG BASE_IMAGE=holohub-tcn_shm_vlm_inference:feature-tcn-artekmed-initial
+ARG BASE_IMAGE=holohub-tcn_all:feature-tcn-artekmed-initial
 FROM ${BASE_IMAGE}
 
 # apt and the /opt overlay both need root, and this image STAYS root -- see FINAL_USER at the
@@ -28,7 +28,7 @@ FROM ${BASE_IMAGE}
 USER root
 
 ARG TRT_VERSION=11.2.1.2
-ARG TRT_CUDA_TAG=cuda12.9
+ARG TRT_CUDA_TAG=cuda13.3
 ARG HOST_INSTALL_DIR=install-cu12-x86_64
 
 # TensorRT 11 runtime + dev. dev headers are kept because engines are built INSIDE this

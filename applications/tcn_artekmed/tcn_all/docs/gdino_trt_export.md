@@ -2,7 +2,7 @@
 
 Builds the TensorRT engine + baked text tensors used by the `gdino_backend: "trt"` path in
 `langsam_inference` (see the runtime `GDinoTrtDetector`). Companion tool:
-[`gdino_trt_export.py`](./gdino_trt_export.py).
+[`gdino_trt_export.py`](gdino_trt_export.py).
 
 ## Why this exists
 
@@ -106,7 +106,7 @@ cd ~/develop/vision/GroundingDINO-TensorRT-and-ONNX-Inference   # relative --con
                                                                # --parity-image resolve from here
 PYTHONPATH=$PWD \                       # so `import groundingdino` resolves (no pip install -e)
 ~/develop/vision/GroundingDINO/.venv-gdino-export/bin/python \
-  <repo>/applications/tcn_artekmed/tcn_shm_vlm_inference/docs/gdino_trt_export.py --stage export \
+  <repo>/applications/tcn_artekmed/tcn_all/docs/gdino_trt_export.py --stage export \
   --checkpoint weights/groundingdino_swint_ogc.pth \
   --config groundingdino/config/GroundingDINO_SwinT_OGC.py \
   --prompts floor person \
@@ -159,7 +159,7 @@ traces at it, build pins `min = opt = max` to it. Changing camera count means re
 
 ### `--from-config`
 
-Instead of `--batch N`, pass `--from-config /path/to/tcn_shm_vlm_inference.yaml` to build one
+Instead of `--batch N`, pass `--from-config /path/to/tcn_all.yaml` to build one
 engine per **distinct worker camera count** in the app's `gpu_workers` node (mutually exclusive
 with `--batch`). Both stages need the **same** `--from-config`:
 
@@ -168,12 +168,12 @@ with `--batch`). Both stages need the **same** `--from-config`:
 python gdino_trt_export.py --stage export --prompts floor person \
   --hw 512 672 --out /data/models/active/groundingdino \
   --parity-image images/in/person.jpg \
-  --from-config /path/to/tcn_shm_vlm_inference.yaml
+  --from-config /path/to/tcn_all.yaml
 
 # container
-python3 /workspace/holohub/applications/tcn_artekmed/tcn_shm_vlm_inference/docs/gdino_trt_export.py \
+python3 /workspace/holohub/applications/tcn_artekmed/tcn_all/docs/gdino_trt_export.py \
   --stage build --hw 512 672 --out /srv/models/active/groundingdino \
-  --from-config /path/to/tcn_shm_vlm_inference.yaml
+  --from-config /path/to/tcn_all.yaml
 ```
 
 With a `gpu_workers.workers` list of `[{cameras: [a, b]}, {cameras: [c, d, e]}]` this builds
@@ -189,8 +189,9 @@ The repo is mounted at `/workspace/holohub` and `/data/models` at `/srv/models`,
 the stage-1 artifacts are already visible:
 
 ```bash
-./run_tcn_shm_receiver.sh          # drops into the tcn_shm_receiver container
-python3 /workspace/holohub/applications/tcn_artekmed/tcn_shm_vlm_inference/docs/gdino_trt_export.py \
+# Inside the already-running container:
+./holohub run --local --cuda 13 tcn_all
+python3 /workspace/holohub/applications/tcn_artekmed/tcn_all/docs/gdino_trt_export.py \
   --stage build --hw 512 672 --out /srv/models/active/groundingdino \
   --batch 3
 ```
@@ -246,9 +247,9 @@ order, with the SAME `--batch N`, then update the YAML.
    `WARNING: N caption categories vs M prompts`: it means the caption did not split into one
    category per prompt (usually a prompt containing a `.`). Do not ship a build that prints it.
 3. Re-run **stage 2** in the container (same command as above — the filenames do not change).
-4. Update `text_prompts.prompts` in `tcn_shm_vlm_inference.yaml`. It does not need to be an exact
+4. Update `text_prompts.prompts` in `tcn_all.yaml`. It does not need to be an exact
    copy of what you just baked: at runtime `GDinoTrtDetector.set_prompts` (`build_prompt_remap`
-   in `operators/tcn_artekmed/tcn_langsam/helpers.py`) accepts **any subset and/or reordering** of the engine's baked
+   in `../../../../operators/tcn_artekmed/tcn_langsam/helpers.py`) accepts **any subset and/or reordering** of the engine's baked
    prompts and renumbers the class ids to match, with no rebuild. Only a term that was never
    baked into the engine at all raises, e.g.:
    `prompts ['robot'] are not baked into the GDINO TRT engine (baked: ['floor', 'person'])`.
@@ -313,7 +314,7 @@ langsam_inference:
 ```
 
 **`text_prompts.prompts` may be any subset and/or reordering of the engine's baked prompts.**
-`GDinoTrtDetector.set_prompts` (`build_prompt_remap` in `operators/tcn_artekmed/tcn_langsam/helpers.py`) renumbers the
+`GDinoTrtDetector.set_prompts` (`build_prompt_remap` in `../../../../operators/tcn_artekmed/tcn_langsam/helpers.py`) renumbers the
 class ids to match at runtime — no rebuild needed. Only a prompt term the engine never baked
 raises (`ValueError: prompts [...] are not baked into the GDINO TRT engine ...`), and only that
 case requires re-running this tool (both stages), with the new term included. Changing the input
@@ -338,4 +339,3 @@ The build stage runs three checks, in this order:
    comparison below, so the container's TRT-vs-PyTorch deviation can neither mask it nor trip it.
 2. **Slice consistency** (blocking). Every slice of a batched run must agree with slice 0.
 3. **PyTorch fidelity** (reported, non-blocking). See below.
-

@@ -166,7 +166,7 @@ tensor `camera01_mask`).
   into a shared module (e.g. `langsam_common.py`), imported by the new
   `langsam_multicam_fragment.py`. The existing single-camera fragment stays intact and can
   import from the shared module too.
-- Wire the app (`tcn_shm_vlm_inference.py`) to feed `subscriber.color_outputs` straight into
+- Wire the app (`tcn_all.py`) to feed `subscriber.color_outputs` straight into
   `LangSamMultiCamProcessingSubgraph` and add a tiled Holoviz for the colorized masks. The
   existing single-camera path/config is retained until the multi-camera path is validated.
 

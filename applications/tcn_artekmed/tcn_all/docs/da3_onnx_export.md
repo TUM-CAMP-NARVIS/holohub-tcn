@@ -1,11 +1,11 @@
 # Exporting Depth-Anything-3 to ONNX for the DA3 fragment
 
-The `operators/tcn_artekmed/tcn_depth_anything/da3.py` pipeline runs Depth-Anything-3 through the Holoscan `InferenceOp`
+The `../../../../operators/tcn_artekmed/tcn_depth_anything/da3.py` pipeline runs Depth-Anything-3 through the Holoscan `InferenceOp`
 (TensorRT backend). The ONNX model it consumes must follow the **same input contract as
 the Depth-Anything-V2 model**, otherwise the depth output is garbage.
 
 The upstream Depth-Anything-3 `export.py` does **not** produce a compatible model, so a
-small patched exporter is provided here: [`da3_export.py`](./da3_export.py).
+small patched exporter is provided here: [`da3_export.py`](da3_export.py).
 
 ## Why a custom export
 
@@ -30,7 +30,7 @@ contract). The key differences from the upstream script:
 The DA3 model outputs **focal-normalized depth**, not metres (it is exported with
 `intrinsics=None`). `DA3PostprocessorOp` converts it to metric depth at runtime using the
 camera focal length: `metric[m] = raw · (focal / 300)` — see `da3_inference_config`
-(`depth_near`/`depth_far`) in `tcn_shm_vlm_inference.yaml`.
+(`depth_near`/`depth_far`) in `tcn_all.yaml`.
 
 ## Prerequisites
 
@@ -55,7 +55,7 @@ camera focal length: `metric[m] = raw · (focal / 300)` — see `da3_inference_c
    `export.py`):
 
    ```bash
-   cp <holohub>/applications/tcn_artekmed/tcn_shm_vlm_inference/docs/da3_export.py \
+   cp <holohub>/applications/tcn_artekmed/tcn_all/docs/da3_export.py \
       Depth-Anything-3/da3_export.py
    ```
 

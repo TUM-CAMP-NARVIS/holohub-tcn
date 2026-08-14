@@ -18,7 +18,7 @@
 - **Host tests must be numpy-only** — no torch, cupy, holoscan or tensorrt imports.
 - **Boxes must never leave the GPU**; only class ids and scores may be transferred.
 - Commit style `feat(tcn_artekmed): ...` / `fix(tcn_artekmed): ...`, ending with `Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>`.
-- The working tree has unrelated uncommitted changes (`metadata.json`, `tcn_shm_vlm_inference.py`, `tcn_shm_vlm_inference.yaml`, `run_tcn_shm_receiver.sh`). Never `git add -A`; stage only the files a task names.
+- The working tree has unrelated uncommitted changes (`metadata.json`, `tcn_all.py`, `tcn_all.yaml`). Never `git add -A`; stage only the files a task names.
 - **Measured facts to preserve** (do not "optimise" against them): batch-1 engine 38.64 ms/exec; batch-3 engine 81.03 ms/exec; slices agree at IoU 0.999611; every container TRT 10.9 engine deviates from PyTorch at IoU ~0.9637 with depressed scores.
 
 ---
@@ -26,8 +26,8 @@
 ### Task R1: Export tool — single `--batch N`, batch-tagged filenames, revised gates
 
 **Files:**
-- Modify: `applications/tcn_artekmed/tcn_shm_vlm_inference/docs/gdino_trt_export.py`
-- Modify: `applications/tcn_artekmed/tcn_shm_vlm_inference/docs/gdino_trt_export.md`
+- Modify: `../../../tcn_all/docs/gdino_trt_export.py`
+- Modify: `../../../tcn_all/docs/gdino_trt_export.md`
 
 **Interfaces produced:** `export_onnx(model, text, H, W, onnx_path, batch=1)`; `build_engine(onnx_path, engine_path, H, W, L, fp16=False, batch=1)`; `run_at_batch(ser, text, img, B)`; `slice_consistency_gate(slices, min_iou=0.999, max_score_delta=0.01)`; `fidelity_report(slice0, s_ref, b_ref, image_path, min_iou=0.99, min_detect=0.30, strict=False)`. Artifact names `gdino_swint_<H>x<W>_b<N>_tf32.{onnx,engine}`.
 

@@ -2,7 +2,7 @@
 
 Builds the fixed-batch FP16 TensorRT engine for the SAM 2 Hiera image encoder, for a future
 `sam_backend: "trt"` path alongside the existing PyTorch `SAM._set_image_batch_gpu` (see
-`operators/tcn_artekmed/tcn_langsam/models.py`). Companion tool: [`sam_trt_export.py`](./sam_trt_export.py).
+`../../../../operators/tcn_artekmed/tcn_langsam/models.py`). Companion tool: [`sam_trt_export.py`](sam_trt_export.py).
 
 ## Why this exists
 
@@ -26,8 +26,9 @@ There is nothing to run on the host for this tool.
 ## Usage
 
 ```bash
-./run_tcn_shm_receiver.sh          # drops into the tcn_shm_receiver container
-python3 /workspace/holohub/applications/tcn_artekmed/tcn_shm_vlm_inference/docs/sam_trt_export.py \
+# Inside the already-running container:
+./holohub run --local --cuda 13 tcn_all
+python3 /workspace/holohub/applications/tcn_artekmed/tcn_all/docs/sam_trt_export.py \
   --sam-type sam2.1_hiera_tiny \
   --batch 3 \
   --out /srv/models/active/sam2 \
@@ -50,14 +51,14 @@ in its place.
 
 ### `--from-config`
 
-Instead of `--batch N`, pass `--from-config /path/to/tcn_shm_vlm_inference.yaml` to build one
+Instead of `--batch N`, pass `--from-config /path/to/tcn_all.yaml` to build one
 engine per **distinct worker camera count** in the app's `gpu_workers` node (mutually exclusive
 with `--batch`):
 
 ```bash
-python3 /workspace/holohub/applications/tcn_artekmed/tcn_shm_vlm_inference/docs/sam_trt_export.py \
+python3 /workspace/holohub/applications/tcn_artekmed/tcn_all/docs/sam_trt_export.py \
   --sam-type sam2.1_hiera_tiny \
-  --from-config /workspace/holohub/applications/tcn_artekmed/tcn_shm_vlm_inference/python/tcn_shm_vlm_inference.yaml \
+  --from-config /workspace/holohub/applications/tcn_artekmed/tcn_all/python/tcn_all.yaml \
   --out /srv/models/active/sam2
 ```
 

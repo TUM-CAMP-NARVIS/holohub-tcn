@@ -1,0 +1,6 @@
+application:
+  title: TCN Artekmed All
+  version: 1.0
+  inputFormats: []
+  outputFormats: ["screen"]
+

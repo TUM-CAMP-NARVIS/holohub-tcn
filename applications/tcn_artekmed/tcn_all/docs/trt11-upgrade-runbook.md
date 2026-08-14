@@ -2,8 +2,8 @@
 
 Why: TensorRT 10.9 depresses Grounding DINO confidence scores (0.487 against PyTorch's 0.871,
 |d| = 0.384); TensorRT 11.2 reproduces PyTorch almost exactly (|d| = 0.001, top-box IoU 0.9999).
-See [`specs/2026-08-10-tensorrt-upgrade-assessment.md`](./specs/2026-08-10-tensorrt-upgrade-assessment.md)
-for the measurement and [`specs/2026-08-10-sam-batched-decode-design.md`](./specs/2026-08-10-sam-batched-decode-design.md)
+See [`../../tcn_shm_vlm_inference/docs/specs/2026-08-10-tensorrt-upgrade-assessment.md`](../../tcn_shm_vlm_inference/docs/specs/2026-08-10-tensorrt-upgrade-assessment.md)
+for the measurement and [`../../tcn_shm_vlm_inference/docs/specs/2026-08-10-sam-batched-decode-design.md`](../../tcn_shm_vlm_inference/docs/specs/2026-08-10-sam-batched-decode-design.md)
 for why it also explains the GDINO FP16 rejection.
 
 **Everything TensorRT touches must be rebuilt, in this order.** A serialized engine only loads in
@@ -36,13 +36,13 @@ engine** — nearly always a model-tree mount pointing at the old tree (step 4).
 ## Step 1 — Holoscan SDK image with TensorRT 11
 
 ```bash
-cd applications/tcn_artekmed/tcn_shm_vlm_inference/docs
+cd applications/tcn_artekmed/tcn_all/docs
 ./trt11_build_test.sh --stage preflight   # cheap; verifies the patches apply
 ./trt11_build_test.sh --stage sdk         # long
 ```
 
 This applies two patches to the SDK checkout, builds, and **reverts them on exit** — including on
-error or Ctrl-C. The checkout is never left modified. The patches live in `patches/`:
+error or Ctrl-C. The checkout is never left modified. The patches live in `patches`:
 
 - `holoscan-sdk-4.4.0-trt-major-param.patch` — the SDK's `tensorrt-dev` stage hardcodes
   `libnvinfer10` / `libnvinfer-plugin10` / `libnvonnxparsers10`. Derives the major from the existing
@@ -76,7 +76,7 @@ the SDK's cu12 comment implies is not required. Override with `CUDA_MAJOR=13` if
 ## Step 2 — rebuild the app containers on that base
 
 ```bash
-./holohub run --base-img holoscan-trt11:4.4.0-cu12 ... tcn_shm_vlm_inference
+./holohub run --local --cuda 13 tcn_all
 ```
 
 Add `--base-img holoscan-trt11:4.4.0-cu12` to each `run_*.sh` you use. Do this rather than
@@ -199,7 +199,7 @@ Harness settings left in the yaml will stop a live run, or worse, fill a disk. C
 
 ```bash
 python3 -c "
-import yaml; c=yaml.safe_load(open('python/tcn_shm_vlm_inference.yaml'))
+import yaml; c=yaml.safe_load(open('python/tcn_all.yaml'))
 print('source          :', c.get('source'))
 print('mask_dump_dir   :', repr(c.get('mask_dump_dir')))
 print('pipelined       :', c['gpu_workers'].get('pipelined'))
@@ -238,7 +238,7 @@ means it worked. Concluding "regression" from that number inverts the result.
 The specific question: the pre-upgrade FP16 A/B found 36 instances present in only one engine's
 output (median 15,290 px, max 78,474 px — whole people flickering). If those stabilise, the FP16
 rejection was a symptom of the score depression rather than a property of FP16, and
-[`specs/2026-08-10-trt-cuda-graphs-design.md`](./specs/2026-08-10-trt-cuda-graphs-design.md)-era
+[`../../tcn_shm_vlm_inference/docs/specs/2026-08-10-trt-cuda-graphs-design.md`](../../tcn_shm_vlm_inference/docs/specs/2026-08-10-trt-cuda-graphs-design.md)-era
 perf work can revisit it.
 
 ## Rollback

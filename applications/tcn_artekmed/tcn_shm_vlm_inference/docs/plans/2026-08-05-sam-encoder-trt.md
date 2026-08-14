@@ -25,8 +25,8 @@
 ### Task S1: The export + build tool
 
 **Files:**
-- Create: `applications/tcn_artekmed/tcn_shm_vlm_inference/docs/sam_trt_export.py`
-- Create: `applications/tcn_artekmed/tcn_shm_vlm_inference/docs/sam_trt_export.md`
+- Create: `../../../tcn_all/docs/sam_trt_export.py`
+- Create: `../../../tcn_all/docs/sam_trt_export.md`
 
 **Interfaces produced:** a CLI producing `<out>/<sam_type>_encoder_b<N>_<fp16|tf32>.engine`.
 
@@ -463,7 +463,7 @@ In `langsam_multicam_fragment.py`, where `SAM(...)` is constructed, add:
                 sam_trt_engine=langsam_cfg.get("sam_trt_engine"),
 ```
 
-In `tcn_shm_vlm_inference.yaml`, under `langsam_inference`, after `sam_gpu_output`:
+In `tcn_all.yaml`, under `langsam_inference`, after `sam_gpu_output`:
 
 ```yaml
   # SAM 2 image encoder backend: "pytorch" (eager) | "trt" (prebuilt engine from
@@ -487,7 +487,7 @@ Expected: `compile OK`; `pytorch /srv/...b3_fp16.engine`; `11/11`, `7/7`, `9/9`.
 ```bash
 git add applications/tcn_artekmed/tcn_shm_vlm_inference/python/langsam_common.py \
         applications/tcn_artekmed/tcn_shm_vlm_inference/python/langsam_multicam_fragment.py \
-        applications/tcn_artekmed/tcn_shm_vlm_inference/python/tcn_shm_vlm_inference.yaml
+        applications/tcn_artekmed/tcn_shm_vlm_inference/python/tcn_all.yaml
 git commit -m "$(cat <<'EOF'
 feat(tcn_artekmed): optional TensorRT backend for the SAM 2 image encoder
 

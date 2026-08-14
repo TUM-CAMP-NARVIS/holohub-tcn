@@ -366,7 +366,7 @@ Expected: `compile OK`; `pipelined: False`; workers `[(0, 2), (1, 3)]`; suites 8
 
 ```bash
 git add applications/tcn_artekmed/tcn_shm_vlm_inference/python/langsam_multicam_fragment.py \
-        applications/tcn_artekmed/tcn_shm_vlm_inference/python/tcn_shm_vlm_inference.yaml
+        applications/tcn_artekmed/tcn_shm_vlm_inference/python/tcn_all.yaml
 git commit -m "$(cat <<'EOF'
 feat(tcn_artekmed): gpu_workers.pipelined selects the 3-operator worker
 

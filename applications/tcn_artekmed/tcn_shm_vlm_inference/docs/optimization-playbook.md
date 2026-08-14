@@ -224,7 +224,7 @@ is what made multi-GPU scaling work at all (§L5).
 
 This is high-value but by far the highest-effort lever: a two-stage export pipeline, four
 separate tracing gotchas, version-locked artifacts, and an accuracy regression still open. Budget
-accordingly. See `gdino_trt_export.md` for the full procedure.
+accordingly. See `../../tcn_all/docs/gdino_trt_export.md` for the full procedure.
 
 ### L5. Parallelise across GPUs — but only after the GIL is gone
 
@@ -733,12 +733,12 @@ before trusting a build-time single-image gate alone.)
 
 ## 9. Related documents
 
-- [`gdino_trt_export.md`](./gdino_trt_export.md) — the two-stage export procedure and its gotchas
+- [`../../tcn_all/docs/gdino_trt_export.md`](../../tcn_all/docs/gdino_trt_export.md) — the two-stage export procedure and its gotchas
 - [`dataflow-and-pipelining-roadmap.md`](./dataflow-and-pipelining-roadmap.md) — the extracted
   compute/data flow and the gated four-step plan for what remains
 - [`deferred-findings.md`](./deferred-findings.md) — review findings consciously not fixed, re-verified
-- [`sam_trt_export.md`](./sam_trt_export.md) — the single-stage SAM 2 encoder export and its gates
-- [`da3_onnx_export.md`](./da3_onnx_export.md) — the Depth-Anything-3 NHWC export
+- [`../../tcn_all/docs/sam_trt_export.md`](../../tcn_all/docs/sam_trt_export.md) — the single-stage SAM 2 encoder export and its gates
+- [`../../tcn_all/docs/da3_onnx_export.md`](../../tcn_all/docs/da3_onnx_export.md) — the Depth-Anything-3 NHWC export
 - [`specs/2026-08-04-gdino-batched-inference-design.md`](./specs/2026-08-04-gdino-batched-inference-design.md) — batching design, corrections and measured results
 - [`specs/2026-08-05-sam-encoder-trt-design.md`](./specs/2026-08-05-sam-encoder-trt-design.md) — SAM encoder → TRT, with the gate-design correction
 - [`specs/2026-08-05-per-worker-engines-design.md`](./specs/2026-08-05-per-worker-engines-design.md) — per-worker batches and the `gpu_workers` topology node

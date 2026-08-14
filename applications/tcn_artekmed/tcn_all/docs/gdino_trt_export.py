@@ -633,7 +633,7 @@ def main():
                          "named _b<N>_ so a mismatched pair cannot be combined by accident. "
                          "(default: 1; mutually exclusive with --from-config)")
     ap.add_argument("--from-config", default=None,
-                    help="path to tcn_shm_vlm_inference.yaml; builds one engine per distinct "
+                    help="path to tcn_all.yaml; builds one engine per distinct "
                          "worker camera count in its gpu_workers node (mutually exclusive "
                          "with --batch). Pass the SAME --from-config to both --stage export "
                          "and --stage build.")
