@@ -294,6 +294,28 @@ explicit cross-edge event ordering. Full numbers and design context:
 > overlapping stages; a wall-time gate that treats stage duration as fixed can be wrong by triple
 > digits in the wrong direction when that duration is itself contention-dependent.
 
+#### L7 addendum (2026-08-16): the sign flips when GDINO is on PyTorch
+
+L7's verdict was measured with GDINO on TensorRT at ~70 ms. Re-measured on the live stream with
+GDINO on **PyTorch** at ~242 ms (`gdino_backend` unset, deliberately — see the prompt-flexibility
+note), the conclusion **reverses**:
+
+| | `pipelined: true` | `pipelined: false` |
+|---|---|---|
+| `gdino` (median) | 368.9 ms | **241.7 ms** |
+| `sam` (median) | 131.4 ms | **44.1 ms** |
+| worker0 tick | **426.1 ms** | 456.0 ms |
+| throughput | **2.26 fps** | 2.11 fps |
+
+Turning pipelining off removed the stage inflation exactly as L7 describes — both stages came out
+*better* than the monolithic baseline. But the period is `max(stage)` pipelined and `sum(stages)`
+monolithic, and with one stage at 242 ms the overlap is worth more than the inflation it causes.
+Confirmed across two independent `pipelined: false` runs (2.11 / 2.12 fps).
+
+> **Transferable:** a pipelining verdict is a property of the *stage-duration ratio*, not of the
+> code. Re-measure it whenever the dominant stage changes by a large factor — a backend swap
+> qualifies. Expect L7's original conclusion to reassert itself once the GDINO TRT engine returns.
+
 ### L8. SAM batched decode across cameras — POSITIVE, +9.7% (adopted pending correctness gate)
 
 Step 4a of the roadmap: replace `SAM.predict_batch_gpu`'s per-camera Python decode loop

@@ -1,253 +1,199 @@
+# =====================================================================================================
+# tcn_shm_vlm_inference -- application configuration
+# =====================================================================================================
+#
+# ORDERED BY DATA FLOW. Read top to bottom and you walk the pipeline:
+#
+#     source  ->  per-camera streams  ->  depth        \
+#                                      ->  segmentation  >  mask/depth join  ->  object tracking
+#                                                       /
+#                                                                      ->  visualisation  ->  debug
+#
+#   1. APPLICATION          identity and packaging
+#   2. SOURCE               where frames come from (live shm, or a dataset replay)
+#   3. RUNTIME              process-wide resources, pose tree, and which stages run at all
+#   4. DEPTH                backprojection and the Depth-Anything variants
+#   5. SEGMENTATION         GPU topology, prompts, LangSAM (Grounding DINO + SAM 2)
+#   6. MASK / DEPTH JOIN    temporal sync, then sampling the panoptic map onto the depth grid
+#   7. OBJECT TRACKING      per-camera reduction -> cross-camera fusion -> identity over time
+#   8. VISUALISATION        one block per Holoviz window
+#   9. DEBUG / GATING       dumps and verification switches
+#  10. UNUSED               inherited from tcn_shm_receiver, read by nothing here
+#
+# ANNOTATION CONVENTION. Every option carries `default:` (what the CODE falls back to when the key is
+# absent -- which is NOT always the value set here), plus `range:` where one is enforced or physically
+# meaningful, and `typical:` where the useful band is narrower than the legal one.
+#
+# TWO TRAPS worth knowing before you edit anything:
+#   - yaml-cpp resolves a bare AND a quoted `y`/`n` to a boolean. Any axis option must therefore be
+#     spelled `axis_y`, never `y`. The operators reject the boolean with an explanation.
+#   - Several options are read by the OFFLINE ENGINE BUILDERS as well as the app
+#     (docs/gdino_trt_export.py, docs/sam_trt_export.py, both with --from-config). Changing those
+#     means rebuilding engines; the app fails fast at startup and prints the command.
+# =====================================================================================================
+
+
+# =====================================================================================================
+# 1. APPLICATION
+# =====================================================================================================
+
 application:
   title: TCN Artekmed Shm Receiver
   version: 1.0
   inputFormats: []
   outputFormats: ["screen"]
 
-# ---------------------------------------------------------------------------
-# Frame source -- "shm" (default) is the live pipeline, unchanged behaviour. "dataset" replays
-# a fixed on-disk export through TcnDatasetReplayerOp instead of TcnShmSubscriberOp, for
-# deterministic correctness gating: run twice with different settings, dump masks to two
-# directories (mask_dump_dir below), then compare with docs/compare_mask_dumps.py. See
-# docs/specs/2026-08-10-replay-harness-design.md §2.1/§2.2/§2.4.
-# ---------------------------------------------------------------------------
+
+# =====================================================================================================
+# 2. SOURCE -- where frames come from
+# =====================================================================================================
+#
+# "shm"     the live pipeline: TcnShmSubscriberOp attached to a running publisher.
+# "dataset" replays a fixed on-disk export through TcnDatasetReplayerOp instead, for deterministic
+#           correctness gating -- run twice with different settings and diff the results. The replayer
+#           is a drop-in: same ports, same tensor names, same channel order, so nothing downstream can
+#           tell. See docs/specs/2026-08-10-replay-harness-design.md.
+#
+# default: "shm"  |  range: "shm" | "dataset"
 source: "shm"
 
-# Only read when source: "dataset". `frame_count` is REQUIRED, not just a preload cap: the app
-# bounds the run with CountCondition(count=frame_count) so a harness run terminates on its own
-# instead of running forever, and passes the SAME value straight through as the replayer's own
-# `frame_count` -- so one run emits exactly this many frames, once, in "auto" playback.
-dataset_source:
-  # k4a_capture matches the live camera resolution (2048x1536); orbbec_capture (1920x1080)
-  # does not but is fine for correctness A/B. See design doc "Dataset facts".
-  path: "/workspace/volumes/artekmed_test_data/data/k4a_capture"
-  cameras: ["camera01", "camera02", "camera03", "camera04"]
-  frame_count: 6
-  loop: false
-  playback: "auto"
-
-# Only read when this is non-empty. Writes one <mask_dump_dir>/frame<NNNNNN>_<camera>.npy per
-# camera per tick from the langsam_multicam mask collector's output. Unset (default "") ->
-# MaskDumpOp is not built at all, so a live run pays nothing. Requires
-# camera_stream_processing.enable_langsam_multicam: true. See
-# docs/compare_mask_dumps.py and design doc §2.2.
-mask_dump_dir: ""
-#mask_dump_dir: "/srv/tmp/harness/bd_on"
-
-# ---------------------------------------------------------------------------
-# Temporal synchronisation of the mask and depth streams
-# (docs/specs/2026-08-11-temporal-sync-design.md). Requires
-# camera_stream_processing.enable_langsam_multicam: true.
-#
-# The mask path runs ~5 fps and about two frames behind the source while depth is independent and
-# faster, so pairing a mask with "whatever depth is current" mis-registers it by a varying amount.
-# When enabled, only groups sharing one acquisition timestamp are emitted.
-#
-# Capacities are PER STREAM on purpose: each must exceed that stream's worst-case skew relative to
-# the slowest stream, so the fast stream (depth) needs several times more slots than the slow one.
-# Size depth_capacity from the real depth cadence once DA2/DA3 are enabled -- 16 is a placeholder.
-#
-# `match_policy: exact` is correct while every camera arrives through ONE shared-memory segment:
-# the subscriber stamps one acquisition time per composite buffer and all cameras share it.
-temporal_sync:
-  enabled: true
-  masks_capacity: 4
-  depth_capacity: 16
-  match_policy: "exact"     # exact | window
-  window_ns: 0              # only used by 'window'
-  verbose: false
-
-# ---------------------------------------------------------------------------
-# Mask/depth join (docs/specs/2026-08-12-mask-depth-join-design.md). Requires temporal_sync.enabled:
-# joining a mask to an unsynchronised depth frame is exactly the mis-registration this path removes.
-#
-# Per camera: depth -> backprojection -> texcoords -> sample the panoptic map onto the depth grid ->
-# apply_mask. Needs per-camera calibration; the dataset source loads it from the export's
-# calibration/<camera>.json, the shm source from the device context.
-mask_depth_join:
-  enabled: true
-  # Class ids (the high byte of the packed panoptic label) whose pixels the mask marks. Empty means
-  # every non-background class. Ids follow the prompt order in langsam_multicam -- see class_id_map.
-  select_classes: []
-  # Depth pixels whose mask is 0 are zeroed. Set true to keep the background instead.
-  invert_mask: false
-  # Label written where a depth pixel has no colour correspondence (invalid depth, or projecting
-  # outside the colour frustum). 0 is background, which is almost always what you want.
-  unlabeled_value: 0
-
-  # Classes the fused point-cloud view draws, one HolovizOp spec (hence one colour) each. Empty
-  # derives them from text_prompts.prompts, which is what keeps them from drifting out of step with
-  # what LangSAM actually detects: class ids are 1-based prompt positions.
-  pointcloud_classes: []
-  # Log per-class point counts every frame.
-  verbose: false
-  # Verification operators (JoinCheckOp / CloudFusionCheckOp). They read every output back with GPU
-  # reductions -- one sync per camera per frame -- and assert that a pixel selected by the mask kept
-  # its depth, which is what caught a use-after-free in the stream splitter. Keep on while gating;
-  # turn off for a latency-sensitive live run.
-  check: false
-  # The join allocates dozens of small, variable-sized tensors per frame, so it uses its own
-  # RMMAllocator rather than the frame-sized BlockMemoryPool the rest of the app shares.
-  pool_initial_size: "256MB"
-  pool_max_size: "1GB"
-
-# ---------------------------------------------------------------------------
-# Object tracking: class-labelled bounding boxes with stable ids.
-#
-# Requires mask_depth_join.enabled. Instance ids in the panoptic map are per-camera, per-frame
-# CONFIDENCE RANKS, not identities -- this path turns them into one entry per physical object:
-# per-camera reduction (tcn_instance_stats) -> cross-camera fusion -> temporal tracking -> console.
-object_tracking:
-  enabled: true
-  # --- per-camera reduction: outlier rejection before the box is measured ---
-  # Discard this fraction of points from EACH end of every axis, by COUNT, before measuring the box.
-  # Percentiles rather than standard deviations: a blob holding a quarter of an instance's points
-  # inflates sigma enough that the +-k*sigma window contains the blob itself (the masking effect), and
-  # iterating the clip cannot escape it -- the first pass rejects nothing, so it is already at a fixed
-  # point. Iterating also erodes a clean cluster, since each pass discards the tails of the last.
-  #
-  # The BREAKDOWN POINT is exactly this value: outliers up to this fraction are removed however far
-  # away they lie, and a larger population survives. Rejecting an arbitrarily large second mode needs
-  # density or connected-component selection (see the operator README) -- not a bigger percentile,
-  # which would start eating the object itself.
-  trim_percentile: 0.02   # keep the 2nd..98th percentile per axis
-  trim_margin: 0.05       # widen the kept range by 5%, so bin resolution does not shave real extremes
-  min_range_m: 0.01       # keeps a perfectly flat instance from rejecting all of its own points
-  # --- yaw-oriented boxes ---
-  # The box stays axis-aligned VERTICALLY and is rotated only about the up axis, because objects in a
-  # room stand upright -- a full 3D orientation would fit noise in the one direction already known.
-  # The yaw comes from the ground-plane covariance of the surviving (trimmed) points.
-  #
-  # min_anisotropy is the ratio the two in-plane eigenvalues must differ by before the yaw is trusted:
-  # a near-circular footprint (a standing person) has no meaningful orientation, and fitting one to
-  # noise makes the box spin frame to frame. Below it the yaw is 0 and the oriented box degenerates to
-  # the axis-aligned one, which is why a person's box looks unrotated while a bed's does not.
-  min_anisotropy: 1.5
-  render_oriented_boxes: false
-  # How far the yaw may swing and still have the oriented box smoothed like the axis-aligned one. Its
-  # extents are measured IN the yaw frame, so past a real re-orientation the old ones mean something
-  # else and blending them would report a box that fits nothing. 0.26 rad = 15 deg.
-  max_yaw_smoothing_delta_rad: 0.26
-  min_points: 500         # fewer than this is depth noise or mask fringe, not an object. At
-                          # depth-camera resolution 64 admitted 100-point "people"; several hundred
-                          # corresponds to a patch of real size.
-  max_instances: 64       # per camera per frame; overflow is warned about, never silently truncated
-  # --- cross-camera fusion (metres; the world frame is metric) ---
-  fusion_iou_threshold: 0.15      # two cameras seeing the same body
-  fusion_containment: 0.6         # one view is a subset of the other (torso vs whole person)
-  fusion_footprint_iou: 0.4       # same ground footprint...
-  fusion_max_vertical_gap_m: 0.5  # ...and vertically adjacent: a mask split by an occluder
-  fusion_max_distance_m: 0.5      # stops single-linkage chaining across a room
-  # --- rejecting non-objects and aggregates (this is what controls object COUNT) ---
-  # A box must be at least this large on EVERY axis. Removes the flat slivers a mask fringe produces
-  # (extents like 0.27 x 0.33 x 0.03 m), which no volume or overlap rule catches.
-  min_extent_m: 0.12
-  # A second, scene-level point threshold on top of the per-camera one above.
-  fusion_min_points: 800
-  # Prefer individual identities over class-like aggregates: a box that contains this many MUTUALLY
-  # DISJOINT smaller boxes of its class is a mask covering several objects, so it is dropped and its
-  # constituents kept. One contained box is a partial view (a torso inside a person) and still merges.
-  # Set aggregate_min_children: 0 to disable.
-  aggregate_containment: 0.7
-  aggregate_min_children: 2
-  aggregate_min_volume_ratio: 1.5   # a container must be meaningfully larger than its children
-  # --- corroboration: the strongest lever on object COUNT for this data ---
-  # An object only ONE camera ever saw is usually mask fringe or a partial detection nothing else
-  # confirms. 2 removes those outright; the cost is that an object at the edge of the room, genuinely
-  # visible to one camera only, disappears. Keep 1 where coverage does not overlap.
-  min_cameras: 2
-  # Applied to the FUSED object, so several small partial views that together make a plausible object
-  # survive where each alone would not. THIS is the effective lever on object count for this data:
-  # measured on the 4-camera replay (8 frames), everything else at these defaults --
-  #     min_detection_points     0 -> 22.0 objects/frame, 24 ids, 4 id-set changes
-  #                           2000 -> 15.9              , 17    , 2
-  #                           3000 ->  9.5              , 10    , 1
-  #   (min_cameras: 2 gives 8.5 / 9 / 1, i.e. the same, but by dropping single-camera objects
-  #    outright -- filtering on evidence quantity is preferred to filtering on viewpoint count.)
-  # Scene-scale dependent: 3000 points is a patch of real size at this depth resolution.
-  min_detection_points: 3000
-  min_detection_extent_m: 0.0
-  # Which world axis is UP. A property of the calibration, not a convention: backprojection applies
-  # each camera's depth_extrinsics, so "up" is whatever camera_pose made it. For the artekmed exports
-  # it is y -- check by printing object centres, where the vertical axis spans a narrow plausible
-  # height band (~0.8 m) while the horizontal axes span the room (4-7 m). A wrong value does not fail
-  # loudly; it just stops vertically split objects from merging.
-  # NOTE "axis_y", not "y": yaml-cpp resolves a bare AND a quoted `y` to boolean true, so the short
-  # form arrives in the operator as True. The operator rejects that with an explanation.
-  up_axis: "axis_y"
-  # --- identity over time ---
-  min_hits: 3             # observations before an object is reported, so a blip never gets an id
-  max_age: 8              # missed frames before retirement (~1.6 s at 5 fps); then a NEW id
-  track_iou_threshold: 0.1
-  track_max_distance_m: 1.0
-  box_smoothing: 0.5      # 0 = follow the raw box; higher damps depth jitter and lags motion
-  # --- output ---
-  # Overlay each object's box on the segmented point cloud, coloured by class from the same LUT the
-  # points use, so a box reads as "the box around those points".
-  render_boxes: true
-  box_line_width: 3.0
-  # Per-frame console block: 0 = shutdown summary only. The boxes are in the viewer; set to 1 (or N)
-  # when debugging the numbers behind them.
-  print_every: 0
-  verbose: false
-  verbose_instances: false
-
-# The fused labeled point cloud. Same viewer path as tcn_shm_receiver's point fusion (merge across
-# cameras, flatten, POINTS_3D), one chain per class so classes are separable by colour.
-labeled_pointcloud_holoviz:
-  width: 1280
-  height: 720
-  window_title: "Labeled Point Cloud (fused)"
-  headless: false
-
-# Read by the per-camera backprojection ops in the join. depth_units_per_meter is a property of the
-# capture format (Azure Kinect / Orbbec write millimetres) and a wrong value scales every unprojected
-# point linearly; the limits reject depth samples outside them, whose texcoords then come back NaN.
-depthimage_backprojection:
-  depth_units_per_meter: 1000.0
-  near_limit_m: 0.01
-  far_limit_m: 10.0
-
+# ---- live source (only read when source: "shm") -----------------------------------------------------
 shared_memory:
+  # iceoryx2 service name the publisher advertises. Must match the publisher exactly or discovery
+  # returns nothing and startup fails.
+  # default: "camera_streams"
   stream_name: "camera_streams"
+  # Service name for the parameter RPC channel (runtime prompt updates, camera settings).
+  # default: "tcn_shm_receiver"
   parameter_rpc_name: "tcn_shm_receiver"
+  # Subscriber poll interval. Below the frame interval so no frame waits on the poll; 1 ms is well
+  # under the ~70 ms camera cadence and costs nothing measurable.
+  # default: 1  |  range: >= 1  |  typical: 1-5
   cycle_time_ms: 1
 
+# ---- replay source (only read when source: "dataset") -----------------------------------------------
+dataset_source:
+  # k4a_capture matches the live camera resolution (2048x1536); orbbec_capture (1920x1080) does not,
+  # but is fine for correctness A/B where absolute scale does not matter.
+  path: "/workspace/volumes/artekmed_test_data/data/k4a_capture"
+  # Must match gpu_workers.workers below -- the app validates the two at startup and fails fast,
+  # naming exactly which cameras are missing or extra.
+  cameras: ["camera01", "camera02", "camera03", "camera04"]
+  # REQUIRED, and not merely a preload cap: the app bounds the run with CountCondition(frame_count)
+  # so a harness run terminates on its own instead of running forever, and passes the same value to
+  # the replayer. One run emits exactly this many frames, once, in "auto" playback.
+  # NOTE the mask path runs several frames behind, so the number of frames that reach the TRACKER is
+  # smaller than this -- budget roughly 6-8x this value if you need N tracked frames.
+  # default: none (required)  |  typical: 6 for a smoke test, 40-200 for a gate
+  frame_count: 6
+  # Replay the export repeatedly. Each pass advances the acquisition timestamps, or consumers keyed on
+  # frame identity would correctly reject pass 2 as already-seen.
+  # default: false
+  loop: false
+  # "auto" emits as fast as the graph accepts; "realtime" paces to the recorded capture times.
+  # default: "auto"  |  range: "auto" | "realtime"
+  playback: "auto"
+  # Emit depth as well as colour. Forced true when mask_depth_join.enabled, since the join unprojects
+  # the depth image.
+  # default: false
+  emit_depth: false
+
+
+# =====================================================================================================
+# 3. RUNTIME -- resources, pose tree, and which stages exist
+# =====================================================================================================
+
+# Packaging hints for `holohub package`. Not read at runtime.
+resources:
+  cpu: 24
+  gpu: 1
+  memory: 1Gi
+  gpuMemory: 1Gi
+
+# Capacity of the pose tree that carries camera extrinsics. All seven are pre-allocation sizes, not
+# limits on meaning: exceeding one throws at insert time rather than degrading. The defaults are the
+# Holoscan SDK's own and there is no reason to change them for a 5-camera rig.
+pose_tree_config:
+  number_frames: 1024                # default: 1024
+  number_edges: 16384                # default: 16384
+  history_length: 1048576            # default: 1048576
+  default_number_edges: 16           # default: 16
+  default_history_length: 1024       # default: 1024
+  edges_chunk_size: 4                # default: 4
+  history_chunk_size: 64             # default: 64
+
+# The master switches: which processing stages are built into the graph at all. An operator that is
+# not enabled here is never constructed, so its configuration below is inert.
 camera_stream_processing:
+  # CUDA device the shared per-camera resources (stream pool, block memory pool) live on. The LangSAM
+  # workers place themselves independently -- see gpu_workers.workers.
+  # default: 0  |  range: a valid CUDA ordinal
   device_id: 0
+  # Frames held in the subscriber's ring. Too small drops frames under a hiccup; too large adds
+  # latency without adding throughput.
+  # default: 8  |  typical: 4-16
   buffer_size: 8
+  # Depth Anything V2 -- monocular depth, single camera.  default: false
   enable_da2: False
+  # Depth Anything V3 -- monocular depth, single camera.  default: false
   enable_da3: False
+  # Single-camera LangSAM (the prompted path). Mutually exclusive in practice with the multicam path
+  # below, which is the one this application exists for.
+  # default: false
   enable_langsam: False
+  # Multi-camera LangSAM. THE main path: everything from section 5 onward depends on it, and
+  # temporal_sync / mask_depth_join / object_tracking all require it.
+  # default: false
   enable_langsam_multicam: True
 
 
-# Depth Anything V2 Example
+# =====================================================================================================
+# 4. DEPTH
+# =====================================================================================================
+
+# Read by the per-camera backprojection ops in the join. `depth_units_per_meter` is a property of the
+# CAPTURE FORMAT (Azure Kinect and Orbbec both write millimetres); a wrong value scales every
+# unprojected point linearly and silently. The limits reject depth samples outside them, whose
+# texcoords then come back NaN and whose pixels therefore go unlabelled.
+depthimage_backprojection:
+  # default: 1000.0  |  1000.0 for millimetre depth, 1.0 for metre depth
+  depth_units_per_meter: 1000.0
+  # default: 0.01  |  range: > 0  |  below the sensor's own near plane is harmless
+  near_limit_m: 0.01
+  # default: 10.0  |  typical: 4-10 for a room; lower trims far-wall noise cheaply
+  far_limit_m: 10.0
+
+# ---- Depth Anything V2 (enable_da2) ------------------------------------------------------------------
 da2_inference_config:
   model_path: "/srv/models/active/depth_anything_v2/depth_anything_v2_vits.onnx"
 
 da2_preprocessor:
   out_tensor_name: preprocessed
   out_dtype: "float32"
+  # The model's trained input size. Changing it needs a matching export.
   resize_width: 518
   resize_height: 518
   scale_min: 0.0
   scale_max: 1.0
 
 da2_inference:
-  backend: "trt"
+  backend: "trt"                     # default: "trt"  |  range: "trt" | "onnxrt" | "torch"
   pre_processor_map:
     "depth_v2": ["preprocessed"]
   inference_map:
     "depth_v2": ["inference_output"]
   input_on_cuda: true
+  # false = model_path is an ONNX file to be converted; true = it is already a built engine.
   is_engine_path: false
 
-# Depth Anything V3 Example
+# ---- Depth Anything V3 (enable_da3) ------------------------------------------------------------------
 da3_inference_config:
   model_path: "/srv/models/active/depth_anything_v3/4010e39f3634a45bc60553321fb49fb760bd594e.onnx"
-  # Metric depth display range in meters (colorized: near -> red, far -> blue)
+  # Metric depth display range, metres. Colourised near -> red, far -> blue. Display only; does not
+  # affect the depth values themselves.
+  # default: 0.3  |  typical: 0.3-1.0
   depth_near: 0.3
+  # default: 10.0  |  typical: 4-10
   depth_far: 10.0
 
 da3_preprocessor:
@@ -267,167 +213,489 @@ da3_inference:
   input_on_cuda: true
   is_engine_path: false
 
-# ---------------------------------------------------------------------------
-# GPU topology -- the single source of truth for which cameras run on which GPU.
-# Read by the application AND by the offline engine builders
-# (docs/gdino_trt_export.py / docs/sam_trt_export.py, --from-config), so the engines that
-# exist always match the split that runs.
+
+# =====================================================================================================
+# 5. SEGMENTATION -- GPU topology, prompts, LangSAM
+# =====================================================================================================
+
+# -----------------------------------------------------------------------------------------------------
+# The single source of truth for which cameras run on which GPU. Read by the application AND by the
+# offline engine builders (docs/gdino_trt_export.py, docs/sam_trt_export.py, --from-config), so the
+# engines that exist always match the split that runs.
 #
-# A worker's ENGINE BATCH is its camera count -- derived, never configured. GPU 0 gets the
-# smaller share because it also drives Holoviz, the collector and colorize.
-# Changing a split means rebuilding that batch; the app fails fast at startup with the command.
+# A worker's ENGINE BATCH is its camera count -- derived, never configured. GPU 0 gets the smaller
+# share because it also drives Holoviz, the collector and colorize. Changing a split means rebuilding
+# that batch; the app fails fast at startup and prints the command.
 #
-# Both camera counts below are real, supported deployment topologies (4-camera and 5-camera
-# rigs both run in production) -- not "production" vs "test". Pick the `workers:` block
-# matching the rig actually connected (or, in source: "dataset" mode, the export being
-# replayed) and comment out the other. Each profile needs its OWN engines, built for its own
-# batch sizes:
-#   5-camera rig (2/3 split): batch-2 AND batch-3 engines
-#   4-camera rig (2/2 split): batch-2 engines only
-# The app validates gpu_workers.workers against the active source's cameras at startup and
-# fails fast, naming exactly which cameras are missing/extra, if they don't match.
-# ---------------------------------------------------------------------------
+# Both camera counts below are real supported topologies (4- and 5-camera rigs both run in
+# production), not "production vs test". Uncomment the block matching the rig actually connected --
+# or, in source: "dataset" mode, the export being replayed -- and comment out the other:
+#     5-camera rig (2/3 split): needs batch-2 AND batch-3 engines
+#     4-camera rig (2/2 split): needs batch-2 engines only
+# -----------------------------------------------------------------------------------------------------
 gpu_workers:
-  # Run each worker's gdino/sam/panoptic as three chained operators instead of one, so stages
-  # overlap across frames (period tends toward max(stage) rather than sum(stage)). Costs ~2 ticks
-  # of extra mask latency. false -> the original single LangSamBatchOp per worker.
-  # See docs/specs/2026-08-07-langsam-pipelining-design.md.
-  pipelined: false
+  # Run each worker's gdino/sam/panoptic as three chained operators instead of one, so stages overlap
+  # across frames: the period tends toward max(stage) rather than sum(stage). Costs ~2 ticks of extra
+  # mask latency.
+  #
+  # THE RIGHT VALUE DEPENDS ON THE GDINO BACKEND, and the sign flips. Pipelining inflates each stage's
+  # own wall time (they contend for one CUDA stream), so it wins only when one stage is large enough
+  # that overlapping beats the inflation:
+  #     gdino on TRT     (~70 ms):  false is better -- playbook L7 measured -12.2% for true
+  #     gdino on PyTorch (~242 ms): true is better  -- measured 2.26 fps vs 2.11, worker tick 426 vs 456 ms
+  # Re-measure whenever the dominant stage changes by a large factor. See the L7 addendum in
+  # docs/optimization-playbook.md and docs/specs/2026-08-07-langsam-pipelining-design.md.
+  # default: false  |  currently true because langsam_inference.gdino_backend is "pytorch"
+  pipelined: true
 
   # -- 5-camera profile (needs batch-2 + batch-3 engines) --
+  #workers:
+  #  - device: 0
+  #    cameras: ["camera01_colorimage", "camera02_colorimage"]
+  #  - device: 1
+  #    cameras: ["camera03_colorimage", "camera04_colorimage", "camera05_colorimage"]
+
+  # -- 4-camera profile (needs batch-2 engines only) --
   workers:
     - device: 0
       cameras: ["camera01_colorimage", "camera02_colorimage"]
     - device: 1
-#      cameras: ["camera03_colorimage", "camera04_colorimage", "camera05_colorimage"]
       cameras: ["camera03_colorimage", "camera04_colorimage"]
 
-  # -- 4-camera profile (needs batch-2 engines only) --
-  # workers:
-  #   - device: 0
-  #     cameras: ["camera01_colorimage", "camera02_colorimage"]
-  #   - device: 1
-  #     cameras: ["camera03_colorimage", "camera04_colorimage"]
-
-# LangSAM (Grounding DINO + SAM2) Configuration
-langsam_inference:
-  # A/B: sam2.1_hiera_tiny (faster encoder) vs sam2.1_hiera_small (higher quality).
-  sam_type: "sam2.1_hiera_tiny"
-  sam_ckpt_path: null
-  gdino_model_ckpt_path: null  # Set to null to download from HuggingFace, or provide local path
-  gdino_processor_ckpt_path: null  # Set to null to download from HuggingFace, or provide local path
-  # Grounding DINO variant (used when the local paths above are null). "-tiny" (Swin-T) is
-  # a smaller backbone than "-base" (Swin-B); switch back to base if detection quality suffers.
-  gdino_model_id: "IDEA-Research/grounding-dino-tiny"
-  # Detector resize target (shortest edge, px). HF default is 800, which UPSCALES a typical
-  # camera frame -- the main GDINO cost is here, not the backbone. Lower = faster; raise
-  # toward 640/800 if small objects are missed. null = keep the HF default (800).
-  gdino_input_size: 512
-  # Run Grounding DINO fully on GPU (no PIL / CPU image processor / host<->device copies,
-  # cached text tokenization). Set false to fall back to the original PIL path.
-  gdino_gpu_preprocess: true
-  # Keep SAM masks on the GPU (avoids SAM2's full-res float mask device->host->device
-  # roundtrip). Set false to use the stock numpy predict_batch path.
-  sam_gpu_output: true
-  # SAM 2 image encoder backend: "pytorch" (eager) | "trt" (prebuilt engine from
-  # docs/sam_trt_export.py). The _b<N>_ in the engine name is its FIXED batch, baked at ONNX
-  # trace time; N must be >= every worker's camera count and smaller workers pad up to it.
-  sam_backend: "trt"
-  sam_trt_engine: "/srv/models/active/sam2/sam2.1_hiera_tiny_encoder_b{batch}_fp16.engine"
-  # Panoptic-map paint backend: "cupy" (existing per-detection boolean-mask assignment) |
-  # "cuda" (fused kernel, one launch per camera -- see
-  # docs/specs/2026-08-10-panoptic-cuda-design.md). cupy's nonzero()-based scatter forces a
-  # device sync PER DETECTION (~45 syncs/tick measured, 28.5 ms wall for ~3 ms of real GPU
-  # work); "cuda" removes that. Falls back to "cupy" with a loud WARNING if the compiled
-  # extension (operators/tcn_artekmed/tcn_panoptic_map) is missing.
-  panoptic_backend: "cuda"
-  # Decode all of a worker's cameras' boxes in ONE SAM mask-decoder call instead of looping
-  # per camera (see docs/specs/2026-08-10-sam-batched-decode-design.md). Output is
-  # near-identical to the loop, NOT bitwise-identical (batching reassociates floating-point
-  # reductions). Falls back to the loop if a worker's cameras do not all share one resolution.
-  sam_batched_decode: true
-  # torch.compile the GDINO model / SAM2 image encoder (no quality loss). WARNING: first-
-  # forward compilation is heavy on host RAM and can OOM (SIGKILL/-9), especially GDINO.
-  # Enable ONE at a time and watch memory; sam_compile is the safer/cleaner target.
-  gdino_compile: false
-  # sam_compile MUST stay false while `gpu_workers.workers` has more than one worker.
-  # Dynamo's tracer and the autocast cache are PROCESS-global: one worker tracing the SAM
-  # encoder while another leaves the global torch.autocast context can deadlock both
-  # permanently (hard hang, only SIGKILL recovers).
-  #
-  # MEASURED 2026-08-05 (sam_compile: true, 2 workers, batch-3 GDINO engine, 586 s run):
-  #  - The compiles are a STARTUP cost, NOT recurring mid-run re-traces as previously assumed:
-  #    4 stalls totalling 284 s, all inside the first 146 s (two graphs per worker, longest
-  #    single call 78 s), then none for the remaining ~440 s.
-  #  - Both workers compiled CONCURRENTLY (t=+0.3 s on both) -- exactly the deadlock condition.
-  #    That run survived it. That is luck, not a guarantee, and the window reopens every start.
-  #  - Steady-state gain is only +4.5% (period 194.5 -> 186.2 ms, 5.14 -> 5.37 fps): compile
-  #    speeds up the SAM ENCODER, but the per-image decode loop -- about half the sam stage --
-  #    is untouched. Effective throughput over the run was 3.96 fps, a 23% REGRESSION, because
-  #    of the startup stalls; break-even is around a one-hour run.
-  # Making it safe would need a CONSTANT SAM batch (one graph only) plus warmup in __init__,
-  # where operator construction is sequential and so closes the concurrency window. Not worth
-  # it for +4.5%: the SAM encoder is moving to TensorRT instead, which removes Dynamo entirely.
-  sam_compile: false
-  box_threshold: 0.3
-  text_threshold: 0.25
-  # Grounding DINO backend: "pytorch" (current) | "trt" (prebuilt TensorRT engine).
-  # "trt" requires an engine + text tensors built offline by docs/gdino_trt_export.py; keep
-  # "pytorch" until those artifacts exist. gdino_trt_hw must match the engine's build size.
-  #
-  # The _b<N>_ in the engine name is its FIXED batch, baked at ONNX trace time (a Where in the
-  # encoder fusion attention is only broadcast-conformable at the traced batch). N must be >=
-  # every worker's camera count in gpu_workers above; smaller workers pad up to it and
-  # discard the extra slices. Changing a worker's camera count above N needs a re-export AND a
-  # rebuild, both at --batch <new N> -- the runtime fails fast at startup with the command.
-  gdino_backend: "pytorch"
-#  gdino_backend: "trt"
-  gdino_trt_engine: "/srv/models/active/groundingdino/gdino_swint_512x672_b{batch}_tf32.engine"
-  gdino_trt_text: "/srv/models/active/groundingdino/gdino_swint_prompts.npz"
-  gdino_trt_hw: [512, 672]
-  # Set true to log rolling GDINO-vs-SAM per-stage timing (to find the bottleneck).
-  # Cameras that are physically mounted UPSIDE DOWN. Each named camera is rotated 180 degrees on the
-  # way into Grounding DINO and SAM, and its mask is rotated back on the way out -- so recognition
-  # sees an upright scene while every geometric consumer downstream (texcoord sampling, point clouds,
-  # boxes) still works in the camera's native orientation. A 180-degree rotation is exactly invertible
-  # and needs no resampling, which is why this is safe where an arbitrary angle would not be.
-  # Accepts "camera01" or "camera01_colorimage"; an unknown name is refused, because a typo would
-  # silently leave that camera unrotated and look like a model problem.
-  flip_cameras: ["camera01", "camera03", "camera04"]
-  # e.g. at NARVIS, where 1, 3 and 4 are inverted:
-  # flip_cameras: ["camera01", "camera03", "camera04"]
-
-  timing: false
-  timing_log_every: 30
-
+# The open-vocabulary prompt set. ORDER IS SEMANTIC: class ids are 1-based positions in this list
+# (class_id_map), so reordering renumbers every class, invalidates any hard-coded
+# mask_depth_join.select_classes / pointcloud_classes, and resets the tracker.
+# More prompts cost GDINO time roughly linearly in token count.
 text_prompts:
 #  prompts: ["floor", "person", "robot", "furniture", "lamp"]
 #  prompts: ["floor", "person"]
 #  prompts: ["person", "bed", "device", "hololens", "pipes"]
   prompts: ["person", "computer", "monitor", "table", "chair"]
 
+# -----------------------------------------------------------------------------------------------------
+# LangSAM = Grounding DINO (open-vocabulary detection) -> SAM 2 (mask per box) -> panoptic paint.
+# Grouped below as: models -> backends -> per-stage tuning -> geometry -> instrumentation.
+# -----------------------------------------------------------------------------------------------------
+langsam_inference:
+
+  # ---- models -----------------------------------------------------------------------------------
+  # A/B: sam2.1_hiera_tiny (faster encoder) vs sam2.1_hiera_small (higher quality).
+  # default: "sam2.1_hiera_tiny"
+  sam_type: "sam2.1_hiera_tiny"
+  # null downloads from HuggingFace; set a path to pin a local checkpoint.
+  # default: null
+  sam_ckpt_path: null
+  gdino_model_ckpt_path: null
+  gdino_processor_ckpt_path: null
+  # Grounding DINO variant, used when the two paths above are null. "-tiny" (Swin-T) is a smaller
+  # backbone than "-base" (Swin-B); switch to base if detection quality suffers.
+  # default: "IDEA-Research/grounding-dino-tiny"
+  gdino_model_id: "IDEA-Research/grounding-dino-tiny"
+
+  # ---- backends ---------------------------------------------------------------------------------
+  # Grounding DINO backend. "trt" needs an engine + text tensors built offline by
+  # docs/gdino_trt_export.py; keep "pytorch" until those artifacts exist, and note that "trt" bakes
+  # the PROMPT TEXT into the engine -- prompts become fixed at export time, which is the reason to
+  # stay on "pytorch" while still iterating on text_prompts.
+  # PyTorch costs ~242 ms/stage against TRT's ~70 ms, so this is the single largest performance lever
+  # in the file. It also decides gpu_workers.pipelined above.
+  # default: "pytorch"  |  range: "pytorch" | "trt"
+  gdino_backend: "pytorch"
+#  gdino_backend: "trt"
+  # The _b<N>_ in the engine name is its FIXED batch, baked at ONNX trace time (a Where in the encoder
+  # fusion attention is only broadcast-conformable at the traced batch). N must be >= every worker's
+  # camera count above; smaller workers pad up to it and discard the extra slices. Growing a worker
+  # past N needs a re-export AND a rebuild, both at --batch <new N>; the runtime fails fast with the
+  # command. {batch} is substituted per worker.
+  gdino_trt_engine: "/srv/models/active/groundingdino/gdino_swint_512x672_b{batch}_tf32.engine"
+  gdino_trt_text: "/srv/models/active/groundingdino/gdino_swint_prompts.npz"
+  # Must match the engine's build size exactly.
+  # default: [512, 672]
+  gdino_trt_hw: [512, 672]
+
+  # SAM 2 image encoder backend. Same fixed-batch rule as GDINO above.
+  # default: "pytorch"  |  range: "pytorch" | "trt"
+  sam_backend: "trt"
+  sam_trt_engine: "/srv/models/active/sam2/sam2.1_hiera_tiny_encoder_b{batch}_fp16.engine"
+
+  # Panoptic-map paint backend. cupy's boolean-mask assignment expands to nonzero() + scatter, and
+  # nonzero() forces a device sync PER DETECTION (~45 syncs/tick measured, 28.5 ms wall for ~3 ms of
+  # real GPU work). "cuda" is one fused kernel launch per camera and removes that.
+  # Falls back to "cupy" with a loud WARNING if operators/tcn_artekmed/tcn_panoptic_map is not built --
+  # a missing module costs performance, not correctness, which is why it is easy to miss in a long log.
+  # See docs/specs/2026-08-10-panoptic-cuda-design.md.
+  # default: "cupy"  |  range: "cupy" | "cuda"
+  panoptic_backend: "cuda"
+
+  # ---- detection tuning -------------------------------------------------------------------------
+  # Detector resize target, shortest edge in px. The HF default of 800 UPSCALES a typical camera
+  # frame, and the main GDINO cost is here rather than in the backbone. Lower = faster; raise toward
+  # 640/800 if small objects are missed. null keeps the HF default.
+  # default: null (=800)  |  typical: 512-800
+  gdino_input_size: 512
+  # Minimum detection confidence. Lower admits more (and more marginal) objects; the downstream
+  # object_tracking thresholds are the better place to control object count.
+  # default: 0.3  |  range: [0, 1]  |  typical: 0.25-0.4
+  box_threshold: 0.3
+  # Minimum token-match score for assigning a detection to a prompt.
+  # default: 0.25  |  range: [0, 1]  |  typical: 0.2-0.35
+  text_threshold: 0.25
+
+  # ---- host<->device hygiene (all wins, no quality cost) -----------------------------------------
+  # Run GDINO fully on GPU: no PIL, no CPU image processor, no host<->device round trips, cached text
+  # tokenisation. false falls back to the original PIL path.
+  # default: false
+  gdino_gpu_preprocess: true
+  # Keep SAM masks on the GPU, avoiding SAM 2's full-res float mask device->host->device round trip.
+  # false uses the stock numpy predict_batch path.
+  # default: false
+  sam_gpu_output: true
+  # Decode all of a worker's cameras' boxes in ONE SAM mask-decoder call instead of looping per
+  # camera. Measured -8.8% period / +9.7% fps. Output is near-identical to the loop but NOT
+  # bitwise-identical (batching reassociates floating-point reductions). Falls back to the loop if a
+  # worker's cameras do not all share one resolution.
+  # See docs/specs/2026-08-10-sam-batched-decode-design.md.
+  # default: false
+  sam_batched_decode: true
+
+  # ---- mask geometry ------------------------------------------------------------------------------
+  # Shrink every instance region of the panoptic map by this many pixels before it is emitted.
+  #
+  # This is the fix for mask BLEED. The map is sampled through the depth image's texcoords
+  # (tcn_label_sampler), so a mask overshooting its object by a few pixels labels BACKGROUND depth
+  # pixels as that object -- and those points are real, finite and metres away. They are exactly what
+  # object_tracking.trim_percentile spends its breakdown point on, so removing them here beats
+  # rejecting them downstream. Applied to the map EVERYTHING sees, including the 2D overlay, so what
+  # Holoviz draws is exactly what the point cloud is built from.
+  #
+  # The radius is in COLOUR pixels (2048x1536) while the depth grid is ~3x coarser, so below ~3 it
+  # barely moves a depth pixel. An object thinner than 2*radius+1 vanishes entirely -- that is what
+  # bounds it from above. Measured at r=4 on the replay: median box volume -31% for -15% of points.
+  # Cost is ~70-120 us per camera-frame; 0 costs nothing at all (no allocation, no launch).
+  # default: 0 (off)  |  range: >= 0  |  typical: 2-6
+  mask_erosion_px: 2
+  # Cameras that are physically mounted UPSIDE DOWN. Each named camera is rotated 180 degrees into
+  # GDINO and SAM and its mask rotated back on the way out, so recognition sees an upright scene while
+  # every geometric consumer downstream (texcoord sampling, point clouds, boxes) still works in the
+  # camera's native orientation. Exactly invertible and resampling-free, which is why 180 is safe
+  # where an arbitrary angle would not be.
+  # Accepts "camera01" or "camera01_colorimage"; an unknown name is REFUSED, because a typo would
+  # silently leave that camera unrotated and look like a model problem.
+  # default: []
+  flip_cameras: ["camera01", "camera03", "camera04"]
+
+  # ---- torch.compile (both default off, and should stay off) --------------------------------------
+  # WARNING: first-forward compilation is heavy on host RAM and can OOM (SIGKILL/-9), especially
+  # GDINO. Enable ONE at a time and watch memory.
+  # default: false
+  gdino_compile: false
+  # MUST stay false while gpu_workers.workers has more than one worker. Dynamo's tracer and the
+  # autocast cache are PROCESS-global: one worker tracing the SAM encoder while another leaves the
+  # global torch.autocast context can deadlock both permanently (hard hang, only SIGKILL recovers).
+  #
+  # MEASURED 2026-08-05 (true, 2 workers, batch-3 GDINO engine, 586 s run): the compiles are a STARTUP
+  # cost, not recurring re-traces -- 4 stalls totalling 284 s, all inside the first 146 s, then none
+  # for the remaining ~440 s. Both workers compiled CONCURRENTLY (t=+0.3 s apart), exactly the
+  # deadlock condition; that run survived it, which is luck, not a guarantee, and the window reopens
+  # every start. Steady-state gain is only +4.5% (194.5 -> 186.2 ms) because compile speeds the SAM
+  # ENCODER while the per-image decode loop -- about half the stage -- is untouched. Effective
+  # throughput over the run was a 23% REGRESSION; break-even is around one hour.
+  # Not worth fixing: the SAM encoder moved to TensorRT instead, which removes Dynamo entirely.
+  # default: false
+  sam_compile: false
+
+  # ---- instrumentation ----------------------------------------------------------------------------
+  # Log rolling GDINO-vs-SAM per-stage timing. Calls torch.cuda.synchronize(), so it CHANGES what it
+  # measures -- keep false in production and prefer the always-on NVTX ranges under nsys.
+  # default: false
+  timing: false
+  # Ticks between timing log lines.  default: 30  |  typical: 30-100
+  timing_log_every: 30
+
+# Single-camera LangSAM path only (enable_langsam). Inert for the multicam path.
 langsam_postprocessor:
-  save_intermediate: false
+  save_intermediate: false           # default: false
+  verbose: false                     # default: false
+
+
+# =====================================================================================================
+# 6. MASK / DEPTH JOIN
+# =====================================================================================================
+
+# -----------------------------------------------------------------------------------------------------
+# The mask path runs several frames behind the source while depth is independent and faster, so pairing
+# a mask with "whatever depth is current" mis-registers it by a varying amount. The synchroniser buffers
+# both and emits only groups sharing one acquisition timestamp.
+# Requires camera_stream_processing.enable_langsam_multicam.
+# See docs/specs/2026-08-11-temporal-sync-design.md.
+# -----------------------------------------------------------------------------------------------------
+temporal_sync:
+  # default: false
+  enabled: true
+  # Capacities are PER STREAM on purpose: each must exceed that stream's worst-case skew relative to
+  # the slowest stream, so the fast stream needs several times more slots than the slow one. Too small
+  # silently drops groups; too large only costs memory.
+  # default: 4  |  typical: 2-8 (the mask stream is the slow one, so it needs few)
+  masks_capacity: 4
+  # default: 16  |  typical: 8-32. Size from the real depth cadence once DA2/DA3 are enabled.
+  depth_capacity: 16
+  # "exact" is correct while every camera arrives through ONE shared-memory segment: the subscriber
+  # stamps one acquisition time per composite buffer and all cameras share it. "window" is for
+  # independently-stamped sources.
+  # default: "exact"  |  range: "exact" | "window"
+  match_policy: "exact"
+  # Only read by "window". Half-width of the match window in nanoseconds.
+  # default: 0  |  typical: 5-20 ms expressed in ns
+  window_ns: 0
+  # default: false
   verbose: false
 
-langsam_multicam_holoviz:
-  width: 1920
-  height: 1080
-  framerate: 30
+# -----------------------------------------------------------------------------------------------------
+# Per camera: depth -> backprojection -> texcoords -> sample the panoptic map onto the depth grid ->
+# apply_mask. Needs per-camera calibration (dataset source reads calibration/<camera>.json, shm source
+# reads the device context). REQUIRES temporal_sync.enabled -- joining a mask to an unsynchronised
+# depth frame is precisely the mis-registration this path exists to remove.
+# See docs/specs/2026-08-12-mask-depth-join-design.md.
+# -----------------------------------------------------------------------------------------------------
+mask_depth_join:
+  # default: false
+  enabled: true
+  # Class ids (the high byte of the packed panoptic label) whose pixels the mask marks. Empty means
+  # every non-background class. Ids follow the text_prompts order -- see the warning there.
+  # default: []
+  select_classes: []
+  # Classes the fused point-cloud view draws, one HolovizOp spec (hence one colour) each. Empty
+  # derives them from text_prompts, which is what keeps them from drifting out of step with what
+  # LangSAM actually detects.
+  # default: []
+  pointcloud_classes: []
+  # Depth pixels whose mask is 0 are zeroed. true keeps the background instead.
+  # default: false
+  invert_mask: false
+  # Label written where a depth pixel has no colour correspondence -- invalid depth, or projecting
+  # outside the colour frustum. 0 is background, which is almost always what you want.
+  # default: 0  |  range: a packed uint16 label
+  unlabeled_value: 0
+  # The join allocates dozens of small, VARIABLE-sized tensors per frame (two per class per camera,
+  # plus a merge each), so it uses its own RMMAllocator rather than the frame-sized BlockMemoryPool
+  # the rest of the app shares -- every one of those would otherwise consume a whole 16 MiB block and
+  # exhaust the pool.
+  # default: "256MB" / "1GB"
+  pool_initial_size: "256MB"
+  pool_max_size: "1GB"
+  # Verification operators (JoinCheckOp / CloudFusionCheckOp): they read every output back with GPU
+  # reductions -- one sync per camera per frame -- and assert that a pixel selected by the mask kept
+  # its depth. That is what caught a use-after-free in the stream splitter. Keep on while gating, off
+  # for a latency-sensitive run.
+  # default: true
+  check: false
+  # Log per-class point counts every frame.  default: false
+  verbose: false
 
-debug_output:
-  enable_colorimage: True
-  enable_depthimage: False
-  enable_weights: False
-  enable_pointcloud: True
-  enable_warped_color: True
 
-resources:
-  cpu: 24
-  gpu: 1
-  memory: 1Gi
-  gpuMemory: 1Gi
+# =====================================================================================================
+# 7. OBJECT TRACKING
+# =====================================================================================================
+#
+# Instance ids in the panoptic map are per-camera, per-frame CONFIDENCE RANKS, not identities. This
+# path turns them into one entry per physical object with a stable id, in four stages:
+#
+#   per-camera reduction  ->  cross-camera fusion  ->  rejection  ->  identity over time
+#   (tcn_instance_stats)      (tcn_object_tracking)                   (ObjectTracker)
+#
+# Requires mask_depth_join.enabled. Sub-keys below follow those four stages.
+# =====================================================================================================
+object_tracking:
+  # default: false
+  enabled: true
 
+  # Which world axis is UP. A property of the CALIBRATION, not a convention: backprojection applies
+  # each camera's depth_extrinsics, so "up" is whatever camera_pose made it. For the artekmed exports
+  # it is y -- verify by printing object centres, where the vertical axis spans a narrow plausible
+  # height band (~0.8 m) while the horizontal axes span the room (4-7 m). A wrong value does not fail
+  # loudly; it silently stops vertically split objects from merging and mis-orients every box.
+  # MUST be spelled "axis_y", never "y": yaml-cpp resolves a bare AND a quoted `y` to boolean true.
+  # default: "axis_y"  |  range: "axis_x" | "axis_y" | "axis_z"
+  up_axis: "axis_y"
+
+  # ---- 7a. per-camera reduction: what counts as an instance ---------------------------------------
+  # Points an instance needs, per camera per frame, to be reported at all. At depth-camera resolution
+  # 64 admitted 100-point "people"; several hundred corresponds to a patch of real size.
+  # default: 64  |  typical: 300-1000
+  min_points: 500
+  # Output row capacity per camera per frame. Overflow is warned about and counted, never silently
+  # truncated.
+  # default: 64  |  typical: 32-128
+  max_instances: 64
+
+  # ---- 7b. outlier rejection: percentile trim ------------------------------------------------------
+  # Discard this fraction of points from EACH end of EVERY axis, by COUNT, before measuring the box.
+  # Percentiles rather than standard deviations: a blob holding a quarter of an instance's points
+  # inflates sigma enough that the +-k*sigma window contains the blob itself (the masking effect), and
+  # iterating cannot escape it -- the first pass rejects nothing, so it is already at a fixed point.
+  # Iterating also erodes a clean cluster, since each pass discards the tails of the last.
+  # The BREAKDOWN POINT is exactly this value: outliers up to this fraction are removed however far
+  # away they lie, and a larger population survives. Raising it is the wrong answer to a large bleed
+  # population -- it starts eating the object; use the connectivity filter below instead.
+  # default: 0.02  |  range: [0, 0.5)  |  typical: 0.01-0.05
+  trim_percentile: 0.02
+  # Widen the kept range by this fraction of itself. The bound sits on a histogram bin edge, and a
+  # small margin keeps genuine extremes from being shaved off by binning resolution alone.
+  # default: 0.05  |  typical: 0.02-0.1
+  trim_margin: 0.05
+  # Floor on the kept range per axis, metres, so a perfectly flat instance (a wall patch, a tabletop)
+  # keeps its own points instead of rejecting all of them.
+  # default: 0.01  |  typical: 0.005-0.02
+  min_range_m: 0.01
+
+  # ---- 7c. outlier rejection: connectivity (the escape from the breakdown point) --------------------
+  # Keep only the largest connected component of each instance. Every distance rule above has a
+  # breakdown point; connectivity does not care how MANY the outliers are, only that they are not
+  # attached to the object. Runs on the depth image GRID, not a voxel grid: these points are an
+  # organised cloud, so 3D adjacency is pixel adjacency plus a depth-continuity test -- and bleed
+  # lands on a background surface, separated from its object by exactly that discontinuity.
+  # Measured: median box volume -30% for -6% of points. Costs ~500 us per camera-frame.
+  # default: false
+  component_filter: true
+  # Two neighbouring pixels join only if their 3D separation is at most this. Above the spacing
+  # between adjacent pixels on a real surface at working range, below the step onto a background
+  # surface. This is what makes it a SURFACE test rather than a mask test.
+  # default: 0.05  |  typical: 0.05-0.30
+  component_max_gap_m: 0.20
+  # Keep every component holding at least this share of the largest, not only the largest itself.
+  # 1.0 ("largest only") is a TRAP: masks have holes -- occlusion and invalid-depth pixels are label
+  # 0 -- and holes break grid adjacency, so a real object routinely arrives as several islands.
+  # MEASURED on the k4a_capture replay: 1.0 destroyed the computer, the monitor and 2 of 5 chairs,
+  # identically at gaps 0.05 / 0.10 / 0.20 -- the gap making no difference is what showed the cause
+  # was holes, not depth steps. 0.10 lost nothing and gained one object.
+  # default: 0.1  |  range: (0, 1]  |  typical: 0.05-0.25
+  component_min_fraction: 0.10
+
+  # ---- 7d. yaw-oriented boxes -----------------------------------------------------------------------
+  # The box stays axis-aligned VERTICALLY and is rotated only about up_axis, because objects in a room
+  # stand upright -- a full 3D orientation would spend two of its three degrees of freedom fitting
+  # noise in the one direction already known. The yaw comes from the ground-plane covariance of the
+  # surviving (trimmed) points.
+  #
+  # min_anisotropy is the ratio the two in-plane eigenvalues must differ by before the yaw is trusted:
+  # a near-circular footprint (a standing person) has no meaningful orientation, and fitting one to
+  # noise makes the box spin frame to frame. Below it the yaw is 0 and the oriented box degenerates to
+  # the axis-aligned one -- which is why a person's box looks unrotated while a table's does not.
+  # default: 1.5  |  range: >= 1  |  typical: 1.3-2.5
+  min_anisotropy: 1.5
+  # How far the yaw may swing and still have the oriented box smoothed like the axis-aligned one. Its
+  # extents are measured IN the yaw frame, so past a real re-orientation the old ones mean something
+  # else and blending them would report a box that fits nothing.
+  # default: 0.26 (=15 deg)  |  typical: 0.17-0.52 (10-30 deg)
+  max_yaw_smoothing_delta_rad: 0.26
+  # Draw the oriented box instead of the axis-aligned one.  default: false
+  render_oriented_boxes: false
+
+  # ---- 7e. cross-camera fusion (metres; the world frame is metric) ----------------------------------
+  # Single-linkage: A merges with B if they overlap enough, transitively. Right for this problem
+  # because a chain of partial views of one person should collapse to one object.
+  fusion_iou_threshold: 0.15      # two cameras seeing the same body   | default: 0.15 | typical: 0.1-0.3
+  fusion_containment: 0.6         # one view is a subset of the other (torso vs whole person)
+                                  #                                    | default: 0.6  | typical: 0.5-0.8
+  fusion_footprint_iou: 0.4       # same ground footprint...            | default: 0.4  | typical: 0.3-0.6
+  fusion_max_vertical_gap_m: 0.5  # ...and vertically adjacent: a mask split by an occluder
+                                  #                                    | default: 0.5  | typical: 0.3-1.0
+  # The gate that stops single-linkage chaining across a room: two people standing close both overlap
+  # a third box between them, and without a distance limit the chain fuses them into one object.
+  # Also the cell size of the spatial hash that makes fusion fast, so it is exact at any value.
+  # default: 1.0  |  typical: 0.3-1.0
+  fusion_max_distance_m: 0.5
+
+  # ---- 7f. rejecting non-objects and aggregates (this is what controls object COUNT) ---------------
+  # A box must be at least this large on EVERY axis. Removes the flat slivers a mask fringe produces
+  # (extents like 0.27 x 0.33 x 0.03 m), which no volume or overlap rule catches.
+  # default: 0.0 (off)  |  typical: 0.08-0.20
+  min_extent_m: 0.12
+  # Escape hatch for objects that are GENUINELY flat. A depth camera sees a tabletop's top surface and
+  # nothing else, so a real table arrives 2-7 cm thick -- sensor noise on a plane. On thickness alone
+  # that is indistinguishable from the mask fringe min_extent_m targets, and it was throwing the table
+  # away entirely: four cameras agreed on a 1.3 x 1.3 m table at y=0.58 and it produced NO detection.
+  # The ground FOOTPRINT separates them where thickness cannot -- 1.64 m2 vs 0.09 m2, about 20x. An
+  # observation is kept if it clears min_extent_m on every axis OR its footprint clears this.
+  # default: 0.0 (off, restoring the old rule exactly)  |  typical: 0.2-0.5
+  min_footprint_m2: 0.30
+  # A second, scene-level point threshold applied to each OBSERVATION, on top of the per-camera
+  # min_points above.
+  # default: 0  |  typical: 500-1500
+  fusion_min_points: 800
+  # Prefer individual identities over class-like aggregates: a box containing this many MUTUALLY
+  # DISJOINT smaller boxes OF ITS OWN CLASS is a mask covering several objects, so it is dropped and
+  # its constituents kept. One contained box is a partial view (a torso inside a person) and still
+  # merges. Strictly intra-class -- a table is never condemned by the computer standing on it.
+  # Set aggregate_min_children: 0 to disable the rule entirely.
+  aggregate_containment: 0.7        # default: 0.7  |  range: [0, 1]  |  typical: 0.6-0.85
+  aggregate_min_children: 2         # default: 2    |  0 disables     |  typical: 2-3
+  aggregate_min_volume_ratio: 1.5   # a container must be meaningfully larger than its children
+                                    #                default: 1.5    |  typical: 1.3-2.0
+  # Corroboration. An object only ONE camera ever saw is usually mask fringe or a partial detection
+  # nothing else confirms. 2 removes those outright; the cost is that an object at the edge of the
+  # room, genuinely visible to one camera only, disappears. Keep 1 where coverage does not overlap.
+  # default: 1  |  range: >= 1  |  typical: 1-2
+  min_cameras: 2
+  # Applied to the FUSED object, so several small partial views that together make a plausible object
+  # survive where each alone would not. THE effective lever on object count for this data -- measured
+  # on the 4-camera replay (8 frames), everything else at these defaults:
+  #        0 -> 22.0 objects/frame, 24 ids, 4 id-set changes
+  #     2000 -> 15.9              , 17    , 2
+  #     3000 ->  9.5              , 10    , 1
+  #   (min_cameras: 2 gives 8.5 / 9 / 1, i.e. the same, but by dropping single-camera objects
+  #    outright -- filtering on evidence QUANTITY is preferred to filtering on viewpoint count.)
+  # Scene-scale dependent: 3000 points is a patch of real size at this depth resolution.
+  # default: 0  |  typical: 1000-4000
+  min_detection_points: 3000
+  # Same idea on the fused box's smallest extent. 0 leaves it to min_extent_m per observation.
+  # default: 0.0  |  typical: 0.0-0.2
+  min_detection_extent_m: 0.0
+
+  # ---- 7g. identity over time -----------------------------------------------------------------------
+  # Observations before an object is reported, so a blip never gets an id.
+  # default: 3  |  typical: 2-5
+  min_hits: 3
+  # Missed frames before retirement (~1.6 s at 5 fps); after that the object returns with a NEW id.
+  # default: 8  |  typical: 5-15
+  max_age: 8
+  # Association gates between this frame's detections and existing tracks. Looser than the fusion
+  # gates above, because a track only has to be the best match, not a good one.
+  track_iou_threshold: 0.1          # default: 0.1  |  typical: 0.05-0.3
+  track_max_distance_m: 1.0         # default: 1.0  |  typical: 0.5-1.5
+  # 0 = follow the raw box exactly; higher damps depth jitter and lags real motion.
+  # default: 0.5  |  range: [0, 1)  |  typical: 0.3-0.7
+  box_smoothing: 0.5
+
+  # ---- 7h. output and instrumentation ---------------------------------------------------------------
+  # Overlay each object's box on the segmented point cloud, coloured by class from the same LUT the
+  # points use, so a box reads as "the box around those points".
+  # default: false
+  render_boxes: true
+  # default: 3.0  |  typical: 1.0-5.0
+  box_line_width: 3.0
+  # Per-frame console block: 0 = shutdown summary only. The boxes are in the viewer; set to 1 (or N)
+  # when debugging the numbers behind them.
+  # default: 0  |  typical: 0 or 1
+  print_every: 0
+  # Log fusion input/output counts per frame.  default: false
+  verbose: false
+  # Log every per-camera instance row every frame -- verbose, but the fastest way to see what the
+  # reduction actually measured.  default: false
+  verbose_instances: false
+  # Pickle each frame's raw observations next to the detections they produced, for replaying the
+  # filter chain offline with one threshold changed at a time. "Which of these thresholds dropped my
+  # object?" is otherwise unanswerable from the logs, since fusion reports only a count. Unset costs
+  # nothing.
+  # default: "" (off)
+  fusion_dump_dir: ""
+
+
+# =====================================================================================================
+# 8. VISUALISATION -- one block per Holoviz window
+# =====================================================================================================
+
+# Generic single-image viewer, used by the DA2/DA3 single-camera paths.
 holoviz:
   width: 518
   height: 518
@@ -440,19 +708,70 @@ da3_holoviz:
   width: 518
   height: 518
 
+# Single-camera LangSAM overlay (enable_langsam).
 langsam_holoviz:
   width: 1024
   height: 1024
   framerate: 30
 
-depth_holoviz:
-  window_title: "Artekmed Depthimages"
+# Multi-camera LangSAM overlay: the tiled per-camera mask view. This is the window that shows the
+# eroded panoptic map, i.e. exactly what the point cloud is built from.
+langsam_multicam_holoviz:
+  width: 1920
+  height: 1080
+  framerate: 30
+
+# The fused labeled point cloud, with object boxes overlaid when object_tracking.render_boxes. Same
+# viewer path as tcn_shm_receiver's point fusion (merge across cameras, flatten, POINTS_3D), one chain
+# per class so classes are separable by colour.
+labeled_pointcloud_holoviz:
+  width: 1280
+  height: 720
+  window_title: "Labeled Point Cloud (fused)"
+  # true renders offscreen -- for headless gate runs with no display.
+  # default: false
+  headless: false
+
+# Raw colour frames, one tile per camera.
+color_holoviz:
+  window_title: "Artekmed Colorimages"
   width: 800
   height: 640
   framerate: 60
 
-color_holoviz:
-  window_title: "Artekmed Colorimages"
+
+# =====================================================================================================
+# 9. DEBUG / GATING
+# =====================================================================================================
+
+# Only read when non-empty. Writes one <dir>/frame<NNNNNN>_<camera>.npy per camera per tick from the
+# multicam mask collector's output, for A/B comparison with docs/compare_mask_dumps.py. Unset means
+# MaskDumpOp is not built at all, so a live run pays nothing.
+# Requires camera_stream_processing.enable_langsam_multicam.
+# default: "" (off)
+mask_dump_dir: ""
+#mask_dump_dir: "/srv/tmp/harness/bd_on"
+
+# Which auxiliary viewer branches to build. Each one that is enabled adds operators and Holoviz work.
+debug_output:
+  enable_colorimage: True            # default: false
+  enable_depthimage: False           # default: false
+  enable_weights: False              # default: false
+  enable_pointcloud: True            # default: false
+  enable_warped_color: True          # default: false
+
+
+# =====================================================================================================
+# 10. UNUSED -- inherited from tcn_shm_receiver, read by NOTHING in this application
+# =====================================================================================================
+#
+# These four blocks are referenced only by applications/tcn_artekmed/tcn_shm_receiver, from which this
+# config was originally derived. They are kept so the two files stay diffable; editing them here has no
+# effect. Safe to delete if that no longer matters.
+# =====================================================================================================
+
+depth_holoviz:
+  window_title: "Artekmed Depthimages"
   width: 800
   height: 640
   framerate: 60
@@ -474,12 +793,3 @@ warped_color_holoviz:
   width: 800
   height: 640
   framerate: 60
-
-pose_tree_config:
-  number_frames: 1024                # default: 1024
-  number_edges: 16384                # default: 16384
-  history_length: 1048576            # default: 1048576
-  default_number_edges: 16           # default: 16
-  default_history_length: 1024       # default: 1024
-  edges_chunk_size: 4                # default: 4
-  history_chunk_size: 64             # default: 64

@@ -704,6 +704,7 @@ class App(hs.core.Application):
                         max_vertical_gap_m=float(track_cfg.get("fusion_max_vertical_gap_m", 0.5)),
                         up_axis=track_cfg.get("up_axis", "axis_y"),
                         min_extent_m=float(track_cfg.get("min_extent_m", 0.0)),
+                        min_footprint_m2=float(track_cfg.get("min_footprint_m2", 0.0)),
                         min_points=int(track_cfg.get("fusion_min_points", 0)),
                         aggregate_containment=float(track_cfg.get("aggregate_containment", 0.7)),
                         aggregate_min_children=int(track_cfg.get("aggregate_min_children", 2)),
@@ -713,6 +714,7 @@ class App(hs.core.Application):
                         min_detection_points=int(track_cfg.get("min_detection_points", 0)),
                         min_detection_extent_m=float(track_cfg.get("min_detection_extent_m", 0.0)),
                         verbose=bool(track_cfg.get("verbose", False)),
+                        dump_dir=str(track_cfg.get("fusion_dump_dir", "") or ""),
                         name="object_fusion")
                     tracker_op = ObjectTrackerOp(
                         self,
@@ -850,6 +852,13 @@ class App(hs.core.Application):
                             min_anisotropy=float(track_cfg.get("min_anisotropy", 1.5)),
                             min_points=int(track_cfg.get("min_points", 64)),
                             max_instances=int(track_cfg.get("max_instances", 64)),
+                            component_filter=bool(track_cfg.get("component_filter", False)),
+                            component_max_gap_m=float(track_cfg.get("component_max_gap_m", 0.05)),
+                            # 0.1, matching the operator's own default -- 1.0 ("largest component
+                            # only") destroys objects whose masks have holes. See the operator's
+                            # parameter docs for the measurement.
+                            component_min_fraction=float(
+                                track_cfg.get("component_min_fraction", 0.1)),
                             verbose=bool(track_cfg.get("verbose_instances", False)),
                             name=f"join_stats_{cam}")
                         self.add_flow(bp_op, stats_op, {("positions", "positions")})
