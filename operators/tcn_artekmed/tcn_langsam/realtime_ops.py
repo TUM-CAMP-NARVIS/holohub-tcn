@@ -23,7 +23,7 @@ import holoscan as hs
 from holoscan.core import Operator, OperatorSpec
 
 from .models import (
-    SAM, GDINO, GDinoTrtDetector, class_id_map, build_panoptic_map, build_panoptic_map_auto, worker_engine_path,
+    SAM, GDINO, GDinoTrtDetector, class_id_map, build_panoptic_map, build_panoptic_map_auto, erode_panoptic_map_auto, worker_engine_path,
 )
 # Shared with langsam_multicam_fragment.py so the output-key convention can't drift between the
 # monolithic and split ops; imported directly (not via langsam_common's re-export list).
@@ -297,8 +297,16 @@ class PanopticOp(Operator):
         self.device = device if isinstance(device, torch.device) else torch.device(f"cuda:{int(device)}")
         self.prompts = list(prompts)
         self._cmap = class_id_map(self.prompts)
+        # Stored before the flip resolution below reads it -- GdinoOp and SamOp do the same. Its
+        # absence made `gpu_workers.pipelined: true` fail at compose() with a bare AttributeError.
+        self.cameras = list(cameras)
         self._flip = resolve_flipped_cameras(self.cameras, flip_cameras)
         self.panoptic_backend = langsam_cfg.get("panoptic_backend", "cupy")
+        self.mask_erosion_px = int(langsam_cfg.get("mask_erosion_px", 0))
+        if self.mask_erosion_px < 0:
+            raise ValueError(
+                f"langsam_inference.mask_erosion_px must be >= 0, got {self.mask_erosion_px}. "
+                "0 disables erosion.")
         self._stream_checked = False
         super().__init__(fragment, *args, **kwargs)
 
@@ -331,9 +339,12 @@ class PanopticOp(Operator):
             if p["sam_idx"]:
                 torch.cuda.nvtx.range_push("panoptic")
                 for k, i in enumerate(p["sam_idx"]):
-                    pmaps[i] = build_panoptic_map_auto(
+                    pmap = build_panoptic_map_auto(
                         p["masks"][k], p["sam_labels"][k], p["scores"][k],
                         self._cmap, hw[0], hw[1], backend=self.panoptic_backend)
+                    # Only the cameras that actually got detections: a camera with no detections
+                    # already holds an all-zero map, and eroding zeros is a no-op worth skipping.
+                    pmaps[i] = erode_panoptic_map_auto(pmap, self.mask_erosion_px)
                 torch.cuda.nvtx.range_pop()
             for i, cam in enumerate(names):
                 pmap = pmaps[i]

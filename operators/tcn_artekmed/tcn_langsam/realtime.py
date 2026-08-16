@@ -20,7 +20,7 @@ from holoscan.core import ConditionType, Operator, OperatorSpec, Subgraph, IOSpe
 from holoscan.operators import HolovizOp
 
 from .models import (
-    SAM, GDINO, GDinoTrtDetector, resolve_workers, worker_batch, worker_engine_path, class_id_map, build_panoptic_map, build_panoptic_map_auto, build_panoptic_lut,
+    SAM, GDINO, GDinoTrtDetector, resolve_workers, worker_batch, worker_engine_path, class_id_map, build_panoptic_map, build_panoptic_map_auto, erode_panoptic_map_auto, build_panoptic_lut,
 )
 # Shared with langsam_pipelined.py so the output-key convention can't drift between the
 # monolithic and split ops; imported directly (not via langsam_common's re-export list).
@@ -73,6 +73,14 @@ class LangSamBatchOp(Operator):
         self.text_threshold = float(langsam_cfg.get("text_threshold", 0.25))
         self.gdino_backend = langsam_cfg.get("gdino_backend", "pytorch")
         self.panoptic_backend = langsam_cfg.get("panoptic_backend", "cupy")
+        self.mask_erosion_px = int(langsam_cfg.get("mask_erosion_px", 0))
+        if self.mask_erosion_px < 0:
+            raise ValueError(
+                f"langsam_inference.mask_erosion_px must be >= 0, got {self.mask_erosion_px}. "
+                "0 disables erosion.")
+        if self.mask_erosion_px:
+            log.info(f"LangSamBatchOp[{device}]: eroding panoptic masks by "
+                     f"{self.mask_erosion_px} px")
         super().__init__(fragment, *args, **kwargs)
         with torch.cuda.device(self.device):
             self.sam = SAM(
@@ -244,9 +252,12 @@ class LangSamBatchOp(Operator):
                 torch.cuda.nvtx.range_pop()
                 torch.cuda.nvtx.range_push("panoptic")
                 for k, i in enumerate(sam_idx):
-                    pmaps[i] = build_panoptic_map_auto(
+                    pmap = build_panoptic_map_auto(
                         masks[k], sam_labels[k], mscores[k], self._cmap, hw[0], hw[1],
                         backend=self.panoptic_backend)
+                    # Only the cameras that actually got detections: a camera with no detections
+                    # already holds an all-zero map, and eroding zeros is a no-op worth skipping.
+                    pmaps[i] = erode_panoptic_map_auto(pmap, self.mask_erosion_px)
                 torch.cuda.nvtx.range_pop()
 
             for i, cam in enumerate(names):

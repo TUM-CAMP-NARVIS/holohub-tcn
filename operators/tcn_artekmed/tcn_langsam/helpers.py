@@ -238,6 +238,45 @@ def paint_panoptic_np(masks, values, priorities, height, width):
     return pmap
 
 
+def erode_panoptic_np(pmap, radius):
+    """Reference for the CUDA erosion kernel: a pixel keeps its packed label only if EVERY pixel
+    in the (2*radius+1)^2 window carries that same label, otherwise it becomes 0 (background).
+
+    Because labels partition the image, that one test erodes every instance region at once -- it
+    is a per-label binary erosion done in a single sweep, and it also opens a seam between two
+    instances that touch, which is the same bleed problem seen from the other side.
+
+    Borders are CLAMPED (the window is truncated at the edge rather than treated as background),
+    so an object running off the side of the frame is not eaten away from that side.
+
+    Separable, exactly as the kernel is: after the horizontal pass a pixel is already either its
+    own label or 0, so requiring the vertical run to be all-equal composes correctly and gives
+    the same result as the square window applied at once (there is a test for that).
+
+    Pure numpy, no cupy. `radius <= 0` returns the input unchanged.
+    """
+    if radius <= 0:
+        return pmap
+    out = np.asarray(pmap)
+    h, w = out.shape
+    for axis, extent in ((1, w), (0, h)):
+        src = out
+        dst = np.zeros_like(src)
+        for i in range(extent):
+            lo = max(0, i - radius)
+            hi = min(extent, i + radius + 1)
+            window = src[:, lo:hi] if axis == 1 else src[lo:hi, :]
+            centre = src[:, i] if axis == 1 else src[i, :]
+            keep = (window == centre[:, None] if axis == 1
+                    else window == centre[None, :]).all(axis=axis)
+            if axis == 1:
+                dst[:, i] = np.where(keep, centre, 0)
+            else:
+                dst[i, :] = np.where(keep, centre, 0)
+        out = dst
+    return out
+
+
 def gdino_postprocess(logits, boxes, token_class_ids, num_classes,
                       box_threshold, img_h, img_w, xp=np):
     """Grounding DINO raw outputs -> detections, using a fixed token->class map.

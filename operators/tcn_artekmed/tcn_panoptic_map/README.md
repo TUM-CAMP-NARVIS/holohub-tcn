@@ -91,3 +91,76 @@ availability fallback) lives in `langsam_common.py`, selected by the
 
 If there are no detections, `out` is zeroed via `cudaMemsetAsync` without launching the paint
 kernel, so callers always get a valid all-zero map.
+
+## Erosion — `erode_panoptic_map_cuda`
+
+The second free function this module exposes, and the fix for **mask bleed at object edges**.
+
+The packed map is consumed as a texture-lookup target: `tcn_label_sampler` samples it through the
+texcoords `tcn_depthimage_backprojection` produces. So a mask that overshoots its object by a few
+*colour* pixels labels **background depth pixels** as that object — and those points are real,
+finite, and metres behind it. They are exactly what `tcn_instance_stats`' `trim_percentile` spends
+its breakdown point on, so removing them here is strictly better than rejecting them downstream.
+
+```python
+from holohub.tcn_panoptic_map._tcn_panoptic_map import erode_panoptic_map_cuda
+
+erode_panoptic_map_cuda(in_ptr, scratch_ptr, out_ptr, H, W, radius, stream_ptr)
+```
+
+A pixel keeps its packed label only if **every** pixel in the `(2r+1)²` window carries that same
+label; otherwise it becomes 0. Because labels partition the image, that single test erodes every
+instance at once — there is no per-label pass — and it also opens a seam between two instances that
+touch, which is the same bleed problem seen from the other side.
+
+**Separable.** The square window factors into a horizontal then a vertical pass: after the first
+pass a pixel is already either its own label or 0, so requiring the vertical run to be all-equal
+composes to exactly the square window. That equivalence is not assumed — it is pinned against a
+brute-force square oracle (see Tests).
+
+**Borders are clamped**, not treated as background, so an object running off the side of the frame
+keeps its pixels there. At these camera angles most detections touch an edge, so the alternative
+would shave nearly all of them.
+
+`scratch` must not alias `in` or `out`; `out` **may** alias `in`. `out` is written in full,
+including at `radius <= 0` (the identity), so it never needs pre-zeroing.
+
+### Choosing a radius
+
+The radius is in **colour** pixels (2048×1536), while the depth grid the labels land on is about 3×
+coarser — so below ~3 it barely moves a depth pixel. An object thinner than `2r+1` disappears
+entirely, which is what bounds it from above. Config key: `langsam_inference.mask_erosion_px`,
+default `0` (off, and free — no allocation and no launch).
+
+Measured at 1536×2048, one camera-frame:
+
+| radius | time | labelled pixels kept |
+|---|---|---|
+| 2 | 78 µs | 97.6% |
+| 4 | 106 µs | 95.3% |
+| 6 | 128 µs | 93.0% |
+| 9 | 165 µs | 89.5% |
+
+### Fallback
+
+`erode_panoptic_map_auto` (`tcn_langsam/models.py`) falls back to `erode_panoptic_map_cupy` —
+`minimum_filter == maximum_filter` over the window, which is precisely "every pixel in the window
+carries the same label" — if the compiled extension predates this function. Same result, more
+launches. `mode="nearest"` there is exactly the kernel's clamped border: replicating the edge pixel
+only adds values already inside the truncated window, so the min and max are unchanged by it.
+
+## Tests
+
+```bash
+# host, numpy only -- the reference vs a brute-force square-window oracle
+python3 ../tcn_langsam/tests/test_panoptic_erosion.py        # 9 cases
+
+# in container -- the real kernel vs that reference, and vs the cupy fallback
+PYTHONPATH=<build>/python/lib:/workspace/holohub python3 tests/test_panoptic_erode_cuda.py  # 7 cases
+```
+
+Between the two the chain is **brute-force square window == separable numpy reference == CUDA
+kernel == cupy fallback**. The CUDA gate also covers a non-square map (a square one hides a row/
+column swap), `out` aliasing `in`, an edge-touching object, and a full 1536×2048 map.
+
+`test_panoptic_paint.py` (9 cases, host) still covers the paint reformulation.

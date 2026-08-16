@@ -51,7 +51,76 @@ __global__ void panoptic_paint_kernel(const uint8_t* __restrict__ masks,
   out[idx] = best_value;  // every pixel written exactly once, 0 = background
 }
 
+// One thread per pixel, one axis. A pixel keeps its packed label only if every pixel in the
+// `radius`-neighbourhood along this axis carries the SAME label; otherwise it becomes 0.
+//
+// Because labels partition the image, that single test erodes every instance region at once --
+// there is no per-label pass. It also opens a seam between two instances that touch, which is the
+// same bleed problem seen from the other side.
+//
+// Borders are CLAMPED (the window truncates at the edge) rather than treated as background, so an
+// object running off the side of the frame is not eaten away from that side.
+//
+// Both passes write every output pixel exactly once, so neither needs `out` pre-zeroed.
+template <bool kHorizontal>
+__global__ void panoptic_erode_kernel(const uint16_t* __restrict__ in,
+                                      uint16_t* __restrict__ out,
+                                      int H, int W, int radius) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= H * W) return;
+
+  const int x = idx % W;
+  const int y = idx / W;
+  const uint16_t v = in[idx];
+
+  const int centre = kHorizontal ? x : y;
+  const int extent = kHorizontal ? W : H;
+  const int lo = max(0, centre - radius);
+  const int hi = min(extent - 1, centre + radius);
+  const int stride = kHorizontal ? 1 : W;
+  const int base = kHorizontal ? (y * W) : x;
+
+  for (int i = lo; i <= hi; ++i) {
+    if (in[base + i * stride] != v) {
+      out[idx] = 0;
+      return;
+    }
+  }
+  out[idx] = v;
+}
+
 }  // namespace
+
+void launch_panoptic_erode(const uint16_t* in,
+                            uint16_t* scratch,
+                            uint16_t* out,
+                            int H, int W, int radius,
+                            cudaStream_t stream) {
+  const int num_pixels = H * W;
+  if (num_pixels <= 0) return;
+  const size_t bytes = static_cast<size_t>(num_pixels) * sizeof(uint16_t);
+
+  if (radius <= 0) {
+    // Identity, but `out` is still written IN FULL -- the caller's contract does not change with
+    // the radius, so a caller that passes a fresh uninitialised buffer stays correct at radius 0.
+    // Skipped entirely (not even this copy) when `in == out`.
+    if (in != out) { HOLOSCAN_CUDA_CALL(cudaMemcpyAsync(out, in, bytes,
+                                                        cudaMemcpyDeviceToDevice, stream)); }
+    return;
+  }
+
+  const int threads = 256;
+  const int blocks = (num_pixels + threads - 1) / threads;
+  // Separable: the square (2r+1)^2 window factors into a horizontal then a vertical pass. After
+  // the first pass a pixel is already either its own label or 0, so requiring the vertical run to
+  // be all-equal composes to exactly the square window -- `erode_panoptic_np` in
+  // tcn_langsam/helpers.py is the reference and tests/test_panoptic_erosion.py pins the
+  // equivalence against a brute-force square oracle.
+  //
+  // `out` may alias `in`: after the horizontal pass `in` is never read again.
+  panoptic_erode_kernel<true><<<blocks, threads, 0, stream>>>(in, scratch, H, W, radius);
+  panoptic_erode_kernel<false><<<blocks, threads, 0, stream>>>(scratch, out, H, W, radius);
+}
 
 void launch_panoptic_paint(const uint8_t* masks,
                             const uint16_t* values,

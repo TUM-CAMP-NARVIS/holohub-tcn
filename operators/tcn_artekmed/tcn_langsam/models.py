@@ -126,6 +126,97 @@ def build_panoptic_map_cuda_backed(masks, labels, scores, cmap, height, width):
     return out
 
 
+# --- mask erosion (bleed at object edges) ------------------------------------------------------
+#
+# The packed map is sampled through the depth image's texcoords (`tcn_label_sampler`), so a mask
+# that overshoots its object by a few COLOUR pixels labels background depth pixels as that object.
+# Those points are real, finite and metres away -- they are exactly what `tcn_instance_stats`'
+# percentile trim spends its breakdown point on. Eroding the map before the lookup removes the
+# bleed at its source instead of paying for it downstream.
+
+_panoptic_erode_ext = None      # None = not yet attempted; False = attempted and failed
+_panoptic_erode_warned = False
+
+
+def _load_panoptic_erode_ext():
+    """Lazy-import the erosion entry point of the compiled `tcn_panoptic_map` extension. Caches
+    success AND failure, so the import (and the warning) happens once per process, not per tick.
+    """
+    global _panoptic_erode_ext, _panoptic_erode_warned
+    if _panoptic_erode_ext is not None:
+        return _panoptic_erode_ext
+    try:
+        from holohub.tcn_panoptic_map._tcn_panoptic_map import (
+            erode_panoptic_map_cuda as _ext_erode_panoptic_map_cuda,
+        )
+        _panoptic_erode_ext = _ext_erode_panoptic_map_cuda
+    except ImportError as e:
+        _panoptic_erode_ext = False
+        if not _panoptic_erode_warned:
+            _panoptic_erode_warned = True
+            print(
+                "WARNING: langsam_inference.mask_erosion_px is set but the compiled "
+                f"tcn_panoptic_map extension does not provide erode_panoptic_map_cuda ({e!r}). "
+                "Falling back to the cupy erosion for the rest of this run -- same result, more "
+                "kernel launches. This usually means the extension predates the erosion and "
+                "needs a rebuild."
+            )
+    return _panoptic_erode_ext
+
+
+def erode_panoptic_map_cupy(pmap, radius):
+    """Fallback erosion, and the GPU-side oracle for the kernel.
+
+    `minimum_filter == maximum_filter` over the window is precisely "every pixel in the window
+    carries the same label", so this is the same operation `launch_panoptic_erode` performs, just
+    via two generic filters instead of one fused pass.
+
+    `mode="nearest"` is exactly the kernel's clamped border: replicating the edge pixel adds only
+    values already inside the truncated window, so the min and the max are unchanged by it.
+    """
+    from cupyx.scipy.ndimage import maximum_filter, minimum_filter
+
+    size = 2 * int(radius) + 1
+    lo = minimum_filter(pmap, size=size, mode="nearest")
+    hi = maximum_filter(pmap, size=size, mode="nearest")
+    return cp.where(lo == hi, pmap, cp.uint16(0)).astype(cp.uint16)
+
+
+def erode_panoptic_map_auto(pmap, radius):
+    """Erode every instance region of a packed panoptic map by `radius` pixels.
+
+    `radius <= 0` returns `pmap` unchanged without touching the GPU, so leaving
+    `langsam_inference.mask_erosion_px` at 0 costs nothing at all -- not even an allocation.
+
+    Returns a NEW array; `pmap` is never mutated.
+    """
+    radius = int(radius)
+    if radius <= 0:
+        return pmap
+
+    ext_fn = _load_panoptic_erode_ext()
+    if ext_fn is False:
+        return erode_panoptic_map_cupy(pmap, radius)
+
+    if not pmap.flags.c_contiguous:
+        raise ValueError(
+            "erode_panoptic_map_auto: pmap must be C-contiguous, got a strided view "
+            f"(shape={pmap.shape}, strides={pmap.strides}). Passing a strided view's raw pointer "
+            "to the kernel would silently read the wrong bytes.")
+    if pmap.dtype != cp.uint16:
+        raise ValueError(f"erode_panoptic_map_auto: pmap must be uint16, got {pmap.dtype}.")
+
+    height, width = pmap.shape
+    scratch = cp.empty_like(pmap)     # separable intermediate; must not alias in or out
+    out = cp.empty_like(pmap)         # kernel writes every pixel; no zero-fill
+    ext_fn(
+        int(pmap.data.ptr), int(scratch.data.ptr), int(out.data.ptr),
+        int(height), int(width), radius,
+        int(cp.cuda.get_current_stream().ptr),
+    )
+    return out
+
+
 def build_panoptic_map_auto(masks, labels, scores, cmap, height, width, backend="cupy"):
     """Dispatch to the cupy (default, existing/oracle) or CUDA-kernel panoptic-map
     implementation by `backend` -- the `langsam_inference.panoptic_backend` config toggle.

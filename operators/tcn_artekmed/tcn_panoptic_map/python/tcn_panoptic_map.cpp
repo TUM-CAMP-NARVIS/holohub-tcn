@@ -51,6 +51,18 @@ void build_panoptic_map_cuda(uintptr_t masks_ptr,
                          reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
+void erode_panoptic_map_cuda(uintptr_t in_ptr,
+                              uintptr_t scratch_ptr,
+                              uintptr_t out_ptr,
+                              int H, int W, int radius,
+                              uintptr_t stream_ptr) {
+  launch_panoptic_erode(reinterpret_cast<const uint16_t*>(in_ptr),
+                         reinterpret_cast<uint16_t*>(scratch_ptr),
+                         reinterpret_cast<uint16_t*>(out_ptr),
+                         H, W, radius,
+                         reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
 }  // namespace
 
 PYBIND11_MODULE(_tcn_panoptic_map, m) {
@@ -114,6 +126,54 @@ PYBIND11_MODULE(_tcn_panoptic_map, m) {
         stream_ptr : int
             CUDA stream handle (e.g. `cupy.cuda.get_current_stream().ptr`) the work is enqueued
             on.
+        )pbdoc");
+
+  m.def("erode_panoptic_map_cuda",
+        &erode_panoptic_map_cuda,
+        "in_ptr"_a,
+        "scratch_ptr"_a,
+        "out_ptr"_a,
+        "H"_a,
+        "W"_a,
+        "radius"_a,
+        "stream_ptr"_a,
+        R"pbdoc(
+        Erode every instance region of a packed panoptic map by `radius` pixels.
+
+        A pixel keeps its packed label only if every pixel in the (2*radius+1)^2 window carries
+        the same label, otherwise it becomes 0. Because labels partition the image this erodes
+        every instance at once, and it also opens a seam between two instances that touch.
+        Borders are clamped, so an object running off the edge of the frame is not shaved from
+        that side.
+
+        Exists because the map is sampled through the depth image's texcoords: a mask that
+        overshoots its object by a few colour pixels labels background depth pixels as that
+        object, and those points are metres away. `erode_panoptic_np` in
+        tcn_langsam/helpers.py is the reference implementation.
+
+        All pointer arguments are raw CUDA device addresses (e.g. cupy's `.data.ptr`), passed as
+        plain integers.
+
+        Parameters
+        ----------
+        in_ptr : int
+            Device pointer to a (H, W) uint16 packed panoptic map.
+        scratch_ptr : int
+            Device pointer to a (H, W) uint16 scratch buffer, caller-owned. Holds the
+            intermediate of the separable pass. MUST NOT alias `in_ptr` or `out_ptr`.
+        out_ptr : int
+            Device pointer to a (H, W) uint16 buffer. Written IN FULL, including at radius <= 0,
+            so it never needs pre-zeroing. MAY alias `in_ptr`.
+        H : int
+            Map height.
+        W : int
+            Map width.
+        radius : int
+            Erosion radius in pixels of the map's own (colour) resolution. <= 0 is the identity
+            and launches no kernel. The depth grid the labels are sampled onto is typically ~3x
+            coarser, so a radius below ~3 barely moves a depth pixel.
+        stream_ptr : int
+            CUDA stream handle the work is enqueued on.
         )pbdoc");
 }  // PYBIND11_MODULE
 

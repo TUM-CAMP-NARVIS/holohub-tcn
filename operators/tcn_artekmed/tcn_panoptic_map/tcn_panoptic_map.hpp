@@ -57,4 +57,43 @@ void launch_panoptic_paint(const uint8_t* masks,
                             uint16_t* out,
                             cudaStream_t stream);
 
+// Erode every instance region of a packed panoptic map by `radius` pixels.
+//
+// Motivation: the map is sampled through the depth image's texcoords (`tcn_label_sampler`), so a
+// mask that overshoots its object by a few COLOUR pixels labels background depth pixels as that
+// object. Those points are real, finite and metres away, and they are what `tcn_instance_stats`'
+// percentile trim spends its breakdown point on. Eroding before the lookup removes the bleed at
+// its source rather than paying for it downstream.
+//
+// A pixel keeps its packed label only if every pixel in the (2*radius+1)^2 window carries the
+// SAME label; otherwise it becomes 0 (background). Because labels partition the image, that one
+// test erodes every instance at once -- no per-label pass -- and it also opens a seam between two
+// instances that touch.
+//
+//   in:       (H, W) uint16 device buffer, the packed (class << 8) | instance map.
+//   scratch:  (H, W) uint16 device buffer, caller-owned. Holds the intermediate of the separable
+//             pass; its contents on entry are irrelevant and on exit meaningless. MUST NOT alias
+//             `in` or `out`.
+//   out:      (H, W) uint16 device buffer, written IN FULL (including at radius <= 0), so it does
+//             not need pre-zeroing. MAY alias `in` -- after the horizontal pass `in` is never
+//             read again.
+//   radius:   erosion radius in pixels, in the map's own (colour) resolution. <= 0 is the
+//             identity and launches no kernel. Note the depth grid the labels are sampled onto is
+//             typically ~3x coarser, so a radius below ~3 barely moves a depth pixel.
+//   stream:   CUDA stream both passes are enqueued on.
+//
+// Separable: the square window factors into a horizontal then a vertical pass. After the first
+// pass a pixel is already either its own label or 0, so the vertical all-equal test composes to
+// exactly the square window. `erode_panoptic_np` (tcn_langsam/helpers.py) is the reference
+// implementation and tests/test_panoptic_erosion.py pins the equivalence against a brute-force
+// square oracle.
+//
+// Borders are CLAMPED, not treated as background: an object running off the edge of the frame
+// keeps its pixels there instead of being shaved from that side.
+void launch_panoptic_erode(const uint16_t* in,
+                            uint16_t* scratch,
+                            uint16_t* out,
+                            int H, int W, int radius,
+                            cudaStream_t stream);
+
 }  // namespace tcn::ops
