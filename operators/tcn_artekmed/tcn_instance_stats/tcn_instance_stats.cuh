@@ -45,6 +45,10 @@ class TcnInstanceStatsOp : public holoscan::Operator {
  private:
   void allocate_scratch();
   void free_scratch();
+  /// (Re)allocate the component scratch for a grid of `count` pixels. Sized by the DEPTH GRID, not
+  /// the label space, so it cannot be done in start() -- H and W are first known on the first tick.
+  void ensure_component_scratch(int64_t count);
+  void free_component_scratch();
 
   holoscan::Parameter<std::shared_ptr<holoscan::Allocator>> allocator_{nullptr};
   holoscan::Parameter<int> cuda_device_ordinal_;
@@ -60,6 +64,9 @@ class TcnInstanceStatsOp : public holoscan::Operator {
   holoscan::Parameter<double> min_anisotropy_;
   holoscan::Parameter<int64_t> min_points_;
   holoscan::Parameter<int64_t> max_instances_;
+  holoscan::Parameter<bool> component_filter_;
+  holoscan::Parameter<double> component_max_gap_m_;
+  holoscan::Parameter<double> component_min_fraction_;
   holoscan::Parameter<bool> verbose_;
   holoscan::Parameter<std::shared_ptr<holoscan::CudaStreamPool>> cuda_stream_pool_;
 
@@ -71,6 +78,7 @@ class TcnInstanceStatsOp : public holoscan::Operator {
   uint16_t* row_labels_d_ = nullptr;
   uint32_t* row_count_d_ = nullptr;
   uint32_t* row_count_h_ = nullptr;      ///< pinned, for the single count read-back
+  ComponentBuffers comp_{};              ///< connected-component pre-filter scratch
   std::size_t emitted_ = 0;
   std::size_t overflow_frames_ = 0;
 };

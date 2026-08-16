@@ -80,6 +80,30 @@ loop and no sort:
 integer atomics order floats correctly — negatives are where a naive encoding breaks, and there is a
 test for exactly that).
 
+### Zeroing the table is not free — and used to be the whole cost
+
+Sizing by the label space buys "no pre-pass", but it has to be paid for once per frame per camera:
+the histogram alone is `65536 × 3 × 64 × 4 B` = **48 MiB**. The original `reset_kernel` was one
+thread per *slot*, each looping over its own 192 bins, so adjacent threads wrote 768 bytes apart:
+50 MB at **45.7 GB/s**, about a fifteenth of the card. That made zeroing the third most expensive
+kernel in the whole application — 1101 µs median, 2.56 s over a 103 s profile, 5.6% of GPU 0
+(nsys, 2026-08-16) — for a fill that computes nothing.
+
+`launch_instance_reset` now uses `cudaMemsetAsync` for everything that resets to plain zero (`0.f`
+is all-zero bytes, so the float arrays qualify) and keeps a kernel only for the min/max sentinels,
+which are `0x7FFFFFFF` / `0x80000000` and therefore not byte-fillable — flat-indexed, so
+consecutive threads write consecutive words.
+
+| | before | after |
+|---|---|---|
+| histogram fill | 45.7 GB/s | **563 GB/s** |
+| whole reset | 1101 µs median | **116.4 µs** (89.3 hist + 18.2 small + 8.9 sentinels) |
+
+The 48 MiB memset now dominates what is left. Shrinking `kInstanceSlots` to `(max_class+1) << 8`
+would cut it ~40× and shrink the other table-sized kernels with it, but those total only ~0.12 s
+against the 2.4 s this recovered — so it is not worth the new failure mode (a class id above the
+bound) today.
+
 The reported `sigma` is the **pre-trim** value, deliberately: it is the signal that a mask covered two
 surfaces. The trim hides that from the box, and it should not also hide it from the log.
 
@@ -115,8 +139,58 @@ escape it, being at a fixed point from the first pass. Both behaviours are pinne
 
 It does **not** reject an outlier population larger than `trim_percentile`, by construction. The
 symptom is an implausibly large extent with a large pre-trim sigma. Raising the percentile is the wrong
-answer — it starts eating the object; the escalation is voxel connected components, keeping only the
-largest connected blob per instance.
+answer — it starts eating the object. That escalation is now implemented: see below.
+
+## The connected-component filter — escaping the breakdown point
+
+`component_filter: true` keeps only the largest connected component of each instance, running
+**before** everything above and rewriting nothing but its own scratch: losing pixels get label 0, so
+the six passes never learn it exists.
+
+Why connectivity rather than another distance rule: every distance rule here has a breakdown point.
+The percentile trim removes outliers up to `trim_percentile` and no further. Sigma clipping is
+strictly worse — for a tabletop with 20% of its points bled onto the floor 0.5 m below,
+`sigma_y = 0.20 m`, so the ±2σ window `[-0.50, +0.30]` *contains the blob it is meant to reject*. A
+real bleed population is routinely above both. Connectivity does not care how many the outliers are,
+only that they are not attached.
+
+**On the image grid, not a voxel grid.** These points come from a depth image, so they are an
+*organised* cloud: 3D adjacency is 2D pixel adjacency plus a depth-continuity test. That makes this a
+2D labelling over `H*W` rather than a voxel grid to allocate, size and hash — and it is the more
+faithful test, because bleed lands on a background surface and so is separated from its object by
+exactly the discontinuity `component_max_gap_m` looks for.
+
+Four-connectivity, deliberately: a diagonal-only link is a single-pixel bridge, and mask fringe is
+where those occur. Convergence is `kComponentRounds` rounds of propagate + pointer-jump with **no
+host synchronisation** — pointer jumping shortens chains geometrically, and under-convergence would
+only split a component further, never merge two.
+
+### `component_min_fraction` is the parameter that matters
+
+`1.0` — "keep strictly the largest" — is a **trap**. Masks have holes (occlusion, invalid depth),
+holes are label 0, and a hole breaks grid adjacency, so a real object routinely arrives as several
+islands. Measured on the 4-camera `k4a_capture` replay:
+
+| setting | objects | person | computer | monitor | table | chair |
+|---|---|---|---|---|---|---|
+| filter off | 18 | 9 | 1 | 1 | 2 | 5 |
+| on, fraction **1.0** | 14 | 9 | **0** | **0** | 2 | **3** |
+| on, fraction **0.10** | **19** | 9 | 1 | 1 | 3 | 5 |
+
+At `1.0` the result was *identical* for gaps 0.05, 0.10 and 0.20 — the gap making no difference is
+what identified holes, rather than depth steps, as the cause. `0.10` is the default for that reason.
+
+### What it buys
+
+Median box volume **−30%** across 468 matched instances (439 shrank, 2 grew) for only −6.1% of
+points — outliers, not erosion. The worst bleeding table went `4.47 × 0.79 × 4.79 m` →
+`2.96 × 0.47 × 3.58 m`.
+
+### Cost
+
+**~443 µs per camera-frame** at 640×576 (nsys, 20 rounds): propagate 20 × 9.4 µs, compress 40 ×
+4.4 µs, then init 11.5, count 16.9, best 45.2, select 5.2. That is on top of the existing six passes'
+~633 µs, and less than half of the ~985 µs the reset rewrite above gave back.
 
 ## Tests
 

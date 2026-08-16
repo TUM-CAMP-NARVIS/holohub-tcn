@@ -414,6 +414,176 @@ def case_up_axis_selects_the_vertical():
     return problems
 
 
+def case_component_filter_removes_a_detached_bleed_blob():
+    """The case percentiles and sigma both lose: an outlier population LARGER than any breakdown
+    point, but not attached to the object.
+
+    24 object points and 16 blob points -- the blob is 40% of the instance, far above both
+    trim_percentile and anything sigma clipping could survive. It is spatially detached, so
+    connectivity removes it regardless of how many there are.
+    """
+    label = PACK(1, 1)
+    # Object: a contiguous 3x8 patch of pixels on a plane at z = 0.
+    obj = [(x * 0.02, y * 0.02, 0.0) for y in range(3) for x in range(8)]
+    # Blob: a contiguous 2x8 patch 2 m behind, laid out in later rows so it is a separate island
+    # in the grid AND separated in depth. A whole grid row of background lies between them.
+    pad = [(0.0, 0.0, 0.0)] * 8                       # one row of label-0 padding
+    blob = [(x * 0.02, y * 0.02, 2.0) for y in range(2) for x in range(8)]
+
+    positions = np.zeros((H * W, 3), np.float32)
+    labels = np.zeros(H * W, np.uint16)
+    for i, pt in enumerate(obj):
+        positions[i], labels[i] = pt, label
+    base = len(obj) + len(pad)
+    for j, pt in enumerate(blob):
+        positions[base + j], labels[base + j] = pt, label
+
+    out_off, out_on = {}, {}
+    Harness(positions.reshape(H, W, 3), labels.reshape(H, W), out_off,
+            min_points=1, trim_percentile=0.0, component_filter=False).run()
+    Harness(positions.reshape(H, W, 3), labels.reshape(H, W), out_on,
+            min_points=1, trim_percentile=0.0,
+            component_filter=True, component_max_gap_m=0.05,
+            component_min_fraction=1.0).run()
+
+    problems = []
+    r_off = row_for(out_off["rows"], out_off["labels"], label)
+    r_on = row_for(out_on["rows"], out_on["labels"], label)
+    if r_off is None or r_on is None:
+        return [f"missing row: off={r_off is not None} on={r_on is not None}"]
+    if int(r_off[CNT]) != len(obj) + len(blob):
+        problems.append(f"precondition: filter OFF kept {int(r_off[CNT])}, expected "
+                        f"{len(obj) + len(blob)} -- the blob was already being removed")
+    if r_off[MXZ] < 1.5:
+        problems.append(f"precondition: filter OFF box max z {r_off[MXZ]:.3f} does not reach the "
+                        f"blob at z=2.0, so this case is not testing what it claims")
+    if int(r_on[CNT]) != len(obj):
+        problems.append(f"filter ON kept {int(r_on[CNT])} points, expected exactly the {len(obj)} "
+                        f"object points")
+    if abs(r_on[MXZ]) > 1e-4:
+        problems.append(f"filter ON box still reaches z={r_on[MXZ]:.3f}; the blob survived")
+    return problems
+
+
+def case_component_filter_keeps_a_contiguous_object_whole():
+    """It must not erode a legitimate object: one connected surface stays entirely intact."""
+    label = PACK(2, 3)
+    pts = [(x * 0.02, y * 0.02, 0.0) for y in range(5) for x in range(8)]
+    positions = np.zeros((H * W, 3), np.float32)
+    labels = np.zeros(H * W, np.uint16)
+    for i, pt in enumerate(pts):
+        positions[i], labels[i] = pt, label
+    out = {}
+    Harness(positions.reshape(H, W, 3), labels.reshape(H, W), out,
+            min_points=1, trim_percentile=0.0,
+            component_filter=True, component_max_gap_m=0.05,
+            component_min_fraction=1.0).run()
+    r = row_for(out["rows"], out["labels"], label)
+    if r is None:
+        return ["the whole object was filtered away"]
+    if int(r[CNT]) != len(pts):
+        return [f"kept {int(r[CNT])} of {len(pts)} points; a contiguous surface was split"]
+    return []
+
+
+def case_component_filter_gap_is_a_surface_test_not_a_mask_test():
+    """With a gap large enough to bridge the depth step, the blob must come BACK -- otherwise the
+    filter is separating on grid adjacency alone and the 3D predicate is dead code."""
+    label = PACK(3, 2)
+    obj = [(x * 0.02, y * 0.02, 0.0) for y in range(3) for x in range(8)]
+    blob = [(x * 0.02, y * 0.02, 0.10) for y in range(2) for x in range(8)]
+    positions = np.zeros((H * W, 3), np.float32)
+    labels = np.zeros(H * W, np.uint16)
+    for i, pt in enumerate(obj):
+        positions[i], labels[i] = pt, label
+    for j, pt in enumerate(blob):
+        positions[len(obj) + j], labels[len(obj) + j] = pt, label   # grid-adjacent, 0.10 m behind
+
+    tight, loose = {}, {}
+    Harness(positions.reshape(H, W, 3), labels.reshape(H, W), tight,
+            min_points=1, trim_percentile=0.0,
+            component_filter=True, component_max_gap_m=0.05,
+            component_min_fraction=1.0).run()
+    Harness(positions.reshape(H, W, 3), labels.reshape(H, W), loose,
+            min_points=1, trim_percentile=0.0,
+            component_filter=True, component_max_gap_m=0.50,
+            component_min_fraction=1.0).run()
+    r_tight = row_for(tight["rows"], tight["labels"], label)
+    r_loose = row_for(loose["rows"], loose["labels"], label)
+    problems = []
+    if r_tight is None or int(r_tight[CNT]) != len(obj):
+        got = "none" if r_tight is None else int(r_tight[CNT])
+        problems.append(f"gap 0.05 kept {got}, expected {len(obj)} (the 0.10 m step should split)")
+    if r_loose is None or int(r_loose[CNT]) != len(obj) + len(blob):
+        got = "none" if r_loose is None else int(r_loose[CNT])
+        problems.append(f"gap 0.50 kept {got}, expected {len(obj) + len(blob)} -- the 3D gap "
+                        f"predicate is not being used, only grid adjacency")
+    return problems
+
+
+def case_component_filter_off_by_default():
+    """Default must be the exact pre-existing behaviour."""
+    label = PACK(4, 1)
+    obj = [(x * 0.02, 0.0, 0.0) for x in range(8)]
+    blob = [(x * 0.02, 0.0, 2.0) for x in range(8)]
+    positions = np.zeros((H * W, 3), np.float32)
+    labels = np.zeros(H * W, np.uint16)
+    for i, pt in enumerate(obj + blob):
+        positions[i], labels[i] = pt, label
+    out = {}
+    Harness(positions.reshape(H, W, 3), labels.reshape(H, W), out,
+            min_points=1, trim_percentile=0.0).run()
+    r = row_for(out["rows"], out["labels"], label)
+    if r is None or int(r[CNT]) != len(obj) + len(blob):
+        got = "none" if r is None else int(r[CNT])
+        return [f"default kept {got}, expected all {len(obj) + len(blob)}: the filter is on by "
+                f"default, which silently changes every existing pipeline"]
+    return []
+
+
+def case_component_min_fraction_keeps_a_secondary_island():
+    """The guard against the trap that `min_fraction: 1.0` is.
+
+    A mask has HOLES -- occlusion and invalid-depth pixels are label 0 -- and a hole breaks grid
+    adjacency, so a real object routinely arrives as several islands. Keeping strictly the largest
+    then deletes most of it. Measured on a 4-camera capture, 1.0 destroyed the computer, the monitor
+    and 2 of 5 chairs; 0.1 lost nothing.
+
+    Here: one object split into 24 + 16 points by a row of label-0 holes, both at the SAME depth, so
+    they are one surface separated only by the hole. 1.0 keeps 24; a fraction below 16/24 keeps all
+    40.
+    """
+    label = PACK(5, 1)
+    big = [(x * 0.02, y * 0.02, 0.0) for y in range(3) for x in range(8)]     # 24
+    small = [(x * 0.02, (y + 4) * 0.02, 0.0) for y in range(2) for x in range(8)]  # 16
+    positions = np.zeros((H * W, 3), np.float32)
+    labels = np.zeros(H * W, np.uint16)
+    for i, pt in enumerate(big):
+        positions[i], labels[i] = pt, label
+    base = len(big) + 8                                   # one row of label-0 holes between them
+    for j, pt in enumerate(small):
+        positions[base + j], labels[base + j] = pt, label
+
+    strict, lenient = {}, {}
+    Harness(positions.reshape(H, W, 3), labels.reshape(H, W), strict,
+            min_points=1, trim_percentile=0.0, component_filter=True,
+            component_max_gap_m=0.05, component_min_fraction=1.0).run()
+    Harness(positions.reshape(H, W, 3), labels.reshape(H, W), lenient,
+            min_points=1, trim_percentile=0.0, component_filter=True,
+            component_max_gap_m=0.05, component_min_fraction=0.5).run()
+    r_s = row_for(strict["rows"], strict["labels"], label)
+    r_l = row_for(lenient["rows"], lenient["labels"], label)
+    problems = []
+    if r_s is None or int(r_s[CNT]) != len(big):
+        got = "none" if r_s is None else int(r_s[CNT])
+        problems.append(f"fraction 1.0 kept {got}, expected only the largest island ({len(big)})")
+    if r_l is None or int(r_l[CNT]) != len(big) + len(small):
+        got = "none" if r_l is None else int(r_l[CNT])
+        problems.append(f"fraction 0.5 kept {got}, expected both islands "
+                        f"({len(big) + len(small)}); 16/24 = 0.67 is above the threshold")
+    return problems
+
+
 def case_yaw_is_computed_on_the_trimmed_points():
     """Orientation must come from the surviving points, not the raw ones: a far outlier blob would
     otherwise drag the principal axis onto itself and rotate the box away from the object."""
@@ -448,6 +618,11 @@ CASES = [
     case_oriented_box_is_never_larger_than_the_aabb,
     case_up_axis_selects_the_vertical,
     case_yaw_is_computed_on_the_trimmed_points,
+    case_component_filter_removes_a_detached_bleed_blob,
+    case_component_filter_keeps_a_contiguous_object_whole,
+    case_component_filter_gap_is_a_surface_test_not_a_mask_test,
+    case_component_filter_off_by_default,
+    case_component_min_fraction_keeps_a_secondary_island,
 ]
 
 if __name__ == "__main__":

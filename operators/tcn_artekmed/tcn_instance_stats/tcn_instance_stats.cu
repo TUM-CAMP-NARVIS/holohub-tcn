@@ -115,6 +115,33 @@ void TcnInstanceStatsOp::setup(holoscan::OperatorSpec& spec) {
              "Maximum Instances",
              "Output row capacity. Overflow is counted and reported, never silently truncated.",
              static_cast<int64_t>(64));
+  spec.param(component_filter_, "component_filter",
+             "Component Filter",
+             "Keep only the largest connected component of each instance, rejecting mask bleed by "
+             "CONNECTIVITY instead of by distance. Every distance rule here has a breakdown point -- "
+             "the percentile trim removes outliers up to trim_percentile and no further, and sigma "
+             "clipping is worse because the outliers inflate the sigma meant to catch them. A real "
+             "bleed population is routinely 20% of an instance, above both. Connectivity does not "
+             "care how many the outliers are, only that they are not attached to the object.",
+             false);
+  spec.param(component_max_gap_m_, "component_max_gap_m",
+             "Component Max Gap",
+             "Two neighbouring pixels join only if their 3D separation is at most this, in metres. "
+             "This is what makes the filter a SURFACE test rather than a mask test: without it every "
+             "pixel of one mask would be a single component however far apart in space. Size it "
+             "above the depth spacing between adjacent pixels on a real surface at working range, "
+             "and below the step onto a background surface.",
+             0.05);
+  spec.param(component_min_fraction_, "component_min_fraction",
+             "Component Min Fraction",
+             "Keep every component holding at least this share of the largest, not only the largest "
+             "itself. 1.0 keeps strictly the largest and is a TRAP: a mask has holes -- occlusion and "
+             "invalid depth pixels are label 0 -- and those holes break grid adjacency, so a real "
+             "object routinely arrives as several islands. Measured on a 4-camera capture, 1.0 "
+             "destroyed the computer, the monitor and 2 of 5 chairs, at every gap from 0.05 to 0.20 "
+             "(the gap made no difference at all, which is what identified holes rather than depth "
+             "steps as the cause). 0.1 lost nothing and still cut median box volume by 30%.",
+             0.1);
   spec.param(verbose_, "verbose", "Verbose", "Log the per-instance rows every frame.", false);
   spec.param(cuda_device_ordinal_, "cuda_device_ordinal", "CudaDeviceOrdinal",
              "Device to use for CUDA operations", holoscan::ParameterFlag::kOptional);
@@ -188,6 +215,36 @@ void TcnInstanceStatsOp::allocate_scratch() {
       "TcnInstanceStatsOp: failed to allocate the pinned row count");
 }
 
+void TcnInstanceStatsOp::ensure_component_scratch(int64_t count) {
+  if (comp_.capacity >= count) return;
+  free_component_scratch();
+  auto alloc = [](void** p, size_t bytes, const char* what) {
+    HOLOSCAN_CUDA_CALL_THROW_ERROR(
+        cudaMalloc(p, bytes),
+        (std::string("TcnInstanceStatsOp: failed to allocate component ") + what));
+  };
+  const size_t n = static_cast<size_t>(count);
+  alloc(reinterpret_cast<void**>(&comp_.comp), n * sizeof(uint32_t), "roots");
+  // Indexed BY ROOT, and a root is a pixel index, so this is grid-sized rather than instance-sized.
+  alloc(reinterpret_cast<void**>(&comp_.compCount), n * sizeof(uint32_t), "counts");
+  alloc(reinterpret_cast<void**>(&comp_.labelsOut), n * sizeof(uint16_t), "filtered labels");
+  alloc(reinterpret_cast<void**>(&comp_.best),
+        static_cast<size_t>(kInstanceSlots) * sizeof(unsigned long long), "per-label best");
+  comp_.capacity = count;
+  HOLOSCAN_LOG_INFO("TcnInstanceStatsOp[cam {}]: component filter scratch for {} pixels "
+                    "({:.1f} MiB)", camera_index_.get(), count,
+                    (n * (2 * sizeof(uint32_t) + sizeof(uint16_t)) +
+                     kInstanceSlots * sizeof(unsigned long long)) / (1024.0 * 1024.0));
+}
+
+void TcnInstanceStatsOp::free_component_scratch() {
+  for (void* p : {reinterpret_cast<void*>(comp_.comp), reinterpret_cast<void*>(comp_.compCount),
+                  reinterpret_cast<void*>(comp_.labelsOut), reinterpret_cast<void*>(comp_.best)}) {
+    if (p) cudaFree(p);
+  }
+  comp_ = ComponentBuffers{};
+}
+
 void TcnInstanceStatsOp::free_scratch() {
   for (void* p : {reinterpret_cast<void*>(acc_.count1), reinterpret_cast<void*>(acc_.sum1),
                   reinterpret_cast<void*>(acc_.sqsum1), reinterpret_cast<void*>(acc_.sigmaRaw),
@@ -212,6 +269,7 @@ void TcnInstanceStatsOp::free_scratch() {
 
 void TcnInstanceStatsOp::stop() {
   ScopedDevice guard(cuda_device_ordinal_.get());
+  free_component_scratch();
   free_scratch();
   if (overflow_frames_ > 0) {
     HOLOSCAN_LOG_ERROR("TcnInstanceStatsOp[cam {}]: {} of {} frames exceeded max_instances={}; "
@@ -276,6 +334,30 @@ void TcnInstanceStatsOp::compute(holoscan::InputContext& op_input,
 
   const auto* positions_d = static_cast<const float*>(positions_t->data());
   const auto* labels_d = static_cast<const uint16_t*>(labels_t->data());
+
+  // Connected-component pre-filter. It rewrites nothing but its own scratch: losing components get
+  // label 0 in `comp_.labelsOut`, and every pass below then runs on that instead of the input. That
+  // is what keeps the six-pass reduction completely unaware this exists.
+  if (component_filter_.get()) {
+    // The 2D grid is what makes this cheap, so it has to be a real grid. `positions` is [H, W, 3]
+    // and `labels` is [H, W] or [H, W, 1]; both must agree, which was checked above by element
+    // count -- here we only need the shape to walk pixel neighbours.
+    const auto& shape = labels_t->shape();
+    if (shape.size() < 2) {
+      throw std::runtime_error(
+          "TcnInstanceStatsOp: component_filter needs the labels as a 2D grid [H, W], got a "
+          + std::to_string(shape.size()) + "-D tensor. Pixel adjacency is the whole basis of the "
+          "filter -- a flat list has no neighbours. Disable component_filter for flat input.");
+    }
+    const int h = static_cast<int>(shape[0]);
+    const int w = static_cast<int>(shape[1]);
+    ensure_component_scratch(static_cast<int64_t>(h) * static_cast<int64_t>(w));
+    launch_component_filter(positions_d, labels_d, h, w,
+                            static_cast<float>(component_max_gap_m_.get()),
+                            static_cast<float>(component_min_fraction_.get()),
+                            comp_, cuda_stream);
+    labels_d = comp_.labelsOut;
+  }
 
   HOLOSCAN_CUDA_CALL_THROW_ERROR(cudaMemsetAsync(row_count_d_, 0, sizeof(uint32_t), cuda_stream),
                                  "TcnInstanceStatsOp: failed to reset the row counter");

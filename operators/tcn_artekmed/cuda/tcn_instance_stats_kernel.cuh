@@ -37,6 +37,11 @@ enum InstanceStatColumn {
 /// present before binning. Sized once at start(), not per frame.
 constexpr int kInstanceHistBins = 64;
 
+/// Propagate + pointer-jump rounds in the component pre-filter. Pointer jumping shortens chains
+/// geometrically, so even a structure spanning the full grid width converges in about five; the
+/// margin here buys immunity to awkward shapes without a host round trip to test for convergence.
+constexpr int kComponentRounds = 20;
+
 /// Device-side accumulators, all sized [kInstanceSlots] (or x3 where noted). Allocated once and
 /// reused.
 struct InstanceAccumulators {
@@ -66,6 +71,53 @@ struct InstanceAccumulators {
   int32_t*  oMinEnc;     ///< [slots*2]    min along (yaw, perpendicular), ordered-int encoded
   int32_t*  oMaxEnc;     ///< [slots*2]    max along the same
 };
+
+/// Scratch for the connected-component pre-filter. Sized by the depth grid, not the label space, so
+/// it is allocated on the first tick (when H and W are known) and reused.
+struct ComponentBuffers {
+  uint32_t* comp = nullptr;        ///< [H*W]   union-find parent, converged to the component root
+  uint32_t* compCount = nullptr;   ///< [H*W]   points per root (indexed BY root, hence H*W wide)
+  unsigned long long* best = nullptr;  ///< [slots] packed (count << 32 | root), largest per label
+  uint16_t* labelsOut = nullptr;   ///< [H*W]   input labels with the losing components zeroed
+  int64_t capacity = 0;            ///< allocated H*W; a larger frame triggers a realloc
+};
+
+/// Reject mask bleed by CONNECTIVITY rather than by distance: keep only the largest connected
+/// component of each instance and zero the rest, writing the result to `bufs.labelsOut`.
+///
+/// Why connectivity. Every distance-based rule here has a breakdown point -- percentile trimming
+/// removes outliers up to `trim_percentile` however far away they lie, and no further; sigma
+/// clipping is worse, because the outliers inflate the sigma meant to catch them (the masking
+/// effect, see this header's .cu). A real bleed population is routinely 20% of an instance, above
+/// both. Connectivity has no such bound: it does not care how MANY the outliers are, only that they
+/// are not attached to the object.
+///
+/// Why the image grid and not a voxel grid. These points come from a depth image, so they are an
+/// ORGANISED cloud: 3D adjacency is 2D pixel adjacency plus a depth-continuity test. That makes this
+/// a 2D component labelling over H*W instead of a voxel grid that would have to be allocated, sized
+/// and hashed -- and it is the more faithful test, because mask bleed lands on a background surface
+/// and is therefore separated from its object by exactly the depth discontinuity this predicate
+/// looks for.
+///
+/// Two pixels join when they share a packed label AND their 3D separation is <= `max_gap_m`. The
+/// gap is what makes this a surface test rather than a mask test: without it every pixel of one
+/// mask would be one component no matter how far apart in space, which is the bug being fixed.
+///
+/// `min_fraction` keeps every component holding at least that share of the largest, not only the
+/// single largest -- an object split by an occluder is genuinely two components, and keeping only
+/// one would discard a real part. 1.0 keeps strictly the largest.
+///
+/// Convergence: `kComponentRounds` rounds of propagate + pointer-jump, no host synchronisation.
+/// Pointer jumping shortens chains geometrically, so a 640-wide structure converges in ~5 rounds;
+/// the cap is generous. A non-converged component only ever splits an object further, never merges
+/// two -- so the failure mode is conservative.
+void launch_component_filter(const float* positions,    ///< [H*W*3] xyz, world space
+                             const uint16_t* labels,    ///< [H*W] packed panoptic, unmodified
+                             int height, int width,
+                             float max_gap_m,
+                             float min_fraction,
+                             const ComponentBuffers& bufs,
+                             cudaStream_t stream);
 
 /// Zero the accumulators (min/max are set to the encoding's extremes, not to 0).
 void launch_instance_reset(const InstanceAccumulators& acc, cudaStream_t stream);

@@ -39,34 +39,150 @@ __device__ __forceinline__ float ordered_to_float(int32_t i) {
   return (i >= 0) ? __int_as_float(i) : __int_as_float(i ^ 0x7FFFFFFF);
 }
 
-__global__ void reset_kernel(InstanceAccumulators acc) {
-  const int s = blockIdx.x * blockDim.x + threadIdx.x;
-  if (s >= kInstanceSlots) return;
-  acc.count1[s] = 0u;
-  acc.count2[s] = 0u;
-  acc.sumUU[s] = 0.f;
-  acc.sumVV[s] = 0.f;
-  acc.sumUV[s] = 0.f;
-  acc.yaw[s] = 0.f;
-  for (int d = 0; d < 3; ++d) {
-    const int k = 3 * s + d;
-    acc.sum1[k] = 0.f;
-    acc.sqsum1[k] = 0.f;
-    acc.sigmaRaw[k] = 0.f;
-    acc.rawMinEnc[k] = 0x7FFFFFFF;                        // +inf under the ordered encoding
-    acc.rawMaxEnc[k] = static_cast<int32_t>(0x80000000);   // -inf
-    acc.loBound[k] = 0.f;
-    acc.hiBound[k] = 0.f;
-    acc.sum2[k] = 0.f;
-    acc.minEnc[k] = 0x7FFFFFFF;
-    acc.maxEnc[k] = static_cast<int32_t>(0x80000000);
-    if (d < 2) {
-      acc.oMinEnc[2 * s + d] = 0x7FFFFFFF;
-      acc.oMaxEnc[2 * s + d] = static_cast<int32_t>(0x80000000);
-    }
-    for (int b = 0; b < kInstanceHistBins; ++b) {
-      acc.hist[(3 * s + d) * kInstanceHistBins + b] = 0u;
-    }
+// ── connected-component pre-filter ───────────────────────────────────────────────────────────────
+//
+// See the .cuh for why this is connectivity rather than distance, and why it runs on the image grid
+// rather than a voxel grid. Everything below writes only into ComponentBuffers; the input labels are
+// never modified.
+
+constexpr uint32_t kNoComponent = 0xFFFFFFFFu;
+
+__global__ void component_init_kernel(const float* __restrict__ positions,
+                                      const uint16_t* __restrict__ labels,
+                                      int64_t count,
+                                      uint32_t* __restrict__ comp,
+                                      uint32_t* __restrict__ compCount) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  compCount[i] = 0u;
+  const uint16_t label = labels[i];
+  // Background and non-finite pixels take no part: they must not bridge two real components.
+  if (label == 0 || !isfinite(positions[3 * i + 0]) || !isfinite(positions[3 * i + 1]) ||
+      !isfinite(positions[3 * i + 2])) {
+    comp[i] = kNoComponent;
+    return;
+  }
+  comp[i] = static_cast<uint32_t>(i);          // every pixel starts as its own root
+}
+
+/// One propagation round: adopt the smallest root among the four-neighbours that share this pixel's
+/// label AND lie within `max_gap_m` of it in 3D.
+///
+/// Four-connectivity, not eight: a diagonal-only link is a single-pixel bridge, and mask fringe is
+/// exactly where such bridges occur -- letting one join the bleed to the object would defeat the
+/// whole filter.
+__global__ void component_propagate_kernel(const float* __restrict__ positions,
+                                           const uint16_t* __restrict__ labels,
+                                           int height, int width,
+                                           float max_gap_sq,
+                                           uint32_t* __restrict__ comp) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= height * width) return;
+  const uint32_t mine = comp[idx];
+  if (mine == kNoComponent) return;
+
+  const int x = idx % width;
+  const int y = idx / width;
+  const uint16_t label = labels[idx];
+  const float p[3] = {positions[3 * idx + 0], positions[3 * idx + 1], positions[3 * idx + 2]};
+
+  uint32_t best = mine;
+  const int dx[4] = {-1, 1, 0, 0};
+  const int dy[4] = {0, 0, -1, 1};
+  for (int k = 0; k < 4; ++k) {
+    const int nx = x + dx[k], ny = y + dy[k];
+    if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+    const int n = ny * width + nx;
+    if (labels[n] != label) continue;
+    const uint32_t other = comp[n];
+    if (other == kNoComponent) continue;
+    const float d0 = positions[3 * n + 0] - p[0];
+    const float d1 = positions[3 * n + 1] - p[1];
+    const float d2 = positions[3 * n + 2] - p[2];
+    if (d0 * d0 + d1 * d1 + d2 * d2 > max_gap_sq) continue;   // a depth step: different surface
+    if (other < best) best = other;
+  }
+  if (best != mine) atomicMin(&comp[idx], best);
+}
+
+/// Pointer jumping: replace each pixel's root by its root's root. Halves chain length per
+/// application, which is what turns O(diameter) propagation into O(log diameter).
+__global__ void component_compress_kernel(uint32_t* __restrict__ comp, int64_t count) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  uint32_t r = comp[i];
+  if (r == kNoComponent) return;
+  uint32_t rr = comp[r];
+  if (rr == kNoComponent) return;              // cannot happen for a valid root, but never chase it
+  comp[i] = rr;
+}
+
+__global__ void component_count_kernel(const uint32_t* __restrict__ comp,
+                                       int64_t count,
+                                       uint32_t* __restrict__ compCount) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const uint32_t r = comp[i];
+  if (r == kNoComponent) return;
+  atomicAdd(&compCount[r], 1u);
+}
+
+/// Largest component per label, as a packed (count << 32 | root) so one 64-bit atomicMax settles
+/// both the winning size and its identity. Ties break on the larger root index, which is arbitrary
+/// but deterministic -- what matters is that every pixel agrees on the same winner.
+__global__ void component_best_kernel(const uint16_t* __restrict__ labels,
+                                      const uint32_t* __restrict__ comp,
+                                      const uint32_t* __restrict__ compCount,
+                                      int64_t count,
+                                      unsigned long long* __restrict__ best) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const uint32_t r = comp[i];
+  if (r == kNoComponent) return;
+  const uint16_t label = labels[i];
+  if (label == 0) return;
+  const unsigned long long key =
+      (static_cast<unsigned long long>(compCount[r]) << 32) | static_cast<unsigned long long>(r);
+  atomicMax(&best[label], key);
+}
+
+__global__ void component_select_kernel(const uint16_t* __restrict__ labels,
+                                        const uint32_t* __restrict__ comp,
+                                        const uint32_t* __restrict__ compCount,
+                                        const unsigned long long* __restrict__ best,
+                                        int64_t count,
+                                        float min_fraction,
+                                        uint16_t* __restrict__ labelsOut) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const uint16_t label = labels[i];
+  const uint32_t r = comp[i];
+  if (label == 0 || r == kNoComponent) { labelsOut[i] = 0u; return; }
+  const uint32_t largest = static_cast<uint32_t>(best[label] >> 32);
+  if (largest == 0u) { labelsOut[i] = 0u; return; }
+  // Keep every component holding at least `min_fraction` of the largest, not only the largest
+  // itself: an object split by an occluder is genuinely two components and dropping one would
+  // discard a real part of it. At 1.0 the comparison keeps exactly the winner.
+  const float share = static_cast<float>(compCount[r]) / static_cast<float>(largest);
+  labelsOut[i] = (share >= min_fraction) ? label : static_cast<uint16_t>(0);
+}
+
+/// The half of the reset that a `cudaMemsetAsync` cannot do: the min/max sentinels are
+/// 0x7FFFFFFF / 0x80000000 under the ordered-int encoding, and neither is a repeated byte.
+///
+/// Indexed FLAT over the arrays rather than per slot, so consecutive threads write consecutive
+/// words. That is the whole point -- see `launch_instance_reset`.
+__global__ void reset_sentinels_kernel(InstanceAccumulators acc) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= kInstanceSlots * 3) return;
+  acc.rawMinEnc[i] = 0x7FFFFFFF;                        // +inf under the ordered encoding
+  acc.rawMaxEnc[i] = static_cast<int32_t>(0x80000000);   // -inf
+  acc.minEnc[i] = 0x7FFFFFFF;
+  acc.maxEnc[i] = static_cast<int32_t>(0x80000000);
+  // The oriented arrays are [slots*2], so the first two thirds of the same launch cover them.
+  if (i < kInstanceSlots * 2) {
+    acc.oMinEnc[i] = 0x7FFFFFFF;
+    acc.oMaxEnc[i] = static_cast<int32_t>(0x80000000);
   }
 }
 
@@ -338,8 +454,64 @@ __global__ void compact_kernel(InstanceAccumulators acc,
 
 }  // namespace
 
+void launch_component_filter(const float* positions, const uint16_t* labels,
+                             int height, int width, float max_gap_m, float min_fraction,
+                             const ComponentBuffers& bufs, cudaStream_t stream) {
+  const int64_t count = static_cast<int64_t>(height) * static_cast<int64_t>(width);
+  if (count <= 0) return;
+  const int64_t grid = grid_for(count);
+  const float max_gap_sq = max_gap_m * max_gap_m;
+
+  cudaMemsetAsync(bufs.best, 0, static_cast<size_t>(kInstanceSlots) * sizeof(unsigned long long),
+                  stream);
+  component_init_kernel<<<grid, kBlock, 0, stream>>>(positions, labels, count, bufs.comp,
+                                                     bufs.compCount);
+  // No convergence test, hence no host round trip: pointer jumping shortens chains geometrically,
+  // so the fixed cap converges with room to spare. Under-convergence would only split a component
+  // further, never merge two -- a conservative failure.
+  for (int r = 0; r < kComponentRounds; ++r) {
+    component_propagate_kernel<<<grid, kBlock, 0, stream>>>(positions, labels, height, width,
+                                                            max_gap_sq, bufs.comp);
+    component_compress_kernel<<<grid, kBlock, 0, stream>>>(bufs.comp, count);
+    component_compress_kernel<<<grid, kBlock, 0, stream>>>(bufs.comp, count);
+  }
+  component_count_kernel<<<grid, kBlock, 0, stream>>>(bufs.comp, count, bufs.compCount);
+  component_best_kernel<<<grid, kBlock, 0, stream>>>(labels, bufs.comp, bufs.compCount, count,
+                                                     bufs.best);
+  component_select_kernel<<<grid, kBlock, 0, stream>>>(labels, bufs.comp, bufs.compCount, bufs.best,
+                                                        count, min_fraction, bufs.labelsOut);
+}
+
 void launch_instance_reset(const InstanceAccumulators& acc, cudaStream_t stream) {
-  reset_kernel<<<grid_for(kInstanceSlots), kBlock, 0, stream>>>(acc);
+  const size_t slots = static_cast<size_t>(kInstanceSlots);
+
+  // Everything that resets to plain zero goes through cudaMemsetAsync, which is a coalesced/DMA
+  // fill. The previous version was one thread per SLOT, each looping over its own 3x64 histogram
+  // bins -- so adjacent threads wrote 768 bytes apart and the 50 MB histogram fill ran at ~46 GB/s,
+  // roughly a fifteenth of the card. That made zeroing the accumulators the THIRD most expensive
+  // kernel in the whole application: 1101 us median, 2.56 s over a 103 s profile, 5.6% of GPU 0
+  // (nsys, 2026-08-16). It is pure zero-fill; none of that time bought anything.
+  //
+  // Return codes are deliberately not checked here, matching the kernel launches below: an
+  // asynchronous failure surfaces at the `cudaStreamSynchronize` in
+  // TcnInstanceStatsOp::compute(), which IS checked and names this operator.
+  cudaMemsetAsync(acc.count1, 0, slots * sizeof(uint32_t), stream);
+  cudaMemsetAsync(acc.count2, 0, slots * sizeof(uint32_t), stream);
+  cudaMemsetAsync(acc.sumUU, 0, slots * sizeof(float), stream);
+  cudaMemsetAsync(acc.sumVV, 0, slots * sizeof(float), stream);
+  cudaMemsetAsync(acc.sumUV, 0, slots * sizeof(float), stream);
+  cudaMemsetAsync(acc.yaw, 0, slots * sizeof(float), stream);
+  cudaMemsetAsync(acc.sum1, 0, slots * 3 * sizeof(float), stream);
+  cudaMemsetAsync(acc.sqsum1, 0, slots * 3 * sizeof(float), stream);
+  cudaMemsetAsync(acc.sigmaRaw, 0, slots * 3 * sizeof(float), stream);
+  cudaMemsetAsync(acc.loBound, 0, slots * 3 * sizeof(float), stream);
+  cudaMemsetAsync(acc.hiBound, 0, slots * 3 * sizeof(float), stream);
+  cudaMemsetAsync(acc.sum2, 0, slots * 3 * sizeof(float), stream);
+  cudaMemsetAsync(acc.hist, 0, slots * 3 * kInstanceHistBins * sizeof(uint32_t), stream);
+
+  // 0.f is all-zero bytes, so the float arrays above are byte-fillable. The min/max sentinels are
+  // not, so they keep a kernel -- but a flat-indexed, fully coalesced one over ~1.5 MB.
+  reset_sentinels_kernel<<<grid_for(kInstanceSlots * 3), kBlock, 0, stream>>>(acc);
 }
 
 void launch_instance_pass1(const float* positions, const uint16_t* labels, int64_t count,

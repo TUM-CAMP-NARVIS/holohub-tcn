@@ -68,6 +68,9 @@ class PyTcnInstanceStatsOp : public TcnInstanceStatsOp {
       double min_anisotropy = 1.5,
       int64_t min_points = 64,
       int64_t max_instances = 64,
+      bool component_filter = false,
+      double component_max_gap_m = 0.05,
+      double component_min_fraction = 0.1,
       bool verbose = false,
       const std::string& name = "tcn_instance_stats")
       : TcnInstanceStatsOp(
@@ -85,6 +88,9 @@ class PyTcnInstanceStatsOp : public TcnInstanceStatsOp {
                               holoscan::Arg{"min_anisotropy", min_anisotropy},
                               holoscan::Arg{"min_points", min_points},
                               holoscan::Arg{"max_instances", max_instances},
+                              holoscan::Arg{"component_filter", component_filter},
+                              holoscan::Arg{"component_max_gap_m", component_max_gap_m},
+                              holoscan::Arg{"component_min_fraction", component_min_fraction},
                               holoscan::Arg{"verbose", verbose}}) {
     add_positional_condition_and_resource_args(this, args);
     init_operator_base(this, fragment_or_subgraph, name);
@@ -128,6 +134,9 @@ PYBIND11_MODULE(_tcn_instance_stats, m) {
                     int64_t,
                     int64_t,
                     bool,
+                    double,
+                    double,
+                    bool,
                     const std::string&>(),
            "fragment"_a,
            "allocator"_a,
@@ -144,6 +153,9 @@ PYBIND11_MODULE(_tcn_instance_stats, m) {
            "min_anisotropy"_a = 1.5,
            "min_points"_a = static_cast<int64_t>(64),
            "max_instances"_a = static_cast<int64_t>(64),
+           "component_filter"_a = false,
+           "component_max_gap_m"_a = 0.05,
+           "component_min_fraction"_a = 0.1,
            "verbose"_a = false,
            "name"_a = "tcn_instance_stats"s,
            doc::TcnInstanceStatsOp::doc_TcnInstanceStatsOp)
