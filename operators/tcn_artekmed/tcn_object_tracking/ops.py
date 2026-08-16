@@ -76,10 +76,11 @@ class InstanceFusionOp(Operator):
     def __init__(self, fragment, *args, iou_threshold=0.15, containment_threshold=0.6,
                  max_centroid_distance_m=1.0, footprint_iou_threshold=0.4,
                  max_vertical_gap_m=0.5, up_axis="y", min_extent_m=0.0, min_points=0,
+                 min_footprint_m2=0.0,
                  aggregate_containment=0.7, aggregate_min_children=2,
                  aggregate_min_volume_ratio=1.5, min_cameras=1,
                  min_detection_points=0, min_detection_extent_m=0.0,
-                 verbose=False, **kwargs):
+                 verbose=False, dump_dir="", **kwargs):
         # The vertical world axis is a property of the calibration, not a convention: for the
         # artekmed exports it is y. A wrong value does not fail loudly -- the footprint rule simply
         # stops merging vertically split objects -- so it is configured, never assumed.
@@ -107,6 +108,7 @@ class InstanceFusionOp(Operator):
         self.max_vertical_gap_m = float(max_vertical_gap_m)
         self.min_extent_m = float(min_extent_m)
         self.min_points = int(min_points)
+        self.min_footprint_m2 = float(min_footprint_m2)
         self.aggregate_containment = float(aggregate_containment)
         self.aggregate_min_children = int(aggregate_min_children)
         self.aggregate_min_volume_ratio = float(aggregate_min_volume_ratio)
@@ -114,6 +116,12 @@ class InstanceFusionOp(Operator):
         self.min_detection_points = int(min_detection_points)
         self.min_detection_extent_m = float(min_detection_extent_m)
         self.verbose = bool(verbose)
+        # Opt-in diagnostic: pickle this frame's raw observations next to the detections they
+        # produced, so the filter chain can be replayed offline with one threshold changed at a
+        # time. "Which of the seven thresholds dropped my object?" is otherwise unanswerable from
+        # the logs -- fusion reports only a count -- and guessing at it wastes whole sessions.
+        # Unset (default) costs nothing. Same spirit as mask_dump_dir / JoinCheckOp.
+        self.dump_dir = str(dump_dir or "")
         self.dropped = 0
         self.frames = 0
         super().__init__(fragment, *args, **kwargs)
@@ -142,6 +150,7 @@ class InstanceFusionOp(Operator):
             up_axis=self.up_axis,
             min_extent_m=self.min_extent_m,
             min_points=self.min_points,
+            min_footprint_m2=self.min_footprint_m2,
             suppress_aggregates_containment=self.aggregate_containment,
             suppress_aggregates_min_children=self.aggregate_min_children,
             suppress_aggregates_min_volume_ratio=self.aggregate_min_volume_ratio,
@@ -149,6 +158,13 @@ class InstanceFusionOp(Operator):
             min_detection_points=self.min_detection_points,
             min_detection_extent_m=self.min_detection_extent_m)
         self.frames += 1
+        if self.dump_dir:
+            import os
+            import pickle
+            os.makedirs(self.dump_dir, exist_ok=True)
+            with open(os.path.join(self.dump_dir, f"frame{self.frames:06d}.pkl"), "wb") as fh:
+                pickle.dump({"acq": acq, "observations": observations,
+                             "detections": detections}, fh)
         if self.verbose:
             log.info(f"InstanceFusionOp: frame {self.frames}: {len(observations)} observation(s) "
                      f"from {len({o.camera_index for o in observations})} camera(s) -> "

@@ -8,7 +8,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from association import (UP_AXIS_Y, UP_AXIS_Z, Observation, box_containment, box_extent,
+from association import (UP_AXIS_Y, UP_AXIS_Z, Observation, _candidate_pairs,
+                         box_containment, box_extent,
                          filter_detections, filter_observations, suppress_aggregates,
                          box_intersection, box_iou, box_union, box_volume,
                          centroid_distance, footprint_iou, fuse_observations,
@@ -193,6 +194,187 @@ def test_min_extent_rejects_a_flat_sliver():
     assert len(keep) == 1 and keep[0].instance_id == 2, [box_extent(o.box) for o in keep]
 
 
+def test_large_flat_object_survives_min_extent_via_its_footprint():
+    """A tabletop is a PLANE to a depth camera -- it sees the top surface and nothing else, so the
+    vertical extent is a few centimetres of sensor noise. `min_extent_m` alone therefore cannot
+    tell a real 1.3 x 1.3 m table from the 0.27 x 0.33 x 0.03 m mask fringe it was written to
+    reject: both are thin on one axis.
+
+    The footprint discriminates where the thickness cannot -- 1.64 m2 against 0.09 m2, about 20x.
+    Measured on a real capture: without this the table produced no detection at all from four
+    cameras that all agreed on it.
+    """
+    # Real numbers from cam0/cam3 of the k4a_capture replay.
+    table = Observation(4, 1, 0, 8444, (-0.46, 0.58, -0.92), box(-0.46, 0.58, -0.92, 1.28, 0.03, 1.26))
+    sliver = Observation(1, 1, 0, 9000, (0, 0, 0.9), box(0, 0, 0.9, 0.27, 0.33, 0.03))
+
+    # Today's rule: both rejected, which is the bug.
+    keep = filter_observations([table, sliver], min_extent_m=0.12)
+    assert keep == [], "precondition changed: min_extent_m no longer rejects both"
+
+    # With the footprint override the table returns and the sliver stays out.
+    keep = filter_observations([table, sliver], min_extent_m=0.12, min_footprint_m2=0.30)
+    assert [o.class_id for o in keep] == [4], (
+        f"expected only the table, got {[(o.class_id, box_extent(o.box)) for o in keep]}")
+
+
+def test_footprint_override_uses_the_ground_plane_not_a_fixed_pair():
+    """The footprint is the two axes perpendicular to `up_axis`. With up_axis=z a table is thin in
+    z, and reading the footprint off the wrong pair would measure a cross-section instead."""
+    # Thin in z: a tabletop under a z-up calibration.
+    table_z = Observation(4, 1, 0, 8000, (0, 0, 0.6), box(0, 0, 0.6, 1.3, 1.26, 0.03))
+    assert filter_observations([table_z], min_extent_m=0.12, min_footprint_m2=0.30,
+                               up_axis=UP_AXIS_Z) == [table_z], "z-up footprint not recognised"
+    # Under y-up the same box is 1.3 x 0.03 on the ground plane = 0.039 m2 -> correctly rejected.
+    assert filter_observations([table_z], min_extent_m=0.12, min_footprint_m2=0.30,
+                               up_axis=UP_AXIS_Y) == [], "footprint read off the wrong axis pair"
+
+
+def test_footprint_override_is_off_by_default():
+    """Default 0.0 must leave the existing rule exactly as it was."""
+    table = Observation(4, 1, 0, 8444, (-0.46, 0.58, -0.92), box(-0.46, 0.58, -0.92, 1.28, 0.03, 1.26))
+    assert filter_observations([table], min_extent_m=0.12) == []
+    assert filter_observations([table], min_extent_m=0.12, min_footprint_m2=0.0) == []
+
+
+def test_footprint_override_does_not_bypass_min_points():
+    """The two rejections stay independent: a large footprint must not rescue a speck."""
+    speck = Observation(4, 1, 0, 12, (0, 0.6, 0), box(0, 0.6, 0, 1.3, 0.03, 1.26))
+    assert filter_observations([speck], min_extent_m=0.12, min_footprint_m2=0.30,
+                               min_points=500) == [], "footprint override bypassed min_points"
+
+
+# ── optimisation equivalence gates ────────────────────────────────────────────────────────────────
+#
+# These pin OUTPUT IDENTITY, not behaviour: the functions below were made faster (object_fusion was
+# measured at 31.9 ms/tick live, the single most expensive Python operator in the app) and an
+# optimisation that changes results is a bug, not a speedup. Each test carries a naive reference
+# and asserts the fast path agrees with it exactly.
+
+def _oriented_hull_reference(points, yaw, up_axis=UP_AXIS_Y):
+    """The pre-optimisation formulation, kept verbatim as the oracle."""
+    import math
+    u = 1 if up_axis == 0 else 0
+    v = 1 if up_axis == 2 else 2
+    c, sn = math.cos(yaw), math.sin(yaw)
+    lo = [float("inf")] * 3
+    hi = [float("-inf")] * 3
+    for pt in points:
+        local = (c * pt[u] + sn * pt[v], -sn * pt[u] + c * pt[v], pt[up_axis])
+        for d in range(3):
+            lo[d] = min(lo[d], local[d])
+            hi[d] = max(hi[d], local[d])
+    mid = [(lo[d] + hi[d]) / 2.0 for d in range(3)]
+    center = [0.0, 0.0, 0.0]
+    center[u] = c * mid[0] - sn * mid[1]
+    center[v] = sn * mid[0] + c * mid[1]
+    center[up_axis] = mid[2]
+    return tuple(center), tuple(hi[d] - lo[d] for d in range(3))
+
+
+def test_oriented_hull_matches_its_reference():
+    import random
+    rng = random.Random(31)
+    for trial in range(60):
+        n = rng.randint(1, 40)
+        pts = [(rng.uniform(-4, 4), rng.uniform(-2, 2), rng.uniform(-4, 4)) for _ in range(n)]
+        for up in (0, UP_AXIS_Y, UP_AXIS_Z):
+            for yaw in (0.0, 0.3, -1.1, 3.0):
+                got = oriented_hull(pts, yaw, up)
+                want = _oriented_hull_reference(pts, yaw, up)
+                for a, b in zip(got[0] + got[1], want[0] + want[1]):
+                    assert abs(a - b) < 1e-9, (trial, up, yaw, got, want)
+
+
+def _suppress_aggregates_reference(observations, containment_threshold=0.7, min_children=2,
+                                   min_volume_ratio=1.5):
+    """The pre-optimisation O(n^2)-over-everything formulation, kept verbatim as the oracle."""
+    keep = [True] * len(observations)
+    for i, container in enumerate(observations):
+        vol_c = box_volume(container.box)
+        if vol_c <= 0.0:
+            continue
+        children = []
+        for j, child in enumerate(observations):
+            if i == j or child.class_id != container.class_id:
+                continue
+            vol_ch = box_volume(child.box)
+            if vol_ch <= 0.0 or vol_c < min_volume_ratio * vol_ch:
+                continue
+            if box_containment(container.box, child.box) >= containment_threshold:
+                children.append(j)
+        if len(children) < min_children:
+            continue
+        disjoint = []
+        for j in children:
+            if all(box_iou(observations[j].box, observations[k].box) <= 0.0 for k in disjoint):
+                disjoint.append(j)
+        if len(disjoint) >= min_children:
+            keep[i] = False
+    return [o for o, k in zip(observations, keep) if k]
+
+
+def _random_scene(rng, n, classes=5):
+    out = []
+    for i in range(n):
+        cx, cy, cz = rng.uniform(-3, 3), rng.uniform(0, 1.5), rng.uniform(-3, 3)
+        sx, sy, sz = rng.uniform(0.1, 2.5), rng.uniform(0.05, 1.5), rng.uniform(0.1, 2.5)
+        out.append(Observation(rng.randint(1, classes), i, rng.randint(0, 3),
+                               rng.randint(100, 40000), (cx, cy, cz),
+                               box(cx, cy, cz, sx, sy, sz),
+                               yaw=rng.choice([0.0, 0.4, -0.7])))
+    return out
+
+
+def test_suppress_aggregates_matches_its_reference():
+    import random
+    rng = random.Random(37)
+    for trial in range(40):
+        obs = _random_scene(rng, rng.randint(2, 90))
+        got = suppress_aggregates(obs)
+        want = _suppress_aggregates_reference(obs)
+        assert [id(o) for o in got] == [id(o) for o in want], (
+            f"trial {trial}: kept {len(got)} vs {len(want)} -- suppression changed")
+
+
+def test_fusion_matches_all_pairs_linking():
+    """The pairing loop is now spatially bucketed. Bucketing is exact only if the cell size is the
+    centroid gate itself, so any pair within the gate lands in adjacent cells -- this asserts that,
+    end to end, on scenes dense enough for buckets to actually exclude pairs."""
+    import random
+    rng = random.Random(41)
+    for trial in range(30):
+        obs = _random_scene(rng, rng.randint(2, 90))
+        for maxd in (0.3, 0.8, 2.0):
+            got = fuse_observations(obs, max_centroid_distance_m=maxd, min_extent_m=0.0,
+                                    min_points=0, suppress_aggregates_min_children=0)
+            want = fuse_observations(obs, max_centroid_distance_m=maxd, min_extent_m=0.0,
+                                     min_points=0, suppress_aggregates_min_children=0,
+                                     _force_all_pairs=True)
+            assert len(got) == len(want), (
+                f"trial {trial} maxd={maxd}: {len(got)} vs {len(want)} detections")
+            for a, b in zip(got, want):
+                assert a.class_id == b.class_id and a.num_points == b.num_points, (trial, maxd)
+                for x, y in zip(a.box[0] + a.box[1], b.box[0] + b.box[1]):
+                    assert abs(x - y) < 1e-9, (trial, maxd, a.box, b.box)
+                assert sorted(a.cameras) == sorted(b.cameras), (trial, maxd)
+
+
+def test_bucketed_pairs_find_every_pair_within_the_gate():
+    """Directly on the helper: the bucket neighbourhood must never miss a qualifying pair."""
+    import random
+    rng = random.Random(43)
+    for trial in range(40):
+        obs = _random_scene(rng, rng.randint(2, 120))
+        maxd = rng.choice([0.2, 0.5, 1.5])
+        got = {(min(i, j), max(i, j)) for i, j in _candidate_pairs(obs, maxd)}
+        want = {(i, j) for i in range(len(obs)) for j in range(i + 1, len(obs))
+                if centroid_distance(obs[i].centroid, obs[j].centroid) <= maxd}
+        missing = want - got
+        assert not missing, (f"trial {trial} maxd={maxd}: bucketing missed {len(missing)} pairs "
+                             f"that are within the gate, e.g. {sorted(missing)[:3]}")
+
+
 def test_aggregate_containing_two_disjoint_objects_is_dropped():
     """A mask covering two people must not become one identity -- prefer the individuals."""
     a = obs(1, 1, 0, 20000, -0.6, 0, 0.9)                       # person A
@@ -209,6 +391,39 @@ def test_a_single_contained_partial_view_is_kept_and_merged():
     keep = suppress_aggregates([person, torso])
     assert len(keep) == 2, "a single-child container was mistaken for an aggregate"
     assert len(fuse_observations([person, torso])) == 1, "the partial view stopped merging"
+
+
+def test_aggregate_suppression_is_strictly_intra_class():
+    """A large box of one class must never be condemned by small boxes of ANOTHER class.
+
+    The realistic shape of this: a table's box legitimately contains the computer and the monitor
+    standing on it, and two chairs tucked under it. If containment were evaluated across classes
+    the table would be read as an aggregate of four disjoint children and dropped -- losing the
+    one object whose whole purpose is to have things on it.
+
+    Pinned because it is invisible from the outside: the symptom is a missing box, not an error.
+    """
+    table = Observation(4, 1, 0, 40000, (0, 0.6, 0), box(0, 0.6, 0, 2.0, 0.05, 1.2))
+    # Four mutually disjoint children of OTHER classes, all well inside the table's box and each
+    # small enough to clear min_volume_ratio. Cross-class, this is textbook "aggregate".
+    on_top = [
+        Observation(2, 1, 0, 5000, (-0.7, 0.6, -0.3), box(-0.7, 0.6, -0.3, 0.2, 0.02, 0.2)),
+        Observation(3, 1, 0, 5000, (-0.2, 0.6, -0.3), box(-0.2, 0.6, -0.3, 0.2, 0.02, 0.2)),
+        Observation(5, 1, 0, 5000, (+0.2, 0.6, +0.3), box(+0.2, 0.6, +0.3, 0.2, 0.02, 0.2)),
+        Observation(5, 2, 0, 5000, (+0.7, 0.6, +0.3), box(+0.7, 0.6, +0.3, 0.2, 0.02, 0.2)),
+    ]
+    keep = suppress_aggregates([table] + on_top, min_children=2)
+    assert any(o.class_id == 4 for o in keep), (
+        "the table was suppressed by children of other classes -- aggregate suppression leaked "
+        "across the class boundary")
+    assert len(keep) == 5, [(o.class_id, o.instance_id) for o in keep]
+
+    # Control: the SAME geometry within one class must still be suppressed, so the assertion above
+    # is testing the class guard and not a rule that never fires.
+    same_class = [Observation(4, 2 + i, 0, 5000, o.centroid, o.box) for i, o in enumerate(on_top)]
+    keep = suppress_aggregates([table] + same_class, min_children=2)
+    assert not any(o.class_id == 4 and o.instance_id == 1 for o in keep), (
+        "the intra-class aggregate was NOT suppressed, so the cross-class assertion proves nothing")
 
 
 def test_aggregate_of_similar_sized_boxes_is_not_dropped():

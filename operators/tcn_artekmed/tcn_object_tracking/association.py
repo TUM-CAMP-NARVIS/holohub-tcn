@@ -145,13 +145,25 @@ def oriented_hull(points: Sequence[Vec3], yaw: float, up_axis: int = UP_AXIS_Y):
     """
     u, v = _plane_axes(up_axis)
     c, s = math.cos(yaw), math.sin(yaw)
-    lo = [float("inf")] * 3
-    hi = [float("-inf")] * 3
+    # Hand-unrolled over the three axes rather than an inner `for d in range(3)` with min()/max().
+    # This is the hottest loop in object_fusion -- it ran 3.2 M builtin max() calls in a 240-tick
+    # profile, 6 per point, plus a tuple build per point. Comparisons inline instead.
+    lo0 = lo1 = lo2 = float("inf")
+    hi0 = hi1 = hi2 = float("-inf")
     for p in points:
-        local = (c * p[u] + s * p[v], -s * p[u] + c * p[v], p[up_axis])
-        for d in range(3):
-            lo[d] = min(lo[d], local[d])
-            hi[d] = max(hi[d], local[d])
+        pu = p[u]
+        pv = p[v]
+        a = c * pu + s * pv
+        b = c * pv - s * pu
+        e = p[up_axis]
+        if a < lo0: lo0 = a
+        if a > hi0: hi0 = a
+        if b < lo1: lo1 = b
+        if b > hi1: hi1 = b
+        if e < lo2: lo2 = e
+        if e > hi2: hi2 = e
+    lo = (lo0, lo1, lo2)
+    hi = (hi0, hi1, hi2)
     mid = [(lo[d] + hi[d]) / 2.0 for d in range(3)]
     center = [0.0, 0.0, 0.0]
     center[u] = c * mid[0] - s * mid[1]
@@ -225,7 +237,9 @@ def box_extent(box: Box) -> Vec3:
 
 def filter_observations(observations: Sequence[Observation],
                         min_extent_m: float = 0.0,
-                        min_points: int = 0) -> List[Observation]:
+                        min_points: int = 0,
+                        min_footprint_m2: float = 0.0,
+                        up_axis: int = UP_AXIS_Y) -> List[Observation]:
     """Drop specks and slivers before anything else looks at them.
 
     Two independent rejections:
@@ -236,15 +250,34 @@ def filter_observations(observations: Sequence[Observation],
       flat slivers a mask fringe produces (extents like 0.27 x 0.33 x 0.03 m), which no volume or
       overlap rule catches because they are legitimately small.
 
+    `min_footprint_m2` is the escape hatch for objects that are *genuinely* flat. A depth camera sees
+    a tabletop's top surface and nothing else, so a real table arrives with a vertical extent of two
+    to seven centimetres -- sensor noise on a plane. On thickness alone it is indistinguishable from
+    the mask fringe above, and `min_extent_m` therefore threw away every observation of it: measured
+    on a real capture, four cameras agreed on a 1.3 x 1.3 m table at y = 0.58 m and it produced no
+    detection at all.
+
+    The ground-plane FOOTPRINT separates the two where thickness cannot -- 1.64 m2 against 0.09 m2,
+    about twenty-fold -- so an observation is kept when it clears `min_extent_m` on every axis OR its
+    footprint clears this. 0.0 (the default) disables the override and restores the old rule exactly.
+
     Order matters: this runs before aggregate suppression, so a sliver cannot count as one of the
     "children" that condemns a container.
     """
+    p, q = _plane_axes(up_axis)
     out = []
     for o in observations:
         if o.num_points < min_points:
             continue
         if min_extent_m > 0.0 and min(box_extent(o.box)) < min_extent_m:
-            continue
+            # Thin on some axis. Only a large ground footprint rescues it -- and the footprint is
+            # read off the two axes perpendicular to `up_axis`, not a fixed pair, or under a z-up
+            # calibration this would measure a cross-section instead.
+            if min_footprint_m2 <= 0.0:
+                continue
+            extent = box_extent(o.box)
+            if extent[p] * extent[q] < min_footprint_m2:
+                continue
         out.append(o)
     return out
 
@@ -273,18 +306,29 @@ def suppress_aggregates(observations: Sequence[Observation],
     also why a smaller box wins over the box that contains it.
     """
     keep = [True] * len(observations)
+    # Bucket by class before the pair loop rather than testing the class inside it. Sharing a class is
+    # a hard prerequisite -- a container is never condemned by another class's boxes (see
+    # test_aggregate_suppression_is_strictly_intra_class) -- so this compares exactly the same pairs,
+    # without walking the whole scene once per observation. Volumes are hoisted for the same reason:
+    # box_volume ran 460 k times in a 240-tick profile, nearly all of it recomputing one child's
+    # volume once per candidate container.
+    by_class: Dict[int, List[int]] = {}
+    for idx, o in enumerate(observations):
+        by_class.setdefault(o.class_id, []).append(idx)
+    volumes = [box_volume(o.box) for o in observations]
+
     for i, container in enumerate(observations):
-        vol_c = box_volume(container.box)
+        vol_c = volumes[i]
         if vol_c <= 0.0:
             continue
         children = []
-        for j, child in enumerate(observations):
-            if i == j or child.class_id != container.class_id:
+        for j in by_class[container.class_id]:
+            if i == j:
                 continue
-            vol_ch = box_volume(child.box)
+            vol_ch = volumes[j]
             if vol_ch <= 0.0 or vol_c < min_volume_ratio * vol_ch:
                 continue                       # not meaningfully larger: not a container
-            if box_containment(container.box, child.box) >= containment_threshold:
+            if box_containment(container.box, observations[j].box) >= containment_threshold:
                 children.append(j)
         if len(children) < min_children:
             continue
@@ -297,6 +341,49 @@ def suppress_aggregates(observations: Sequence[Observation],
         if len(disjoint) >= min_children:
             keep[i] = False
     return [o for o, k in zip(observations, keep) if k]
+
+
+def _candidate_pairs(items: Sequence[Observation], max_centroid_distance_m: float):
+    """Index pairs whose centroids could be within `max_centroid_distance_m`, via a uniform grid.
+
+    The centroid gate is checked FIRST in the linking rule and is a hard prerequisite: no pair
+    further apart can ever link, whatever their boxes do. So hashing centroids into cells of exactly
+    that size and visiting only the 3x3x3 cell neighbourhood is **exact**, not approximate -- two
+    points within `d` cannot be more than one cell apart when the cell size is `d`. The caller still
+    applies the real distance test; this only avoids enumerating pairs that cannot pass it.
+
+    Falls back to all pairs when the gate is not positive, since then it excludes nothing and the
+    grid would just be overhead.
+    """
+    n = len(items)
+    if max_centroid_distance_m <= 0.0 or n < 32:
+        # Small scenes are not worth the bookkeeping -- the crossover measured well below 32.
+        for i in range(n):
+            for j in range(i + 1, n):
+                yield i, j
+        return
+
+    cell = max_centroid_distance_m
+    grid: Dict[tuple, List[int]] = {}
+    keys = []
+    for i, o in enumerate(items):
+        c = o.centroid
+        k = (int(math.floor(c[0] / cell)), int(math.floor(c[1] / cell)),
+             int(math.floor(c[2] / cell)))
+        keys.append(k)
+        grid.setdefault(k, []).append(i)
+
+    for i in range(n):
+        kx, ky, kz = keys[i]
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    bucket = grid.get((kx + dx, ky + dy, kz + dz))
+                    if not bucket:
+                        continue
+                    for j in bucket:
+                        if j > i:            # each unordered pair exactly once
+                            yield i, j
 
 
 def merge_observations(group: Sequence[Observation], up_axis: int = UP_AXIS_Y) -> Detection:
@@ -351,12 +438,14 @@ def fuse_observations(observations: Sequence[Observation],
                       up_axis: int = UP_AXIS_Y,
                       min_extent_m: float = 0.0,
                       min_points: int = 0,
+                      min_footprint_m2: float = 0.0,
                       suppress_aggregates_containment: float = 0.7,
                       suppress_aggregates_min_children: int = 2,
                       suppress_aggregates_min_volume_ratio: float = 1.5,
                       min_cameras: int = 1,
                       min_detection_points: int = 0,
-                      min_detection_extent_m: float = 0.0) -> List[Detection]:
+                      min_detection_extent_m: float = 0.0,
+                      _force_all_pairs: bool = False) -> List[Detection]:
     """Group observations of the same physical object into detections, per class.
 
     Deliberately merges observations from the SAME camera as well as across cameras: one physical
@@ -387,7 +476,8 @@ def fuse_observations(observations: Sequence[Observation],
     # Order is deliberate: reject specks and slivers first so they cannot count as the children that
     # condemn a container, then drop aggregates so the containment merge below cannot fuse distinct
     # objects into a class-level blob.
-    usable = filter_observations(usable, min_extent_m=min_extent_m, min_points=min_points)
+    usable = filter_observations(usable, min_extent_m=min_extent_m, min_points=min_points,
+                                 min_footprint_m2=min_footprint_m2, up_axis=up_axis)
     if suppress_aggregates_min_children > 0:
         usable = suppress_aggregates(
             usable,
@@ -416,17 +506,20 @@ def fuse_observations(observations: Sequence[Observation],
             if ri != rj:
                 parent[max(ri, rj)] = min(ri, rj)
 
-        for i in range(len(items)):
-            for j in range(i + 1, len(items)):
-                a, b = items[i], items[j]
-                if centroid_distance(a.centroid, b.centroid) > max_centroid_distance_m:
-                    continue
-                linked = (box_iou(a.box, b.box) >= iou_threshold
-                          or box_containment(a.box, b.box) >= containment_threshold
-                          or (footprint_iou(a.box, b.box, up_axis) >= footprint_iou_threshold
-                              and vertical_gap(a.box, b.box, up_axis) <= max_vertical_gap_m))
-                if linked:
-                    union(i, j)
+        # Only pairs that can pass the centroid gate are enumerated; `_force_all_pairs` restores the
+        # exhaustive enumeration so a test can assert the two agree.
+        pairs = (((i, j) for i in range(len(items)) for j in range(i + 1, len(items)))
+                 if _force_all_pairs else _candidate_pairs(items, max_centroid_distance_m))
+        for i, j in pairs:
+            a, b = items[i], items[j]
+            if centroid_distance(a.centroid, b.centroid) > max_centroid_distance_m:
+                continue
+            linked = (box_iou(a.box, b.box) >= iou_threshold
+                      or box_containment(a.box, b.box) >= containment_threshold
+                      or (footprint_iou(a.box, b.box, up_axis) >= footprint_iou_threshold
+                          and vertical_gap(a.box, b.box, up_axis) <= max_vertical_gap_m))
+            if linked:
+                union(i, j)
 
         groups: Dict[int, List[Observation]] = {}
         for i, o in enumerate(items):
