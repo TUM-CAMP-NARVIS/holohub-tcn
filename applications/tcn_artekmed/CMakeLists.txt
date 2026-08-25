@@ -33,11 +33,12 @@ add_holohub_application(tcn_shm_receiver DEPENDS OPERATORS
                           tcn_depthimage_apply_mask
                           tcn_depthimage_fgbg_mask
                           tcn_depthimage_max_distance
-                                            tcn_stream_splitter
+                          tcn_stream_splitter
                           tcn_stream_merger
                           tcn_shm_serde
                           tcn_shm_subscriber
                           tcn_device_context
+                          tcn_flatten_tensor
                           #slang_shader
                           )
 
