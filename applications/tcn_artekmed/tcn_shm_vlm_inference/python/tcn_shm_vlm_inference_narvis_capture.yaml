@@ -38,7 +38,7 @@
 # =====================================================================================================
 
 application:
-  title: TCN Artekmed Shm Receiver
+  title: TCN Artekmed Shm VLM Inference
   version: 1.0
   inputFormats: []
   outputFormats: ["screen"]
@@ -78,7 +78,7 @@ dataset_source:
   path: "/workspace/volumes/artekmed_test_data/data/k4a_capture"
   # Must match gpu_workers.workers below -- the app validates the two at startup and fails fast,
   # naming exactly which cameras are missing or extra.
-  cameras: ["camera01", "camera02", "camera03", "camera04", "camera05"]
+  cameras: ["camera01", "camera02", "camera03", "camera04"]
   # REQUIRED, and not merely a preload cap: the app bounds the run with CountCondition(frame_count)
   # so a harness run terminates on its own instead of running forever, and passes the same value to
   # the replayer. One run emits exactly this many frames, once, in "auto" playback.
@@ -248,17 +248,15 @@ gpu_workers:
   # default: false  |  currently true because langsam_inference.gdino_backend is "pytorch"
   pipelined: true
 
-  # -- 5-camera profile (needs batch-2 + batch-3 engines) --
+  # -- 5-camera profile (needs batch-4 + batch-5 engines) --
   #workers:
   #  - device: 0
-  #    cameras: ["camera01_colorimage", "camera02_colorimage"]
-  #  - device: 1
-  #    cameras: ["camera03_colorimage", "camera04_colorimage", "camera05_colorimage"]
+  #    cameras: ["camera01_colorimage", "camera02_colorimage", "camera03_colorimage", "camera04_colorimage", "camera05_colorimage"]
 
   # -- 4-camera profile (needs batch-2 engines only) --
   workers:
     - device: 0
-      cameras: ["camera01_colorimage", "camera02_colorimage", "camera03_colorimage", "camera04_colorimage", "camera05_colorimage"]
+      cameras: ["camera01_colorimage", "camera02_colorimage", "camera03_colorimage", "camera04_colorimage"]
 
 # The open-vocabulary prompt set. ORDER IS SEMANTIC: class ids are 1-based positions in this list
 # (class_id_map), so reordering renumbers every class, invalidates any hard-coded
@@ -380,8 +378,7 @@ langsam_inference:
   # Accepts "camera01" or "camera01_colorimage"; an unknown name is REFUSED, because a typo would
   # silently leave that camera unrotated and look like a model problem.
   # default: []
-  # flip_cameras: ["camera01", "camera02", "camera03", "camera04", "camera05"]
-  flip_cameras: []
+  flip_cameras: ["camera01", "camera02", "camera03", "camera04"]
 
   # ---- torch.compile (both default off, and should stay off) --------------------------------------
   # WARNING: first-forward compilation is heavy on host RAM and can OOM (SIGKILL/-9), especially
