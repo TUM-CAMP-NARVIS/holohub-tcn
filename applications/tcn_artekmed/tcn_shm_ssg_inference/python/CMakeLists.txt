@@ -33,7 +33,6 @@ target_link_libraries(tcn_shm_ssg_inference INTERFACE
     holoscan::ops::tcn_flatten_tensor
     holoscan::ops::tcn_depthimage_backprojection
     holoscan::ops::tcn_depthimage_temporal_filter
-    holoscan::ops::tcn_depthimage_weights
     holoscan::ops::tcn_texture_sampler
     holoscan::ops::tcn_depthimage_max_distance
     holoscan::ops::tcn_depthimage_fgbg_mask

@@ -12,7 +12,6 @@ import numpy as np
 import holoscan as hs
 from holohub.tcn_depthimage_backprojection import TcnDepthImageBackprojectionOp
 from holohub.tcn_depthimage_temporal_filter import TcnDepthImageTemporalFilterOp
-from holohub.tcn_depthimage_weights import TcnDepthImageWeightsOp
 from holohub.tcn_texture_sampler import TcnTextureSamplerOp
 from holohub.tcn_depthimage_backprojection._tcn_depthimage_backprojection import CameraModel, DistortionType, \
     RigidTransform, CameraParameters, make_rigid_transform
@@ -272,20 +271,6 @@ class App(hs.core.Application):
                 **self.kwargs("points_holoviz"),
             )
 
-        weights_visualizer = None
-        if debug_output_config.get("enable_weights", False):
-            log.info("create weights debug-view")
-            weights_output_specs = create_tiled_input_specs(camera_names)
-
-            weights_visualizer = HolovizOp(
-                self,
-                name="weights_visualizer",
-                tensors=weights_output_specs,
-                allocator=device_memory_pool,
-                cuda_stream_pool=cuda_stream_pool,
-                **self.kwargs("weights_holoviz"),
-            )
-
         warped_color_visualizer = None
         if debug_output_config.get("enable_warped_color", False):
             log.info("create warped_color debug-view")
@@ -430,41 +415,6 @@ class App(hs.core.Application):
 
             position_merge_connections.append((bp_op, {("positions", f"{camera_name}_positions")}))
             texcoords_merge_connections.append((bp_op, {("texcoords", f"{camera_name}_texcoords")}))
-
-            if camera_streams_config.get("enable_compute_weights", False):
-                log.info(f"create compute weights: {camera_name}")
-                cp_op = TcnDepthImageWeightsOp(
-                    self,
-                    cuda_stream_pool,
-                    allocator=device_memory_pool,
-                    # out_tensor_name=camera_name,
-                    in_tensor_name="",
-                    out_tensor_name=camera_name,
-                    cuda_device_ordinal=cuda_device_id,
-                    name=f"{camera_name}_weights",
-                    **self.kwargs("depthimage_weights")
-                )
-                sink_ops.append(cp_op)
-
-                log.debug(f"Flow: {prev_op.name} -> cp_op [{camera_name}_weights] ({prev_output} -> depth_image)")
-                self.add_flow(prev_op, cp_op, {
-                    (prev_output, "depth_image"),
-                })
-                log.debug(f"Flow: xylt_op [xylt_loader_{camera_name}] -> cp_op [{camera_name}_weights] (xy_table -> xy_table)")
-                self.add_flow(xylt_op, cp_op, {
-                    ("xy_table", "xy_table")
-                })
-                # debug view..
-                if weights_visualizer is not None:
-                    log.debug(f"Flow: cp_op [{camera_name}_weights] -> weights_visualizer (output -> receivers)")
-                    self.add_flow(cp_op, weights_visualizer, {("output", "receivers")})
-                else:
-                    sink_op = DummySinkOp(self, name=f"{camera_name}_sink")
-                    log.debug(f"Flow: cp_op [{camera_name}_weights] -> sink_op [{camera_name}_sink] (output -> input)")
-                    self.add_flow(cp_op, sink_op, {
-                        ("output", "input"),
-                        })
-                    sink_ops.append(sink_op)
 
             if camera_streams_config.get("enable_warp_colorimage", False):
                 wci_op = TcnTextureSamplerOp(

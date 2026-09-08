@@ -14,7 +14,6 @@ camera_stream_processing:
   buffer_size: 8
   enable_temporal_filter: True
   enable_background_substract: False
-  enable_compute_weights: True
   enable_warp_colorimage: True
 
 depthimage_temporal_filter:
@@ -33,22 +32,11 @@ depthimage_backprojection:
   near_limit_m: 0.01
   far_limit_m: 10.0
 
-
-depthimage_weights:
-  depth_units_per_meter: 1000.0
-  # 20 degree (PI / 9.0)
-  angle_reject_limit: 0.3490658503988659
-  angle_reject_envelope: 1.0
-  offset_envelope: 1.0
-  depth_near_limit: 0.1
-  depth_far_limit: 8.0
-
 rmm_allocator:
 
 debug_output:
   enable_colorimage: True
   enable_depthimage: True
-  enable_weights: True
   enable_pointcloud: True
   enable_warped_color: False
 
@@ -73,12 +61,6 @@ color_holoviz:
 
 points_holoviz:
   window_title: "Artekmed Pointclouds"
-  width: 800
-  height: 640
-  framerate: 60
-
-weights_holoviz:
-  window_title: "Artekmed Deptimage Weights"
   width: 800
   height: 640
   framerate: 60
