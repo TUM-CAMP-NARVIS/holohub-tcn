@@ -94,6 +94,23 @@ add_holohub_application(tcn_shm_vlm_inference DEPENDS OPERATORS
         tcn_depthimage_apply_mask
 )
 
+
+add_holohub_application(tcn_shm_ssg_inference DEPENDS OPERATORS
+        tcn_stream_splitter
+        tcn_shm_serde
+        tcn_shm_subscriber
+        tcn_device_context
+        tcn_convert_bgra_to_rgba
+        tcn_stream_synchronizer
+        tcn_depthimage_backprojection
+        tcn_label_sampler
+        tcn_labeled_pointcloud
+        tcn_instance_stats
+        tcn_stream_merger
+        tcn_flatten_tensor
+        tcn_depthimage_apply_mask
+)
+
 add_holohub_application(tcn_operator_tests DEPENDS OPERATORS
         tcn_convert_bgra_to_rgba
         tcn_flatten_tensor
